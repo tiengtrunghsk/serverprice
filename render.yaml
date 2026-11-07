@@ -8,9 +8,6 @@ services:
     startCommand: python price_api.py
     healthCheckPath: /healthz
 
-    domains:
-      - dautuchungkhoan.ddns.net
-
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
@@ -20,5 +17,6 @@ services:
         value: "45"
       - key: MAX_SYMBOLS_PER_REQUEST
         value: "20"
+      # Cho phép mọi origin gọi API (vì HTML có thể serve từ bất kỳ đâu)
       - key: ALLOWED_ORIGINS
-        value: "https://dautuchungkhoan.ddns.net"
+        value: "*"
