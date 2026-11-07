@@ -1,10 +1,6 @@
 """
 Price API — Pro Quant Screener
-- Auto-crawl: 15 phút/lần, cào lại toàn bộ trong giờ giao dịch (9h-15h T2-T6).
-- Sau 15h & ngoài giờ: Nếu đã cào đủ tất cả mã, không gọi sàn nữa.
-- Nếu có mã lỗi, lần cào sau chỉ bổ sung những mã lỗi đó.
-- Timeout Lock: Tự giải phóng khóa nếu tiến trình cào treo quá 120s.
-- CHỐNG GHI GITHUB TRÙNG: Chỉ 1 luồng được ghi Github tại 1 thời điểm.
+Cơ chế Tối giản & Ổn định (Chống lỗi 500).
 """
 
 import os
@@ -28,7 +24,7 @@ from lotusmarket import fetchers
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 if not MONGO_URI:
-    print("❌ LỖI NGHIÊM TRỌNG: Chưa cấu hình biến môi trường MONGO_URI!", flush=True)
+    print("❌ LỖI: Thiếu MONGO_URI!", flush=True)
     sys.exit(1)
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -40,7 +36,6 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
 COOLDOWN_SECONDS = 300
-LOCK_TIMEOUT_SECONDS = 120
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -63,29 +58,15 @@ except PyMongoError as e:
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
-# ==== BIẾN QUẢN LÝ TRẠNG THÁI ====
-is_auto_crawling = False
+# Biến toàn cục quản lý trạng thái
+is_crawling = False
 crawl_lock = threading.Lock()
-crawl_start_time = 0
 LAST_CRAWL_TIME = {}
-
-# ==== CHỐNG GHI GITHUB TRÙNG ====
-github_write_lock = threading.Lock()  # Khóa cho việc ghi Github
-is_github_writing = False  # Cờ hiệu: Đang ghi Github
-
-# ==== BỘ THEO DÕI MÃ ĐÃ CÀO THÀNH CÔNG ====
-SUCCESS_CACHE: Set[str] = set()
-SUCCESS_CACHE_DATE = ""
-SUCCESS_CACHE_RESET_LOCK = threading.Lock()
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
     vn_time = datetime.utcnow() + timedelta(hours=7)
     return vn_time.strftime("%d/%m/%Y %H:%M:%S")
-
-def _today_str() -> str:
-    vn_time = datetime.utcnow() + timedelta(hours=7)
-    return vn_time.strftime("%d/%m/%Y")
 
 def _is_trading_time() -> bool:
     vn_now = datetime.utcnow() + timedelta(hours=7)
@@ -95,15 +76,6 @@ def _is_trading_time() -> bool:
 def _is_after_15h() -> bool:
     vn_time = datetime.utcnow() + timedelta(hours=7)
     return vn_time.hour >= 15
-
-def _reset_cache_if_new_day():
-    global SUCCESS_CACHE, SUCCESS_CACHE_DATE
-    with SUCCESS_CACHE_RESET_LOCK:
-        today = _today_str()
-        if SUCCESS_CACHE_DATE != today:
-            SUCCESS_CACHE.clear()
-            SUCCESS_CACHE_DATE = today
-            print(f"🔄 Reset SUCCESS_CACHE cho ngày mới: {today}", flush=True)
 
 def _fetch_one(symbol: str) -> Optional[int]:
     def _do():
@@ -126,25 +98,6 @@ def _fetch_one(symbol: str) -> Optional[int]:
     if price < 1000: price = price * 1000
     return int(price)
 
-def _can_user_crawl(symbols: list) -> bool:
-    now = time.time()
-    for sym in symbols:
-        last_time = LAST_CRAWL_TIME.get(sym, 0)
-        if now - last_time < COOLDOWN_SECONDS:
-            return False
-    return True
-
-def _acquire_crawl_lock(blocking: bool = False) -> bool:
-    global crawl_start_time
-    if crawl_lock.locked() and (time.time() - crawl_start_time > LOCK_TIMEOUT_SECONDS):
-        print(f"⚠️ Khóa cào bị treo quá {LOCK_TIMEOUT_SECONDS}s. Tự giải phóng!", flush=True)
-        try: crawl_lock.release()
-        except RuntimeError: pass
-    
-    acquired = crawl_lock.acquire(blocking=blocking)
-    if acquired: crawl_start_time = time.time()
-    return acquired
-
 # ===================== GITHUB SYNC =====================
 def get_github_file_data():
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
@@ -155,9 +108,11 @@ def get_github_file_data():
         if res.status_code == 200:
             file_info = res.json()
             return json.loads(base64.b64decode(file_info["content"]).decode("utf-8")), file_info["sha"]
-        elif res.status_code == 404: return {}, None
+        elif res.status_code == 404:
+            return {}, None
         return None, None
-    except Exception: return None, None
+    except Exception:
+        return None, None
 
 def update_github_file(data_dict, commit_message):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return False
@@ -175,7 +130,8 @@ def update_github_file(data_dict, commit_message):
         if res.status_code in [200, 201]:
             if gh_history: gh_history.insert_one({"time": datetime.utcnow(), "message": commit_message})
             return True
-    except Exception: pass
+    except Exception:
+        pass
     return False
 
 def can_update_github() -> bool:
@@ -185,109 +141,68 @@ def can_update_github() -> bool:
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
     return gh_history.count_documents({"time": {"$gte": start_of_day_utc}}) < 3
 
-def _sync_to_github(updated_data, now_str):
-    """Ghi dữ liệu lên Github, có cơ chế chống trùng."""
-    global is_github_writing
+# ===================== CORE CRAWL LOGIC =====================
+def _execute_crawl(symbols: list):
+    global is_crawling
     
-    if not updated_data or not GITHUB_TOKEN or not can_update_github():
+    if is_crawling:
+        print("[CRAWL] ⏳ Đang có luồng cào khác chạy. Bỏ qua.", flush=True)
         return
-    
-    # Nếu đang có luồng khác ghi Github, bỏ qua (vì lần ghi hiện tại đã bao gồm dữ liệu mới nhất)
-    if is_github_writing:
-        print("[GITHUB] ⏳ Đang có luồng khác ghi Github. Bỏ qua lần này.", flush=True)
-        return
-    
+        
+    is_crawling = True
     try:
-        if not github_write_lock.acquire(blocking=False):
-            print("[GITHUB] ⏳ Không lấy được khóa ghi Github. Bỏ qua.", flush=True)
-            return
+        now_str = _now_str()
+        updated_data = {}
         
-        is_github_writing = True
-        print("[GITHUB] 🚀 Bắt đầu ghi Github...", flush=True)
+        print(f"[CRAWL] 🚀 Bắt đầu cào tuần tự {len(symbols)} mã...", flush=True)
         
-        old_gh_data, _ = get_github_file_data()
-        if old_gh_data is not None:
-            for sym, price in updated_data.items():
-                old_gh_data[sym] = old_gh_data.get(sym, {})
-                old_gh_data[sym]["close"] = price
-                old_gh_data[sym]["updated_at"] = now_str
-            update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
-        
-        print("[GITHUB] ✅ Ghi Github hoàn tất.", flush=True)
+        # CÀO TUẦN TỰ TỪNG MÃ (An toàn tuyệt đối cho Render Free)
+        for sym in symbols:
+            price = _fetch_one(sym)
+            if price:
+                collection.update_one(
+                    {"symbol": sym},
+                    {"$set": {"symbol": sym, "close": price, "updated_at": now_str}},
+                    upsert=True
+                )
+                updated_data[sym] = price
+                LAST_CRAWL_TIME[sym] = time.time()
+                print(f"[CRAWL] ✅ {sym}: {price:,}", flush=True)
+            else:
+                print(f"[CRAWL] ❌ {sym}: Lỗi/Timeout", flush=True)
+
+        # Cập nhật giờ toàn cục
+        if len(symbols) >= 5:
+            settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
+
+        # Ghi Github (Chỉ ghi khi đã qua 15h và đủ điều kiện)
+        if updated_data and GITHUB_TOKEN and can_update_github():
+            print("[GITHUB] 🚀 Bắt đầu ghi Github...", flush=True)
+            old_gh_data, _ = get_github_file_data()
+            if old_gh_data is not None:
+                for sym, price in updated_data.items():
+                    old_gh_data[sym] = old_gh_data.get(sym, {})
+                    old_gh_data[sym]["close"] = price
+                    old_gh_data[sym]["updated_at"] = now_str
+                update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
+
+        print(f"[CRAWL] ✅ Hoàn tất cào {len(updated_data)}/{len(symbols)} mã.", flush=True)
         
     finally:
-        is_github_writing = False
-        github_write_lock.release()
+        is_crawling = False
 
-# ===================== CORE CRAWL LOGIC =====================
-def _execute_crawl(symbols: list, source: str = "user", only_failed: bool = False):
-    now_str = _now_str()
-    updated_data = {}
-    
-    _reset_cache_if_new_day()
-    
-    if only_failed:
-        symbols = [s for s in symbols if s not in SUCCESS_CACHE]
-        if not symbols:
-            print(f"[{source.upper()}] ✅ Tất cả mã đã cào thành công. Không cần gọi sàn.", flush=True)
-            return
-    
-    print(f"[{source.upper()}] 🚀 Bắt đầu cào {len(symbols)} mã...", flush=True)
-    
-    def process_sym(sym):
-        price = _fetch_one(sym)
-        if price:
-            collection.update_one(
-                {"symbol": sym},
-                {"$set": {"symbol": sym, "close": price, "updated_at": now_str}},
-                upsert=True
-            )
-            return sym, price
-        return sym, None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(process_sym, symbols))
-
-    for sym, price in results:
-        if price:
-            updated_data[sym] = price
-            LAST_CRAWL_TIME[sym] = time.time()
-            with SUCCESS_CACHE_RESET_LOCK:
-                SUCCESS_CACHE.add(sym)
-
-    if len(symbols) >= 5:
-        settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
-
-    # Ghi Github (có cơ chế chống trùng)
-    _sync_to_github(updated_data, now_str)
-
-    print(f"[{source.upper()}] ✅ Hoàn tất cào {len(updated_data)}/{len(symbols)} mã.", flush=True)
-
-# ===================== BACKGROUND WORKER =====================
+# ===================== BACKGROUND WORKER (AUTO 15m) =====================
 def auto_crawler_worker():
-    global is_auto_crawling
     print("⏰ [AUTO] Đã bật luồng tự động cập nhật giá (15 phút/lần).", flush=True)
-    
     while True:
         try:
             if _is_trading_time():
-                is_auto_crawling = True
-                _reset_cache_if_new_day()
-                
                 symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
                 if symbols:
-                    if _acquire_crawl_lock(blocking=True):
-                        try:
-                            _execute_crawl(symbols, source="auto", only_failed=False)
-                        finally:
-                            crawl_lock.release()
-                
-                is_auto_crawling = False
-                
-            time.sleep(900)
+                    _execute_crawl(symbols)
+            time.sleep(900) # 15 phút
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
-            is_auto_crawling = False
             time.sleep(60)
 
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
@@ -311,44 +226,42 @@ def api_get_data():
 
 @app.get("/api/sync")
 def api_sync():
-    global is_auto_crawling
-    
     raw = request.args.get("symbols", "").strip()
     if not raw: abort(400)
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
     if not symbols or len(symbols) > MAX_SYMBOLS_PER_REQUEST: abort(400)
 
     now_str = _now_str()
-    _reset_cache_if_new_day()
-
-    all_done = all(sym in SUCCESS_CACHE for sym in symbols)
     
-    if is_auto_crawling:
-        print(f"[SYNC] ⏳ Auto-crawl đang chạy. Trả về MongoDB.", flush=True)
-        updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) 
-                        for sym in symbols if collection.find_one({"symbol": sym})}
+    # Nếu đang cào -> Trả về MongoDB ngay lập tức (Chống spam/sập)
+    if is_crawling:
+        print(f"[SYNC] ⏳ Hệ thống đang cào. Trả về MongoDB.", flush=True)
+        updated_data = {}
+        for sym in symbols:
+            doc = collection.find_one({"symbol": sym})
+            if doc and "close" in doc:
+                updated_data[sym] = doc["close"]
         return jsonify({
             "status": "success",
-            "updated_at": now_str + " (Auto đang chạy)",
-            "updated_count": len(updated_data),
-            "updated_data": updated_data,
-        })
-    
-    if not _is_trading_time() and all_done:
-        print(f"[SYNC] ✅ Ngoài giờ GD và đã đủ dữ liệu. Không gọi sàn.", flush=True)
-        updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) 
-                        for sym in symbols if collection.find_one({"symbol": sym})}
-        return jsonify({
-            "status": "success",
-            "updated_at": now_str + " (Ngoài giờ, đã đủ)",
+            "updated_at": now_str + " (Đang cào)",
             "updated_count": len(updated_data),
             "updated_data": updated_data,
         })
 
-    if not _can_user_crawl(symbols):
+    # Kiểm tra giãn cách 5 phút
+    can_crawl = True
+    for sym in symbols:
+        if time.time() - LAST_CRAWL_TIME.get(sym, 0) < COOLDOWN_SECONDS:
+            can_crawl = False
+            break
+            
+    if not can_crawl:
         print(f"[SYNC] ⏳ Chưa đủ 5 phút. Trả về MongoDB.", flush=True)
-        updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) 
-                        for sym in symbols if collection.find_one({"symbol": sym})}
+        updated_data = {}
+        for sym in symbols:
+            doc = collection.find_one({"symbol": sym})
+            if doc and "close" in doc:
+                updated_data[sym] = doc["close"]
         return jsonify({
             "status": "success",
             "updated_at": now_str + " (Cache 5 phút)",
@@ -356,31 +269,19 @@ def api_sync():
             "updated_data": updated_data,
         })
 
-    print(f"[SYNC] 🚀 Đủ điều kiện. Cào {len(symbols)} mã...", flush=True)
+    # Đủ điều kiện -> Cào ngầm và trả kết quả hiện tại (để người dùng không phải chờ)
+    print(f"[SYNC] 🚀 Kích hoạt cào ngầm {len(symbols)} mã...", flush=True)
+    threading.Thread(target=_execute_crawl, args=(symbols,)).start()
     
-    if not _acquire_crawl_lock(blocking=False):
-        print(f"[SYNC] ⏳ Có tiến trình khác đang cào. Trả về MongoDB.", flush=True)
-        updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) 
-                        for sym in symbols if collection.find_one({"symbol": sym})}
-        return jsonify({
-            "status": "success",
-            "updated_at": now_str + " (Đang cào)",
-            "updated_count": len(updated_data),
-            "updated_data": updated_data,
-        })
-        
-    try:
-        only_failed = not _is_trading_time()
-        _execute_crawl(symbols, source="user", only_failed=only_failed)
-    finally:
-        crawl_lock.release()
-    
-    updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) 
-                    for sym in symbols if collection.find_one({"symbol": sym})}
+    updated_data = {}
+    for sym in symbols:
+        doc = collection.find_one({"symbol": sym})
+        if doc and "close" in doc:
+            updated_data[sym] = doc["close"]
 
     return jsonify({
         "status": "success",
-        "updated_at": now_str,
+        "updated_at": now_str + " (Đang cào ngầm)",
         "updated_count": len(updated_data),
         "updated_data": updated_data,
     })
