@@ -70,6 +70,7 @@ github_sync_lock = threading.Lock()
 # Biến cờ hiệu cho cơ chế Hàng đợi (Lock)
 is_crawling = False
 crawl_lock = threading.Lock()
+crawl_start_time = 0 # Lưu thời điểm bắt đầu cào để chống kẹt
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -311,7 +312,7 @@ def api_price(symbol: str):
 
 @app.get("/api/sync")
 def api_sync():
-    global is_crawling
+    global is_crawling, crawl_start_time
     
     if collection is None:
         return jsonify({"status": "error", "message": "MongoDB chưa kết nối"}), 500
@@ -326,9 +327,8 @@ def api_sync():
     if len(symbols) > MAX_SYMBOLS_PER_REQUEST:
         abort(400, description=f"Too many symbols (max {MAX_SYMBOLS_PER_REQUEST})")
 
-    # --- CƠ CHẾ HÀNG ĐỢI (LOCK) ---
-    # Nếu có người đang cào, những người khác đợi tối đa 25s rồi lấy kết quả từ DB
-    if is_crawling:
+    # --- CƠ CHẾ HÀNG ĐỢI (CÓ CHỐNG KẸT) ---
+    if is_crawling and (time.time() - crawl_start_time < 60):
         print(f"[SYNC] ⏳ Có người đang cào giá, đợi lấy kết quả...", flush=True)
         wait_time = 0
         while is_crawling and wait_time < 25:
@@ -340,17 +340,26 @@ def api_sync():
             doc = collection.find_one({"symbol": sym})
             if doc and "close" in doc:
                 updated_data[sym] = doc["close"]
+            else:
+                updated_data[sym] = 0
                 
         return jsonify({
             "status": "success",
-            "updated_at": _now_str() + " (Đã chờ)",
+            "updated_at": _now_str() + " (Từ bộ nhớ tạm)",
             "updated_count": len(updated_data),
             "updated_data": updated_data,
         })
+    elif is_crawling:
+        print(f"[SYNC] ⚠️ Phát hiện tiến trình cào cũ bị treo quá 60s. Tự động giải phóng khóa!", flush=True)
+        is_crawling = False
 
     # --- BẮT ĐẦU CÀO GIÁ (NGƯỜI ĐẦU TIÊN) ---
     with crawl_lock:
+        if is_crawling:
+            return jsonify({"status": "error", "message": "Hệ thống đang bận, vui lòng thử lại sau giây lát."}), 503
+            
         is_crawling = True
+        crawl_start_time = time.time()
         print(f"[SYNC] 🚀 Bắt đầu cào giá thật từ sàn cho {len(symbols)} mã...", flush=True)
         
         now_str = _now_str()
@@ -371,17 +380,13 @@ def api_sync():
                     success += 1
                     print(f"[SYNC] ✅ {sym}: {res['close']:,}", flush=True)
                 else:
+                    print(f"[SYNC] ❌ Không lấy được giá {sym}", flush=True)
                     fail += 1
 
-            # Cập nhật giờ toàn cục nếu là lệnh cập nhật hàng loạt
+            # Cập nhật giờ toàn cục
             if len(symbols) >= 5 and success > 0:
                 if settings_col:
-                    settings_col.update_one(
-                        {"_id": "global_last_update"},
-                        {"$set": {"time": now_str}},
-                        upsert=True
-                    )
-                    print(f"[SYNC] Đã cập nhật mốc thời gian toàn cục: {now_str}", flush=True)
+                    settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
 
             # Đồng bộ Github
             if updated_data and GITHUB_TOKEN:
@@ -396,8 +401,7 @@ def api_sync():
                             update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
 
         finally:
-            # Mở khóa cho người tiếp theo
-            is_crawling = False 
+            is_crawling = False
 
         print(f"[SYNC] Hoàn tất: {success} OK | {fail} FAIL", flush=True)
         return jsonify({
