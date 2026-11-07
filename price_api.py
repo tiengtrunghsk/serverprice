@@ -22,7 +22,7 @@ DATA_FILE = "data.json"
 SYMBOLS_FILE = "vn100_symbols.json"
 LAST_UPDATE_FILE = "last_update.json"
 
-FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "10")) # Tăng lên 10s cho an toàn
+FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "30")) # Tăng lên 10s cho an toàn
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "45"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
 
