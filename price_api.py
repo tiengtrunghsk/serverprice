@@ -220,9 +220,19 @@ def api_last_update():
 
 @app.get("/api/data")
 def api_get_data():
-    cursor = collection.find({}, {"_id": 0})
-    data = {doc["symbol"]: doc for doc in cursor if "symbol" in doc}
-    return jsonify({"status": "success", "count": len(data), "data": data})
+    """Trả toàn bộ dữ liệu, đồng bộ cả trường 'close' và 'close_price' để Frontend dễ dùng."""
+    try:
+        cursor = collection.find({}, {"_id": 0})
+        data = {}
+        for doc in cursor:
+            sym = doc.get("symbol")
+            if sym:
+                # Đảm bảo Frontend luôn nhận được 'close_price' và 'updated_at' đúng định dạng
+                doc["close_price"] = doc.get("close", 0)
+                data[sym] = doc
+        return jsonify({"status": "success", "count": len(data), "data": data})
+    except PyMongoError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.get("/api/sync")
 def api_sync():
