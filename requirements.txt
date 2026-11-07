@@ -1,4 +1,5 @@
 flask>=3.0
 flask-cors>=4.0
-lotusmarket
+lotusmarket[fetchers]
 gunicorn
+httpx
