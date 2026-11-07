@@ -2,7 +2,7 @@
 Price API — Pro Quant Screener
 Phục vụ tại Render, lưu trữ dữ liệu trên MongoDB Atlas và đồng bộ ngược lại GitHub.
 
-Biến môi trường bắt buộc:
+Biến môi trường:
   - MONGO_URI : chuỗi kết nối MongoDB Atlas
   - GITHUB_TOKEN : Personal Access Token (quyền repo)
   - GITHUB_USERNAME : Tên tài khoản Github
@@ -74,6 +74,7 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 _cache: Dict[str, dict] = {}
 _cache_lock = threading.Lock()
+github_sync_lock = threading.Lock() # Lock để chống lỗi 409 khi commit GitHub
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -178,6 +179,7 @@ def get_github_file_data():
     except Exception as e:
         print(f"❌ Exception khi lấy GitHub: {e}", flush=True)
         return None, None
+
 
 def update_github_file(data_dict, commit_message):
     """Ghi đè nội dung data_dict lên data.json trên GitHub."""
@@ -306,16 +308,19 @@ def api_sync():
             print(f"[SYNC] ❌ Không lấy được giá {sym}", flush=True)
             fail += 1
 
-    # ĐỒNG BỘ LÊN GITHUB NGAY LẬP TỨC
+    # ĐỒNG BỘ LÊN GITHUB (DÙNG LOCK ĐỂ TRÁNH LỖI 409)
     if updated_data and GITHUB_TOKEN:
-        old_gh_data, _ = get_github_file_data()
-        if old_gh_data is not None:
-            for sym, price in updated_data.items():
-                if sym not in old_gh_data: old_gh_data[sym] = {}
-                old_gh_data[sym]["close"] = price
-                old_gh_data[sym]["updated_at"] = now_str
-            
-            update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
+        with github_sync_lock:
+            print("[GITHUB] Đang chờ lock để ghi đè Github...", flush=True)
+            old_gh_data, _ = get_github_file_data()
+            if old_gh_data is not None:
+                for sym, price in updated_data.items():
+                    if sym not in old_gh_data: old_gh_data[sym] = {}
+                    old_gh_data[sym]["close"] = price
+                    old_gh_data[sym]["updated_at"] = now_str
+                
+                update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
+            print("[GITHUB] Ghi đè hoàn tất.", flush=True)
 
     print(f"[SYNC] Hoàn tất: {success} OK | {fail} FAIL", flush=True)
     return jsonify({
@@ -343,24 +348,25 @@ def api_backup_github():
     if not mongo_data:
         return jsonify({"status": "error", "message": "MongoDB trống, không có gì để backup"}), 400
 
-    gh_data, _ = get_github_file_data()
-    if gh_data is None:
-        return jsonify({"status": "error", "message": "Không lấy được data.json từ GitHub"}), 500
+    with github_sync_lock:
+        gh_data, _ = get_github_file_data()
+        if gh_data is None:
+            return jsonify({"status": "error", "message": "Không lấy được data.json từ GitHub"}), 500
 
-    diff_count = 0
-    now_str = _now_str()
-    for sym, m_doc in mongo_data.items():
-        m_price = m_doc.get("close")
-        g_price = gh_data.get(sym, {}).get("close")
-        
-        if m_price != g_price:
-            if sym not in gh_data: gh_data[sym] = {}
-            gh_data[sym]["close"] = m_price
-            gh_data[sym]["updated_at"] = m_doc.get("updated_at", now_str)
-            diff_count += 1
+        diff_count = 0
+        now_str = _now_str()
+        for sym, m_doc in mongo_data.items():
+            m_price = m_doc.get("close")
+            g_price = gh_data.get(sym, {}).get("close")
+            
+            if m_price != g_price:
+                if sym not in gh_data: gh_data[sym] = {}
+                gh_data[sym]["close"] = m_price
+                gh_data[sym]["updated_at"] = m_doc.get("updated_at", now_str)
+                diff_count += 1
 
-    if diff_count > 0:
-        update_github_file(gh_data, f"Auto-backup {diff_count} prices from MongoDB ({now_str})")
+        if diff_count > 0:
+            update_github_file(gh_data, f"Auto-backup {diff_count} prices from MongoDB ({now_str})")
     
     return jsonify({
         "status": "success", 
