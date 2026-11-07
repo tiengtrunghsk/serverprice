@@ -2,7 +2,6 @@
 Price API — Pro Quant Screener
 Phục vụ tại Render, lưu trữ dữ liệu trên MongoDB Atlas và đồng bộ ngược lại GitHub.
 Quy tắc đồng bộ Github: Chỉ ghi sau 15h00 (GMT+7) và tối đa 3 lần/ngày.
-Cơ chế chống quá tải: Hàng đợi (Lock) - Chỉ 1 người gọi sàn, những người khác chờ lấy kết quả.
 """
 
 import os
@@ -66,11 +65,6 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 _cache: Dict[str, dict] = {}
 _cache_lock = threading.Lock()
 github_sync_lock = threading.Lock() 
-
-# Biến cờ hiệu cho cơ chế Hàng đợi (Lock)
-is_crawling = False
-crawl_lock = threading.Lock()
-crawl_start_time = 0 # Lưu thời điểm bắt đầu cào để chống kẹt
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -209,8 +203,7 @@ def update_github_file(data_dict, commit_message):
         if res.status_code in [200, 201]:
             print(f"✅ Đã ghi đè {GITHUB_FILE_PATH} lên GitHub!", flush=True)
             # Lưu lịch sử ghi để đếm số lần
-            if gh_history:
-                gh_history.insert_one({"time": datetime.utcnow(), "message": commit_message})
+            gh_history.insert_one({"time": datetime.utcnow(), "message": commit_message})
             return True
         else:
             print(f"❌ Lỗi commit GitHub: {res.status_code} - {res.text}", flush=True)
@@ -228,9 +221,6 @@ def can_update_github() -> bool:
     if not _is_after_15h():
         print("[GITHUB] ⏳ Chưa tới 15h, không ghi Github.", flush=True)
         return False
-
-    if not gh_history:
-        return True
 
     # Đếm số lần ghi trong ngày hôm nay (theo giờ UTC, sau khi đã lùi 7 tiếng)
     vn_now = datetime.utcnow() + timedelta(hours=7)
@@ -312,8 +302,7 @@ def api_price(symbol: str):
 
 @app.get("/api/sync")
 def api_sync():
-    global is_crawling, crawl_start_time
-    
+    """Lấy giá realtime cho danh sách mã, ghi đè vào MongoDB VÀ Github."""
     if collection is None:
         return jsonify({"status": "error", "message": "MongoDB chưa kết nối"}), 500
 
@@ -327,90 +316,67 @@ def api_sync():
     if len(symbols) > MAX_SYMBOLS_PER_REQUEST:
         abort(400, description=f"Too many symbols (max {MAX_SYMBOLS_PER_REQUEST})")
 
-    # --- CƠ CHẾ HÀNG ĐỢI (CÓ CHỐNG KẸT) ---
-    if is_crawling and (time.time() - crawl_start_time < 60):
-        print(f"[SYNC] ⏳ Có người đang cào giá, đợi lấy kết quả...", flush=True)
-        wait_time = 0
-        while is_crawling and wait_time < 25:
-            time.sleep(1)
-            wait_time += 1
-            
-        updated_data = {}
-        for sym in symbols:
-            doc = collection.find_one({"symbol": sym})
-            if doc and "close" in doc:
-                updated_data[sym] = doc["close"]
-            else:
-                updated_data[sym] = 0
-                
-        return jsonify({
-            "status": "success",
-            "updated_at": _now_str() + " (Từ bộ nhớ tạm)",
-            "updated_count": len(updated_data),
-            "updated_data": updated_data,
-        })
-    elif is_crawling:
-        print(f"[SYNC] ⚠️ Phát hiện tiến trình cào cũ bị treo quá 60s. Tự động giải phóng khóa!", flush=True)
-        is_crawling = False
+    print(f"[SYNC] Bắt đầu đồng bộ {len(symbols)} mã: {symbols}", flush=True)
+    now_str = _now_str()
+    updated_data = {}
+    success = 0
+    fail = 0
 
-    # --- BẮT ĐẦU CÀO GIÁ (NGƯỜI ĐẦU TIÊN) ---
-    with crawl_lock:
-        if is_crawling:
-            return jsonify({"status": "error", "message": "Hệ thống đang bận, vui lòng thử lại sau giây lát."}), 503
-            
-        is_crawling = True
-        crawl_start_time = time.time()
-        print(f"[SYNC] 🚀 Bắt đầu cào giá thật từ sàn cho {len(symbols)} mã...", flush=True)
-        
-        now_str = _now_str()
-        updated_data = {}
-        success = 0
-        fail = 0
+    for sym in symbols:
+        res = _get_price(sym, use_cache=False)
+        if res["close"] > 0:
+            try:
+                collection.update_one(
+                    {"symbol": sym},
+                    {"$set": {
+                        "symbol": sym,
+                        "close": res["close"],
+                        "updated_at": now_str,
+                    }},
+                    upsert=True,
+                )
+                updated_data[sym] = res["close"]
+                success += 1
+                print(f"[SYNC] ✅ {sym}: {res['close']:,}", flush=True)
+            except PyMongoError as e:
+                print(f"[SYNC] ❌ Lỗi ghi Mongo cho {sym}: {e}", flush=True)
+                fail += 1
+        else:
+            print(f"[SYNC] ❌ Không lấy được giá {sym}", flush=True)
+            fail += 1
 
-        try:
-            for sym in symbols:
-                res = _get_price(sym, use_cache=False)
-                if res["close"] > 0:
-                    collection.update_one(
-                        {"symbol": sym},
-                        {"$set": {"symbol": sym, "close": res["close"], "updated_at": now_str}},
-                        upsert=True,
-                    )
-                    updated_data[sym] = res["close"]
-                    success += 1
-                    print(f"[SYNC] ✅ {sym}: {res['close']:,}", flush=True)
-                else:
-                    print(f"[SYNC] ❌ Không lấy được giá {sym}", flush=True)
-                    fail += 1
+    # NẾU LÀ CẬP NHẬT HÀNG LOẠT (từ 5 mã trở lên), CẬP NHẬT LUÔN GIỜ TOÀN CỤC
+    if len(symbols) >= 5 and success > 0:
+        settings_col.update_one(
+            {"_id": "global_last_update"},
+            {"$set": {"time": now_str}},
+            upsert=True
+        )
+        print(f"[SYNC] Đã cập nhật mốc thời gian toàn cục: {now_str}", flush=True)
 
-            # Cập nhật giờ toàn cục
-            if len(symbols) >= 5 and success > 0:
-                if settings_col:
-                    settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
+    # ĐỒNG BỘ LÊN GITHUB (CÓ KIỂM TRA ĐIỀU KIỆN GIỜ VÀ SỐ LẦN)
+    if updated_data and GITHUB_TOKEN:
+        if can_update_github():
+            with github_sync_lock:
+                print("[GITHUB] Đang chờ lock để ghi đè Github...", flush=True)
+                old_gh_data, _ = get_github_file_data()
+                if old_gh_data is not None:
+                    for sym, price in updated_data.items():
+                        if sym not in old_gh_data: old_gh_data[sym] = {}
+                        old_gh_data[sym]["close"] = price
+                        old_gh_data[sym]["updated_at"] = now_str
+                    
+                    update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
+                print("[GITHUB] Ghi đè hoàn tất.", flush=True)
 
-            # Đồng bộ Github
-            if updated_data and GITHUB_TOKEN:
-                if can_update_github():
-                    with github_sync_lock:
-                        old_gh_data, _ = get_github_file_data()
-                        if old_gh_data is not None:
-                            for sym, price in updated_data.items():
-                                if sym not in old_gh_data: old_gh_data[sym] = {}
-                                old_gh_data[sym]["close"] = price
-                                old_gh_data[sym]["updated_at"] = now_str
-                            update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
-
-        finally:
-            is_crawling = False
-
-        print(f"[SYNC] Hoàn tất: {success} OK | {fail} FAIL", flush=True)
-        return jsonify({
-            "status": "success",
-            "updated_at": now_str,
-            "updated_count": len(updated_data),
-            "failed_count": fail,
-            "updated_data": updated_data,
-        })
+    print(f"[SYNC] Hoàn tất: {success} OK | {fail} FAIL", flush=True)
+    return jsonify({
+        "status": "success",
+        "updated_at": now_str,
+        "updated_count": len(updated_data),
+        "failed_count": fail,
+        "updated_data": updated_data,
+    })
 
 
 @app.get("/api/backup-github")
