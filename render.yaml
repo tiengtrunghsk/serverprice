@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: quant-price-api
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python price_api.py
+    healthCheckPath: /healthz
+
+    domains:
+      - dautuchungkhoan.ddns.net
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: FETCH_TIMEOUT
+        value: "8"
+      - key: CACHE_TTL
+        value: "45"
+      - key: MAX_SYMBOLS_PER_REQUEST
+        value: "20"
+      - key: ALLOWED_ORIGINS
+        value: "https://dautuchungkhoan.ddns.net"
