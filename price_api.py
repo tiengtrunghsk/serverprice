@@ -48,13 +48,14 @@ try:
     mongo_client.admin.command('ping')
     db = mongo_client['quant_db']
     collection = db['stocks']
-    # Collection dùng để lưu lịch sử ghi Github (chống spam)
-    gh_history = db['github_sync_history']
+    settings_col = db['settings'] # Lưu giờ cập nhật toàn cục
+    gh_history = db['github_sync_history'] # Lưu lịch sử ghi Github
     print("✅ Kết nối MongoDB thành công!", flush=True)
 except PyMongoError as e:
     print(f"❌ LỖI KẾT NỐI MONGODB: {e}", flush=True)
     db = None
     collection = None
+    settings_col = None
     gh_history = None
 
 # ===================== APP =====================
@@ -243,13 +244,29 @@ def root():
         "status": "ok",
         "db_connected": collection is not None,
         "github_configured": bool(GITHUB_TOKEN and GITHUB_USERNAME and GITHUB_REPO),
-        "endpoints": ["/healthz", "/api/data", "/api/price/<symbol>", "/api/sync?symbols=VCB,ACB", "/api/backup-github"],
+        "endpoints": ["/healthz", "/api/data", "/api/price/<symbol>", "/api/sync?symbols=VCB,ACB", "/api/backup-github", "/api/last-update"],
     })
 
 
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True, "ts": _now_str(), "db": collection is not None})
+
+
+@app.get("/api/last-update")
+def api_last_update():
+    """Lấy mốc thời gian cập nhật toàn cục từ MongoDB."""
+    if settings_col is None:
+        return jsonify({"last_update": "Chưa kết nối DB"})
+    
+    try:
+        setting = settings_col.find_one({"_id": "global_last_update"})
+        if setting and "time" in setting:
+            return jsonify({"last_update": setting["time"]})
+        return jsonify({"last_update": "Chưa có dữ liệu"})
+    except Exception as e:
+        print(f"[TIME] Lỗi: {e}", flush=True)
+        return jsonify({"last_update": "Lỗi DB"})
 
 
 @app.get("/api/data")
@@ -327,6 +344,15 @@ def api_sync():
         else:
             print(f"[SYNC] ❌ Không lấy được giá {sym}", flush=True)
             fail += 1
+
+    # NẾU LÀ CẬP NHẬT HÀNG LOẠT (từ 5 mã trở lên), CẬP NHẬT LUÔN GIỜ TOÀN CỤC
+    if len(symbols) >= 5 and success > 0:
+        settings_col.update_one(
+            {"_id": "global_last_update"},
+            {"$set": {"time": now_str}},
+            upsert=True
+        )
+        print(f"[SYNC] Đã cập nhật mốc thời gian toàn cục: {now_str}", flush=True)
 
     # ĐỒNG BỘ LÊN GITHUB (CÓ KIỂM TRA ĐIỀU KIỆN GIỜ VÀ SỐ LẦN)
     if updated_data and GITHUB_TOKEN:
