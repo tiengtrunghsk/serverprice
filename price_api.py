@@ -1,10 +1,11 @@
 """
 Price API — cập nhật giá realtime cho Pro Quant Screener.
+Deploy trên Render, phục vụ tại https://<service>.onrender.com
 
 Hai chế độ:
-  1) Server mode (mặc định): chạy HTTP API trên Render.
+  1) Server mode (mặc định):
        python price_api.py
-  2) Batch mode: cập nhật toàn bộ data.json (giữ tương thích pipeline cũ).
+  2) Batch mode (cập nhật toàn bộ data.json):
        python price_api.py --batch
 
 Endpoints:
@@ -20,12 +21,13 @@ import time
 import threading
 import concurrent.futures
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
 
 from lotusmarket import fetchers
+
 
 # ===================== CONFIG =====================
 DATA_FILE = "data.json"
@@ -33,17 +35,23 @@ SYMBOLS_FILE = "vn100_symbols.json"
 LAST_UPDATE_FILE = "last_update.json"
 
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "8"))
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "45"))       # giây
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "45"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
+
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
+if _raw_origins == "*" or not _raw_origins:
+    ALLOWED_ORIGINS = "*"
+else:
+    ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 
 # ===================== APP =====================
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
-# In-memory cache: { "VCB": {"close": 92000, "updated_at": "...", "ts": 1699...} }
 _cache: Dict[str, dict] = {}
 _cache_lock = threading.Lock()
+
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -51,10 +59,7 @@ def _now_str() -> str:
 
 
 def _fetch_one(symbol: str) -> Optional[int]:
-    """
-    Trả về giá close (int, VND) hoặc None nếu fail.
-    Dùng ThreadPoolExecutor để ép timeout cứng — tránh treo request HTTP.
-    """
+    """Trả về giá close (int, VND) hoặc None nếu fail/timeout."""
     def _do():
         try:
             stock = fetchers.vps(symbol)
@@ -73,8 +78,7 @@ def _fetch_one(symbol: str) -> Optional[int]:
     if not price or price <= 0:
         return None
 
-    # lotusmarket trả VND (VD 20350). Heuristic cũ: nếu < 1000 thì × 1000.
-    # Giữ nguyên hành vi cũ để không phá pipeline, nhưng log rõ để dễ debug.
+    # lotusmarket trả VND (VD 20350). Nếu < 1000 thì ×1000 (giữ hành vi cũ).
     if price < 1000:
         price = price * 1000
 
@@ -101,8 +105,7 @@ def _set_cache(symbol: str, close: int):
 
 
 def _get_price(symbol: str, use_cache: bool = True) -> dict:
-    """Trả về dict {symbol, close, updated_at, source} — source ∈ {cache, live, error}."""
-    symbol = symbol.strip().upper()
+    symbol = (symbol or "").strip().upper()
     if not symbol:
         return {"symbol": symbol, "close": 0, "updated_at": _now_str(), "source": "error"}
 
@@ -130,6 +133,19 @@ def _get_price(symbol: str, use_cache: bool = True) -> dict:
 
 
 # ===================== ROUTES =====================
+@app.get("/")
+def root():
+    return jsonify({
+        "service": "quant-price-api",
+        "status": "ok",
+        "endpoints": [
+            "/healthz",
+            "/api/price/<symbol>",
+            "/api/prices?symbols=VCB,ACB,FPT",
+        ],
+    })
+
+
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True, "ts": _now_str()})
@@ -160,14 +176,12 @@ def api_prices():
         abort(400, description=f"Too many symbols (max {MAX_SYMBOLS_PER_REQUEST})")
 
     no_cache = request.args.get("nocache") == "1"
-    data = {}
-    for sym in symbols:
-        data[sym] = _get_price(sym, use_cache=not no_cache)
+    data = {sym: _get_price(sym, use_cache=not no_cache) for sym in symbols}
 
     return jsonify({"updated_at": _now_str(), "data": data})
 
 
-# ===================== BATCH MODE (giữ tương thích) =====================
+# ===================== BATCH MODE =====================
 def _load_json(path: str, default):
     if not os.path.exists(path):
         return default
@@ -238,5 +252,4 @@ if __name__ == "__main__":
         run_batch()
     else:
         port = int(os.environ.get("PORT", "8000"))
-        # Render sẽ inject $PORT. debug=False để production an toàn.
         app.run(host="0.0.0.0", port=port, debug=False)
