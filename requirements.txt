@@ -4,3 +4,4 @@ lotusmarket[fetchers]
 gunicorn
 httpx
 pymongo
+requests
