@@ -4,6 +4,7 @@ Price API — Pro Quant Screener
 - Sau 15h & ngoài giờ: Nếu đã cào đủ tất cả mã, không gọi sàn nữa.
 - Nếu có mã lỗi, lần cào sau chỉ bổ sung những mã lỗi đó.
 - Timeout Lock: Tự giải phóng khóa nếu tiến trình cào treo quá 120s.
+- CHỐNG GHI GITHUB TRÙNG: Chỉ 1 luồng được ghi Github tại 1 thời điểm.
 """
 
 import os
@@ -62,15 +63,17 @@ except PyMongoError as e:
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
-github_sync_lock = threading.Lock() 
-
 # ==== BIẾN QUẢN LÝ TRẠNG THÁI ====
 is_auto_crawling = False
 crawl_lock = threading.Lock()
 crawl_start_time = 0
 LAST_CRAWL_TIME = {}
 
-# ==== BỘ THEO DÕI MÃ ĐÃ CÀO THÀNH CÔNG (để biết đã đủ dữ liệu ngoài giờ) ====
+# ==== CHỐNG GHI GITHUB TRÙNG ====
+github_write_lock = threading.Lock()  # Khóa cho việc ghi Github
+is_github_writing = False  # Cờ hiệu: Đang ghi Github
+
+# ==== BỘ THEO DÕI MÃ ĐÃ CÀO THÀNH CÔNG ====
 SUCCESS_CACHE: Set[str] = set()
 SUCCESS_CACHE_DATE = ""
 SUCCESS_CACHE_RESET_LOCK = threading.Lock()
@@ -182,6 +185,40 @@ def can_update_github() -> bool:
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
     return gh_history.count_documents({"time": {"$gte": start_of_day_utc}}) < 3
 
+def _sync_to_github(updated_data, now_str):
+    """Ghi dữ liệu lên Github, có cơ chế chống trùng."""
+    global is_github_writing
+    
+    if not updated_data or not GITHUB_TOKEN or not can_update_github():
+        return
+    
+    # Nếu đang có luồng khác ghi Github, bỏ qua (vì lần ghi hiện tại đã bao gồm dữ liệu mới nhất)
+    if is_github_writing:
+        print("[GITHUB] ⏳ Đang có luồng khác ghi Github. Bỏ qua lần này.", flush=True)
+        return
+    
+    try:
+        if not github_write_lock.acquire(blocking=False):
+            print("[GITHUB] ⏳ Không lấy được khóa ghi Github. Bỏ qua.", flush=True)
+            return
+        
+        is_github_writing = True
+        print("[GITHUB] 🚀 Bắt đầu ghi Github...", flush=True)
+        
+        old_gh_data, _ = get_github_file_data()
+        if old_gh_data is not None:
+            for sym, price in updated_data.items():
+                old_gh_data[sym] = old_gh_data.get(sym, {})
+                old_gh_data[sym]["close"] = price
+                old_gh_data[sym]["updated_at"] = now_str
+            update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
+        
+        print("[GITHUB] ✅ Ghi Github hoàn tất.", flush=True)
+        
+    finally:
+        is_github_writing = False
+        github_write_lock.release()
+
 # ===================== CORE CRAWL LOGIC =====================
 def _execute_crawl(symbols: list, source: str = "user", only_failed: bool = False):
     now_str = _now_str()
@@ -189,7 +226,6 @@ def _execute_crawl(symbols: list, source: str = "user", only_failed: bool = Fals
     
     _reset_cache_if_new_day()
     
-    # Nếu only_failed, bỏ qua các mã đã cào thành công trong phiên này
     if only_failed:
         symbols = [s for s in symbols if s not in SUCCESS_CACHE]
         if not symbols:
@@ -222,15 +258,8 @@ def _execute_crawl(symbols: list, source: str = "user", only_failed: bool = Fals
     if len(symbols) >= 5:
         settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
 
-    if updated_data and GITHUB_TOKEN and can_update_github():
-        with github_sync_lock:
-            old_gh_data, _ = get_github_file_data()
-            if old_gh_data is not None:
-                for sym, price in updated_data.items():
-                    old_gh_data[sym] = old_gh_data.get(sym, {})
-                    old_gh_data[sym]["close"] = price
-                    old_gh_data[sym]["updated_at"] = now_str
-                update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
+    # Ghi Github (có cơ chế chống trùng)
+    _sync_to_github(updated_data, now_str)
 
     print(f"[{source.upper()}] ✅ Hoàn tất cào {len(updated_data)}/{len(symbols)} mã.", flush=True)
 
@@ -249,8 +278,6 @@ def auto_crawler_worker():
                 if symbols:
                     if _acquire_crawl_lock(blocking=True):
                         try:
-                            # TRONG GIỜ GIAO DỊCH: Cào lại TOÀN BỘ để giá luôn mới
-                            # (only_failed=False để cào lại tất cả)
                             _execute_crawl(symbols, source="auto", only_failed=False)
                         finally:
                             crawl_lock.release()
@@ -294,10 +321,8 @@ def api_sync():
     now_str = _now_str()
     _reset_cache_if_new_day()
 
-    # ==== KIỂM TRA ĐÃ CÀO ĐỦ CHƯA ====
     all_done = all(sym in SUCCESS_CACHE for sym in symbols)
     
-    # ==== BƯỚC 1: ƯU TIÊN AUTO-CRAWL ====
     if is_auto_crawling:
         print(f"[SYNC] ⏳ Auto-crawl đang chạy. Trả về MongoDB.", flush=True)
         updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) 
@@ -309,7 +334,6 @@ def api_sync():
             "updated_data": updated_data,
         })
     
-    # ==== BƯỚC 2: NẾU NGOÀI GIỜ GIAO DỊCH VÀ ĐÃ ĐỦ DỮ LIỆU ====
     if not _is_trading_time() and all_done:
         print(f"[SYNC] ✅ Ngoài giờ GD và đã đủ dữ liệu. Không gọi sàn.", flush=True)
         updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) 
@@ -321,7 +345,6 @@ def api_sync():
             "updated_data": updated_data,
         })
 
-    # ==== BƯỚC 3: KIỂM TRA GIÃN CÁCH 5 PHÚT ====
     if not _can_user_crawl(symbols):
         print(f"[SYNC] ⏳ Chưa đủ 5 phút. Trả về MongoDB.", flush=True)
         updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) 
@@ -333,7 +356,6 @@ def api_sync():
             "updated_data": updated_data,
         })
 
-    # ==== BƯỚC 4: THỬ LẤY KHÓA CÀO ====
     print(f"[SYNC] 🚀 Đủ điều kiện. Cào {len(symbols)} mã...", flush=True)
     
     if not _acquire_crawl_lock(blocking=False):
@@ -348,8 +370,6 @@ def api_sync():
         })
         
     try:
-        # Nếu đang trong giờ giao dịch: cào lại toàn bộ để có giá mới
-        # Nếu ngoài giờ: chỉ cào bổ sung mã lỗi
         only_failed = not _is_trading_time()
         _execute_crawl(symbols, source="user", only_failed=only_failed)
     finally:
@@ -367,4 +387,4 @@ def api_sync():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False
