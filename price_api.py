@@ -1,21 +1,7 @@
 """
 Price API — Pro Quant Screener
 Phục vụ tại Render, lưu trữ dữ liệu trên MongoDB Atlas và đồng bộ ngược lại GitHub.
-
-Biến môi trường:
-  - MONGO_URI : chuỗi kết nối MongoDB Atlas
-  - GITHUB_TOKEN : Personal Access Token (quyền repo)
-  - GITHUB_USERNAME : Tên tài khoản Github
-  - GITHUB_REPO : Tên Repository
-  - GITHUB_FILE_PATH : (Tùy chọn) Mặc định là "data.json"
-  - GITHUB_BRANCH : (Tùy chọn) Mặc định là "main"
-
-Endpoint:
-  GET /healthz
-  GET /api/data                       -> Lấy toàn bộ dữ liệu cổ phiếu từ MongoDB
-  GET /api/price/<symbol>             -> Lấy giá realtime 1 mã (không ghi DB)
-  GET /api/sync?symbols=VCB,ACB,FPT   -> Lấy giá realtime + ghi vào MongoDB + ghi đè Github
-  GET /api/backup-github              -> Đối chiếu MongoDB và Github, nếu lệch thì ghi đè lại Github
+Quy tắc đồng bộ Github: Chỉ ghi sau 15h00 (GMT+7) và tối đa 3 lần/ngày.
 """
 
 import os
@@ -25,7 +11,7 @@ import json
 import base64
 import threading
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 import requests
@@ -62,11 +48,14 @@ try:
     mongo_client.admin.command('ping')
     db = mongo_client['quant_db']
     collection = db['stocks']
+    # Collection dùng để lưu lịch sử ghi Github (chống spam)
+    gh_history = db['github_sync_history']
     print("✅ Kết nối MongoDB thành công!", flush=True)
 except PyMongoError as e:
     print(f"❌ LỖI KẾT NỐI MONGODB: {e}", flush=True)
     db = None
     collection = None
+    gh_history = None
 
 # ===================== APP =====================
 app = Flask(__name__)
@@ -74,12 +63,18 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 _cache: Dict[str, dict] = {}
 _cache_lock = threading.Lock()
-github_sync_lock = threading.Lock() # Lock để chống lỗi 409 khi commit GitHub
+github_sync_lock = threading.Lock() 
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
-    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    """Trả về giờ Việt Nam (GMT+7) dạng chuỗi."""
+    vn_time = datetime.utcnow() + timedelta(hours=7)
+    return vn_time.strftime("%d/%m/%Y %H:%M:%S")
 
+def _is_after_15h() -> bool:
+    """Kiểm tra xem giờ hiện tại (GMT+7) đã qua 15h chưa."""
+    vn_time = datetime.utcnow() + timedelta(hours=7)
+    return vn_time.hour >= 15
 
 def _fetch_one(symbol: str) -> Optional[int]:
     """Lấy giá close từ lotusmarket với timeout cứng."""
@@ -206,6 +201,8 @@ def update_github_file(data_dict, commit_message):
         res = requests.put(api_url, headers=headers, json=payload, timeout=15)
         if res.status_code in [200, 201]:
             print(f"✅ Đã ghi đè {GITHUB_FILE_PATH} lên GitHub!", flush=True)
+            # Lưu lịch sử ghi để đếm số lần
+            gh_history.insert_one({"time": datetime.utcnow(), "message": commit_message})
             return True
         else:
             print(f"❌ Lỗi commit GitHub: {res.status_code} - {res.text}", flush=True)
@@ -213,6 +210,29 @@ def update_github_file(data_dict, commit_message):
     except Exception as e:
         print(f"❌ Exception khi commit GitHub: {e}", flush=True)
         return False
+
+def can_update_github() -> bool:
+    """
+    Kiểm tra điều kiện được phép ghi Github:
+    1. Phải sau 15h (giờ VN).
+    2. Trong ngày hôm nay chưa ghi quá 3 lần.
+    """
+    if not _is_after_15h():
+        print("[GITHUB] ⏳ Chưa tới 15h, không ghi Github.", flush=True)
+        return False
+
+    # Đếm số lần ghi trong ngày hôm nay (theo giờ UTC, sau khi đã lùi 7 tiếng)
+    vn_now = datetime.utcnow() + timedelta(hours=7)
+    start_of_day_vn = vn_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_of_day_utc = start_of_day_vn - timedelta(hours=7)
+    
+    count = gh_history.count_documents({"time": {"$gte": start_of_day_utc}})
+    
+    if count >= 3:
+        print(f"[GITHUB] 🛑 Đã ghi đủ 3 lần hôm nay. Không ghi nữa.", flush=True)
+        return False
+        
+    return True
 
 
 # ===================== ROUTES =====================
@@ -308,19 +328,20 @@ def api_sync():
             print(f"[SYNC] ❌ Không lấy được giá {sym}", flush=True)
             fail += 1
 
-    # ĐỒNG BỘ LÊN GITHUB (DÙNG LOCK ĐỂ TRÁNH LỖI 409)
+    # ĐỒNG BỘ LÊN GITHUB (CÓ KIỂM TRA ĐIỀU KIỆN GIỜ VÀ SỐ LẦN)
     if updated_data and GITHUB_TOKEN:
-        with github_sync_lock:
-            print("[GITHUB] Đang chờ lock để ghi đè Github...", flush=True)
-            old_gh_data, _ = get_github_file_data()
-            if old_gh_data is not None:
-                for sym, price in updated_data.items():
-                    if sym not in old_gh_data: old_gh_data[sym] = {}
-                    old_gh_data[sym]["close"] = price
-                    old_gh_data[sym]["updated_at"] = now_str
-                
-                update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
-            print("[GITHUB] Ghi đè hoàn tất.", flush=True)
+        if can_update_github():
+            with github_sync_lock:
+                print("[GITHUB] Đang chờ lock để ghi đè Github...", flush=True)
+                old_gh_data, _ = get_github_file_data()
+                if old_gh_data is not None:
+                    for sym, price in updated_data.items():
+                        if sym not in old_gh_data: old_gh_data[sym] = {}
+                        old_gh_data[sym]["close"] = price
+                        old_gh_data[sym]["updated_at"] = now_str
+                    
+                    update_github_file(old_gh_data, f"Auto-update prices via API ({now_str})")
+                print("[GITHUB] Ghi đè hoàn tất.", flush=True)
 
     print(f"[SYNC] Hoàn tất: {success} OK | {fail} FAIL", flush=True)
     return jsonify({
@@ -340,6 +361,9 @@ def api_backup_github():
     """
     if collection is None:
         return jsonify({"status": "error", "message": "MongoDB chưa kết nối"}), 500
+
+    if not can_update_github():
+        return jsonify({"status": "skipped", "message": "Chưa tới 15h hoặc đã ghi đủ 3 lần hôm nay."}), 200
 
     print("[BACKUP] Đang đối chiếu MongoDB và GitHub...", flush=True)
     
