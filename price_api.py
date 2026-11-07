@@ -1,36 +1,60 @@
 """
-Price API — cập nhật giá realtime cho Pro Quant Screener (Bản có Log chi tiết).
+Price API — Pro Quant Screener
+Phục vụ tại Render, lưu trữ dữ liệu trên MongoDB Atlas.
+
+Biến môi trường bắt buộc:
+  - MONGO_URI : chuỗi kết nối MongoDB Atlas
+
+Endpoint:
+  GET /healthz
+  GET /api/data                       -> Lấy toàn bộ dữ liệu cổ phiếu từ MongoDB
+  GET /api/price/<symbol>             -> Lấy giá realtime 1 mã (không ghi DB)
+  GET /api/sync?symbols=VCB,ACB,FPT   -> Lấy giá realtime + ghi đè vào MongoDB
 """
 
 import os
 import sys
-import json
 import time
 import threading
 import concurrent.futures
 import traceback
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 
 from lotusmarket import fetchers
 
 # ===================== CONFIG =====================
-DATA_FILE = "data.json"
-SYMBOLS_FILE = "vn100_symbols.json"
-LAST_UPDATE_FILE = "last_update.json"
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
+if not MONGO_URI:
+    print("❌ LỖI NGHIÊM TRỌNG: Chưa cấu hình biến môi trường MONGO_URI!", flush=True)
+    sys.exit(1)
 
-FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "30")) # Tăng lên 10s cho an toàn
+FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "45"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
-if _raw_origins == "*" or not _raw_origins:
-    ALLOWED_ORIGINS = "*"
-else:
-    ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+# ===================== DATABASE =====================
+print(f"🔌 Đang kết nối MongoDB...", flush=True)
+try:
+    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    # Ping thử để chắc chắn kết nối OK
+    mongo_client.admin.command('ping')
+    db = mongo_client['quant_db']
+    collection = db['stocks']
+    print("✅ Kết nối MongoDB thành công!", flush=True)
+except PyMongoError as e:
+    print(f"❌ LỖI KẾT NỐI MONGODB: {e}", flush=True)
+    # Không sys.exit để app vẫn boot, chỉ log lỗi (nếu IP chưa mở)
+    db = None
+    collection = None
 
 # ===================== APP =====================
 app = Flask(__name__)
@@ -43,24 +67,16 @@ _cache_lock = threading.Lock()
 def _now_str() -> str:
     return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
+
 def _fetch_one(symbol: str) -> Optional[int]:
-    """Trả về giá close (int, VND) hoặc None nếu fail/timeout."""
+    """Lấy giá close từ lotusmarket với timeout cứng."""
     def _do():
         try:
-            print(f"[FETCH] Bắt đầu lấy dữ liệu cho {symbol} từ lotusmarket...", flush=True)
             stock = fetchers.vps(symbol)
-            print(f"[FETCH] Dữ liệu thô nhận được từ {symbol}: {stock}", flush=True)
-            
-            if stock is None:
-                print(f"[FETCH] ❌ {symbol}: lotusmarket trả về None", flush=True)
-                return 0
-                
             price = getattr(stock, "close", 0) or 0
-            print(f"[FETCH] ✅ {symbol}: Lấy được close = {price}", flush=True)
             return price
         except Exception as e:
-            print(f"[FETCH] ❌ LỖI EXCEPTION khi lấy {symbol}: {type(e).__name__} - {e}", flush=True)
-            print(traceback.format_exc(), flush=True) # In toàn bộ traceback
+            print(f"[FETCH] ❌ Exception cho {symbol}: {type(e).__name__} - {e}", flush=True)
             return 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
@@ -68,19 +84,21 @@ def _fetch_one(symbol: str) -> Optional[int]:
         try:
             price = fut.result(timeout=FETCH_TIMEOUT)
         except concurrent.futures.TimeoutError:
-            print(f"[FETCH] ❌ TIMEOUT {FETCH_TIMEOUT}s khi lấy {symbol}", flush=True)
+            print(f"[FETCH] ❌ Timeout {FETCH_TIMEOUT}s cho {symbol}", flush=True)
             return None
         except Exception as e:
-            print(f"[FETCH] ❌ LỖI LUỒNG khi lấy {symbol}: {e}", flush=True)
+            print(f"[FETCH] ❌ Lỗi luồng cho {symbol}: {e}", flush=True)
             return None
 
     if not price or price <= 0:
         return None
 
+    # lotusmarket trả VND. Nếu < 1000 thì × 1000 (heuristic cũ)
     if price < 1000:
         price = price * 1000
 
     return int(price)
+
 
 def _get_cached(symbol: str) -> Optional[dict]:
     with _cache_lock:
@@ -91,13 +109,11 @@ def _get_cached(symbol: str) -> Optional[dict]:
             return None
         return entry
 
+
 def _set_cache(symbol: str, close: int):
     with _cache_lock:
-        _cache[symbol] = {
-            "close": close,
-            "updated_at": _now_str(),
-            "ts": time.time(),
-        }
+        _cache[symbol] = {"close": close, "ts": time.time()}
+
 
 def _get_price(symbol: str, use_cache: bool = True) -> dict:
     symbol = (symbol or "").strip().upper()
@@ -110,14 +126,12 @@ def _get_price(symbol: str, use_cache: bool = True) -> dict:
             return {
                 "symbol": symbol,
                 "close": cached["close"],
-                "updated_at": cached["updated_at"],
+                "updated_at": _now_str(),
                 "source": "cache",
             }
 
-    print(f"[PRICE] Không có cache, gọi _fetch_one cho {symbol}", flush=True)
     price = _fetch_one(symbol)
     if price is None:
-        print(f"[PRICE] ❌ {symbol}: Trả về lỗi (None) cho Frontend", flush=True)
         return {"symbol": symbol, "close": 0, "updated_at": _now_str(), "source": "error"}
 
     _set_cache(symbol, price)
@@ -128,14 +142,42 @@ def _get_price(symbol: str, use_cache: bool = True) -> dict:
         "source": "live",
     }
 
+
 # ===================== ROUTES =====================
 @app.get("/")
 def root():
-    return jsonify({"service": "quant-price-api", "status": "ok"})
+    return jsonify({
+        "service": "quant-price-api",
+        "status": "ok",
+        "db_connected": collection is not None,
+        "endpoints": ["/healthz", "/api/data", "/api/price/<symbol>", "/api/sync?symbols=VCB,ACB"],
+    })
+
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"ok": True, "ts": _now_str()})
+    return jsonify({"ok": True, "ts": _now_str(), "db": collection is not None})
+
+
+@app.get("/api/data")
+def api_get_data():
+    """Trả toàn bộ dữ liệu trong collection stocks (dùng thay cho data.json tĩnh)."""
+    if collection is None:
+        return jsonify({"status": "error", "message": "MongoDB chưa kết nối"}), 500
+
+    try:
+        cursor = collection.find({}, {"_id": 0})
+        data = {}
+        for doc in cursor:
+            sym = doc.get("symbol")
+            if sym:
+                data[sym] = doc
+        print(f"[DATA] Trả về {len(data)} mã từ MongoDB.", flush=True)
+        return jsonify({"status": "success", "count": len(data), "data": data})
+    except PyMongoError as e:
+        print(f"[DATA] ❌ Lỗi Mongo: {e}", flush=True)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.get("/api/price/<symbol>")
 def api_price(symbol: str):
@@ -144,76 +186,66 @@ def api_price(symbol: str):
         abort(400, description="Invalid symbol")
 
     no_cache = request.args.get("nocache") == "1"
-    print(f"[API] Có request lấy giá {symbol} (nocache={no_cache})", flush=True)
     result = _get_price(symbol, use_cache=not no_cache)
-    
-    if result["close"] > 0:
-        return jsonify(result), 200
-    else:
-        return jsonify(result), 502
+    return jsonify(result), (200 if result["close"] > 0 else 502)
 
-@app.get("/api/prices")
-def api_prices():
+
+@app.get("/api/sync")
+def api_sync():
+    """Lấy giá realtime cho danh sách mã, ghi đè vào MongoDB."""
+    if collection is None:
+        return jsonify({"status": "error", "message": "MongoDB chưa kết nối"}), 500
+
     raw = request.args.get("symbols", "").strip()
     if not raw:
         abort(400, description="Missing ?symbols=")
+
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    no_cache = request.args.get("nocache") == "1"
-    
-    print(f"[API] Có request lấy list mã: {symbols}", flush=True)
-    data = {sym: _get_price(sym, use_cache=not no_cache) for sym in symbols}
-    return jsonify({"updated_at": _now_str(), "data": data})
+    if not symbols:
+        abort(400, description="Empty symbols list")
+    if len(symbols) > MAX_SYMBOLS_PER_REQUEST:
+        abort(400, description=f"Too many symbols (max {MAX_SYMBOLS_PER_REQUEST})")
 
-# ===================== BATCH MODE (Giữ nguyên) =====================
-def _load_json(path: str, default):
-    if not os.path.exists(path): return default
-    try:
-        with open(path, "r", encoding="utf-8") as f: return json.load(f)
-    except Exception as e:
-        print(f"⚠️ Lỗi đọc {path}: {e}", flush=True)
-        return default
-
-def _get_symbols_batch() -> List[str]:
-    data = _load_json(SYMBOLS_FILE, None)
-    if isinstance(data, list) and data:
-        if isinstance(data[0], dict): return [item["symbol"] for item in data if "symbol" in item]
-        return data
-    stock_db = _load_json(DATA_FILE, {})
-    if stock_db: return list(stock_db.keys())
-    return []
-
-def run_batch():
-    symbols = _get_symbols_batch()
-    if not symbols: return
-    stock_db = _load_json(DATA_FILE, {})
+    print(f"[SYNC] Bắt đầu đồng bộ {len(symbols)} mã: {symbols}", flush=True)
     now_str = _now_str()
-    print("=" * 60, flush=True)
-    print(f"🚀 BATCH CẬP NHẬT GIÁ — {len(symbols)} mã", flush=True)
-    print("=" * 60, flush=True)
-    ok = fail = 0
-    for i, sym in enumerate(symbols, 1):
-        print(f"[{i:>3}/{len(symbols)}] {sym:<6} ...", end="", flush=True)
-        price = _fetch_one(sym)
-        if price and price > 0:
-            stock_db.setdefault(sym, {})
-            stock_db[sym]["close"] = price
-            stock_db[sym]["updated_at"] = now_str
-            print(f" ✅ {price:>10,}", flush=True)
-            ok += 1
+    updated_data = {}
+    success = 0
+    fail = 0
+
+    for sym in symbols:
+        res = _get_price(sym, use_cache=False)
+        if res["close"] > 0:
+            try:
+                collection.update_one(
+                    {"symbol": sym},
+                    {"$set": {
+                        "symbol": sym,
+                        "close": res["close"],
+                        "updated_at": now_str,
+                    }},
+                    upsert=True,
+                )
+                updated_data[sym] = res["close"]
+                success += 1
+                print(f"[SYNC] ✅ {sym}: {res['close']:,}", flush=True)
+            except PyMongoError as e:
+                print(f"[SYNC] ❌ Lỗi ghi Mongo cho {sym}: {e}", flush=True)
+                fail += 1
         else:
-            print(f" ❌", flush=True)
+            print(f"[SYNC] ❌ Không lấy được giá {sym}", flush=True)
             fail += 1
-        time.sleep(1.0)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(stock_db, f, ensure_ascii=False, indent=4)
-    with open(LAST_UPDATE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"last_update": now_str}, f, ensure_ascii=False, indent=4)
-    print(f"\n📊 TỔNG KẾT: {ok} OK | {fail} FAIL", flush=True)
+
+    print(f"[SYNC] Hoàn tất: {success} OK | {fail} FAIL", flush=True)
+    return jsonify({
+        "status": "success",
+        "updated_at": now_str,
+        "updated_count": len(updated_data),
+        "failed_count": fail,
+        "updated_data": updated_data,
+    })
+
 
 # ===================== ENTRYPOINT =====================
 if __name__ == "__main__":
-    if "--batch" in sys.argv:
-        run_batch()
-    else:
-        port = int(os.environ.get("PORT", "8000"))
-        app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
