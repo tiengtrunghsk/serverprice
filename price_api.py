@@ -1,8 +1,10 @@
 """
 Price API — Pro Quant Screener
-- Cào OHLC/Volume -> Lưu liên tục vào MongoDB.
-- Tự động chốt sổ (D1, W1, MN) lên GitHub sau 15h.
-- Nếu thiếu dữ liệu, đánh dấu để cào bù ở các phiên sau.
+Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ OHLC & Volume.
+BẢO VỆ GITHUB 4 LỚP: 5 phút/mã, 10 phút/lần ghi, 3 lần/ngày, chống spam.
+CHỐNG RÁC: Tự động bỏ qua (không lưu DB, không đẩy Github) nếu API trả về OHLC = 0.
+KHÓA SỔ TỪNG MÃ: Đã chốt sổ hôm nay thì không cào API nữa.
+AUTO RESET: Tự động xóa cờ chốt sổ khi sang ngày mới.
 """
 
 import os
@@ -62,6 +64,7 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 is_crawling = False
 crawl_lock = threading.Lock()
 LAST_CRAWL_TIME = {}
+LAST_GITHUB_WRITE_TIME = 0
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -99,6 +102,7 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         except Exception:
             return None
 
+    # CHỐT CHẶN: Nếu OHLC = 0 là ngày nghỉ -> Bỏ qua
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
         return None
     
@@ -148,9 +152,18 @@ def update_github_file(file_path, data_dict, commit_message):
     return False
 
 def can_update_github_today() -> bool:
+    global LAST_GITHUB_WRITE_TIME
+    # Lớp 4: Chống spam (Phải cách lần ghi trước ít nhất 10 phút)
+    if time.time() - LAST_GITHUB_WRITE_TIME < 600: return False
+    if not gh_history: 
+        LAST_GITHUB_WRITE_TIME = time.time()
+        return True
     vn_now = datetime.utcnow() + timedelta(hours=7)
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
-    return gh_history.count_documents({"time": {"$gte": start_of_day_utc}}) == 0
+    count_today = gh_history.count_documents({"time": {"$gte": start_of_day_utc}})
+    if count_today >= 3: return False
+    LAST_GITHUB_WRITE_TIME = time.time()
+    return True
 
 # ===================== CORE CRAWL LOGIC =====================
 def _execute_crawl(symbols: list):
@@ -165,6 +178,14 @@ def _execute_crawl(symbols: list):
         print(f"[CRAWL] 🚀 Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
         
         for sym in symbols:
+            # KHÓA SỔ TỪNG MÃ: Nếu đã chốt sổ hôm nay thì bỏ qua cào API
+            doc = collection.find_one({"symbol": sym})
+            if doc and doc.get("chot_so_today") == trading_date:
+                print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date}. Bỏ qua cào API.", flush=True)
+                if "close" in doc:
+                    updated_data[sym] = doc["close"]
+                continue
+
             data = _fetch_one(sym)
             
             if data:
@@ -176,21 +197,16 @@ def _execute_crawl(symbols: list):
                         "open": data["open"], "high": data["high"], 
                         "low": data["low"], "volume": data["volume"],
                         "trading_date": trading_date,
-                        "updated_at": now_str
+                        "updated_at": now_str,
+                        "is_locked": False # Mặc định chưa khóa
                     }},
                     upsert=True
                 )
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
                 
-                # 2. CHỐT SỔ SAU 15H
+                # 2. CHỐT SỔ SAU 15H VÀ CHƯA ĐƯỢC CHỐT
                 if _is_after_15h() and can_update_github_today():
-                    # Kiểm tra xem hôm nay đã chốt sổ chưa
-                    doc = collection.find_one({"symbol": sym})
-                    if doc and doc.get("chot_so_d1") == trading_date:
-                        print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date} trước đó.", flush=True)
-                        continue
-
                     history_path = f"history/{sym}.json"
                     hist_data, _ = get_github_file_data(history_path)
                     
@@ -249,7 +265,8 @@ def _execute_crawl(symbols: list):
                         hist_data["history_mn"] = mn_bars
                         
                         if update_github_file(history_path, hist_data, f"Chốt sổ D1/W1/MN {sym} ngày {trading_date}"):
-                            collection.update_one({"symbol": sym}, {"$set": {"chot_so_d1": trading_date}})
+                            # ĐÁNH DẤU ĐÃ CHỐT SỔ VÀ KHÓA
+                            collection.update_one({"symbol": sym}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
                             print(f"[GITHUB] 📤 Đã chốt sổ {sym} (D1/W1/MN) ngày {trading_date}", flush=True)
 
                 print(f"[CRAWL] ✅ {sym}: {data['close']:,} | KL: {data['volume']:,}", flush=True)
@@ -267,6 +284,14 @@ def auto_crawler_worker():
     print("⏰ [AUTO] Đã bật luồng tự động cập nhật giá (15 phút/lần).", flush=True)
     while True:
         try:
+            # RESET CỜ KHÓA SỔ KHI SANG NGÀY MỚI
+            vn_now = datetime.utcnow() + timedelta(hours=7)
+            today_str = vn_now.strftime("%Y-%m-%d")
+            collection.update_many(
+                {"chot_so_today": {"$ne": today_str}},
+                {"$unset": {"chot_so_today": "", "is_locked": ""}}
+            )
+
             symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             if symbols:
                 _execute_crawl(symbols)
