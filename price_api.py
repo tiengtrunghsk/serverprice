@@ -2,10 +2,9 @@
 Price API — Pro Quant Screener
 Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ OHLC & Volume.
 ĐỒNG BỘ TỰ ĐỘNG: Đọc danh sách mã từ vn100_symbols.json, so sánh với MongoDB (Thiếu thêm - Thừa xóa).
-BẢO VỆ GITHUB 4 LỚP: 5 phút/mã, 10 phút/lần ghi, 3 lần/ngày, chống spam.
-CHỐNG RÁC: Tự động bỏ qua (không lưu DB, không đẩy Github) nếu API trả về OHLC = 0.
-KHÓA SỔ TỪNG MÃ: Đã chốt sổ hôm nay thì không cào API nữa.
-AUTO RESET: Tự động xóa cờ chốt sổ khi sang ngày mới.
+CÀO BÙ THÔNG MINH: Mã lỗi được đánh dấu is_incomplete. Chỉ cào bù các mã bị đánh dấu.
+CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ (10 lần ghi/ngày).
+CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
 """
 
 import os
@@ -37,7 +36,6 @@ GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 
-# Đường dẫn file danh sách mã (nằm cùng thư mục với app.py)
 SYMBOLS_JSON_FILE = "vn100_symbols.json"
 
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
@@ -58,9 +56,7 @@ try:
     gh_history = db['github_sync_history']
     print("✅ Kết nối MongoDB thành công!", flush=True)
     
-    # -----------------------------------------------------------
     # TỰ ĐỘNG ĐỒNG BỘ DANH SÁCH MÃ TỪ FILE JSON SANG MONGODB
-    # -----------------------------------------------------------
     if os.path.exists(SYMBOLS_JSON_FILE):
         try:
             with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
@@ -69,17 +65,14 @@ try:
             if len(json_symbols) > 0:
                 print(f"🔄 Đang đồng bộ danh sách mã từ {SYMBOLS_JSON_FILE} sang MongoDB...", flush=True)
                 
-                # 1. Lấy danh sách mã hiện có trong MongoDB
                 db_symbols = set([doc["symbol"] for doc in collection.find({}, {"symbol": 1})])
                 
-                # 2. Tìm mã cần THÊM (có trong JSON, chưa có trong DB)
                 symbols_to_add = json_symbols - db_symbols
                 if symbols_to_add:
                     print(f"➕ Thêm {len(symbols_to_add)} mã mới vào DB: {', '.join(symbols_to_add)}", flush=True)
                     for sym in symbols_to_add:
                         collection.insert_one({"symbol": sym})
 
-                # 3. Tìm mã cần XÓA (có trong DB, không có trong JSON)
                 symbols_to_remove = db_symbols - json_symbols
                 if symbols_to_remove:
                     print(f"➖ Xóa {len(symbols_to_remove)} mã không còn trong JSON khỏi DB: {', '.join(symbols_to_remove)}", flush=True)
@@ -93,7 +86,6 @@ try:
             print(f"⚠️ Lỗi khi đọc/đồng bộ file {SYMBOLS_JSON_FILE}: {e}", flush=True)
     else:
         print(f"⚠️ Không tìm thấy file {SYMBOLS_JSON_FILE}. Server sẽ dùng danh sách hiện có trong MongoDB.", flush=True)
-    # -----------------------------------------------------------
 
 except PyMongoError as e:
     print(f"❌ LỖI KẾT NỐI MONGODB: {e}", flush=True)
@@ -203,12 +195,13 @@ def can_update_github_today() -> bool:
     vn_now = datetime.utcnow() + timedelta(hours=7)
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
     count_today = gh_history.count_documents({"time": {"$gte": start_of_day_utc}})
-    if count_today >= 3: return False
+    # Tăng giới hạn lên 10 lần/ngày để đảm bảo chốt sổ đầy đủ
+    if count_today >= 10: return False
     LAST_GITHUB_WRITE_TIME = time.time()
     return True
 
 # ===================== CORE CRAWL LOGIC =====================
-def _execute_crawl(symbols: list):
+def _execute_crawl(symbols: list, is_retry: bool = False):
     global is_crawling
     if is_crawling: return
     is_crawling = True
@@ -217,7 +210,8 @@ def _execute_crawl(symbols: list):
         trading_date = _get_trading_date_str()
         updated_data = {}
         
-        print(f"[CRAWL] 🚀 Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
+        mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
+        print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
         
         for sym in symbols:
             # KHÓA SỔ TỪNG MÃ: Nếu đã chốt sổ hôm nay thì bỏ qua cào API
@@ -240,7 +234,8 @@ def _execute_crawl(symbols: list):
                         "low": data["low"], "volume": data["volume"],
                         "trading_date": trading_date,
                         "updated_at": now_str,
-                        "is_locked": False # Mặc định chưa khóa
+                        "is_locked": False,
+                        "is_incomplete": False # Đánh dấu đã đầy đủ
                     }},
                     upsert=True
                 )
@@ -313,7 +308,16 @@ def _execute_crawl(symbols: list):
 
                 print(f"[CRAWL] ✅ {sym}: {data['close']:,} | KL: {data['volume']:,}", flush=True)
             else:
-                print(f"[CRAWL] 💤 {sym}: Ngày nghỉ hoặc OHLC=0. Bỏ qua.", flush=True)
+                # ĐÁNH DẤU LỖI (KHÔNG ghi đè giá trị cũ của ngày khác)
+                collection.update_one(
+                    {"symbol": sym},
+                    {"$set": {
+                        "is_incomplete": True,
+                        "last_error_at": now_str
+                    }},
+                    upsert=True
+                )
+                print(f"[CRAWL] ⚠️ {sym}: Lỗi API. Đã đánh dấu để cào bù.", flush=True)
 
         if len(symbols) >= 5:
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
@@ -326,17 +330,69 @@ def auto_crawler_worker():
     print("⏰ [AUTO] Đã bật luồng tự động cập nhật giá (15 phút/lần).", flush=True)
     while True:
         try:
-            # RESET CỜ KHÓA SỔ KHI SANG NGÀY MỚI
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
+            is_after_15h = vn_now.hour >= 15
+
+            # 1. Reset cờ khi sang ngày mới
             collection.update_many(
                 {"chot_so_today": {"$ne": today_str}},
                 {"$unset": {"chot_so_today": "", "is_locked": ""}}
             )
 
-            symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-            if symbols:
-                _execute_crawl(symbols)
+            # 2. Lấy danh sách tất cả các mã
+            all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+            
+            # 3. Phân loại mã cần cào
+            incomplete_symbols = []  # Mã bị lỗi API
+            unchot_symbols = []      # Mã chưa được chốt sổ hôm nay (đủ dữ liệu nhưng chưa push)
+            
+            for sym in all_symbols:
+                doc = collection.find_one({"symbol": sym})
+                if not doc: 
+                    incomplete_symbols.append(sym)
+                    continue
+                
+                # Mã bị lỗi dữ liệu
+                if doc.get("is_incomplete"):
+                    incomplete_symbols.append(sym)
+                    continue
+                
+                # Mã chưa chốt sổ hôm nay (dù đã có dữ liệu)
+                if doc.get("trading_date") == today_str and doc.get("chot_so_today") != today_str:
+                    if is_after_15h:
+                        unchot_symbols.append(sym)
+            
+            # 4. Ưu tiên 1: Cào bù các mã bị lỗi
+            if incomplete_symbols:
+                print(f"[AUTO] 🔄 Phát hiện {len(incomplete_symbols)} mã bị lỗi. Đang cào bù...", flush=True)
+                _execute_crawl(incomplete_symbols, is_retry=True)
+
+            # 5. Ưu tiên 2: Chốt sổ các mã đã có dữ liệu nhưng chưa được push
+            if is_after_15h and unchot_symbols:
+                print(f"[AUTO] 📤 Phát hiện {len(unchot_symbols)} mã đủ dữ liệu nhưng chưa chốt sổ. Đang xử lý...", flush=True)
+                _execute_crawl(unchot_symbols)
+            
+            # 6. Ưu tiên 3: Cào mới các mã chưa có dữ liệu hôm nay (trong phiên)
+            if not is_after_15h:
+                symbols_to_crawl = []
+                for sym in all_symbols:
+                    doc = collection.find_one({"symbol": sym})
+                    if not doc or doc.get("trading_date") != today_str:
+                        symbols_to_crawl.append(sym)
+                
+                if symbols_to_crawl:
+                    _execute_crawl(symbols_to_crawl)
+
+            # 7. Báo cáo tình trạng
+            if is_after_15h:
+                total = len(all_symbols)
+                completed = total - len(incomplete_symbols) - len(unchot_symbols)
+                if incomplete_symbols or unchot_symbols:
+                    print(f"[AUTO] ⏳ Tiến độ chốt sổ: {completed}/{total} mã. Còn {len(incomplete_symbols)} lỗi, {len(unchot_symbols)} chưa chốt.", flush=True)
+                else:
+                    print(f"[AUTO] ✅ HOÀN TẤT 100%: Đã chốt sổ toàn bộ {total} mã hôm nay!", flush=True)
+
             time.sleep(900)
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
