@@ -6,6 +6,7 @@ CÀO BÙ THÔNG MINH: Mã lỗi được đánh dấu is_incomplete. Chỉ cào 
 CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ (10 lần ghi/ngày).
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
 TELEGRAM: Gửi thông báo khi chốt sổ thành công và khi hoàn tất 100%.
+TÍNH TOÁN % GIÁ: Lưu prev_close vào MongoDB để tính % và mũi tên ngay trên Server.
 """
 
 import os
@@ -52,7 +53,6 @@ ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip
 
 # ===================== TELEGRAM HELPER =====================
 def send_telegram(message: str):
-    """Gửi tin nhắn về Telegram (nếu có cấu hình)"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -73,7 +73,7 @@ try:
     gh_history = db['github_sync_history']
     print("✅ Kết nối MongoDB thành công!", flush=True)
     
-    # TỰ ĐỘNG ĐỒNG BỘ DANH SÁCH MÃ TỪ FILE JSON SANG MONGODB
+    # TỰ ĐỘNG ĐỒNG BỘ DANH SÁCH MÃ
     if os.path.exists(SYMBOLS_JSON_FILE):
         try:
             with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
@@ -81,7 +81,6 @@ try:
             
             if len(json_symbols) > 0:
                 print(f"🔄 Đang đồng bộ danh sách mã từ {SYMBOLS_JSON_FILE} sang MongoDB...", flush=True)
-                
                 db_symbols = set([doc["symbol"] for doc in collection.find({}, {"symbol": 1})])
                 
                 symbols_to_add = json_symbols - db_symbols
@@ -96,13 +95,13 @@ try:
                     collection.delete_many({"symbol": {"$in": list(symbols_to_remove)}})
                 
                 if not symbols_to_add and not symbols_to_remove:
-                    print("ℹ️ Danh sách mã trên MongoDB đã đồng bộ hoàn toàn với file JSON.", flush=True)
+                    print("ℹ️ Danh sách mã trên MongoDB đã đồng bộ hoàn toàn.", flush=True)
             else:
-                print(f"⚠️ File {SYMBOLS_JSON_FILE} rỗng. Bỏ qua đồng bộ để bảo vệ dữ liệu.", flush=True)
+                print(f"⚠️ File {SYMBOLS_JSON_FILE} rỗng. Bỏ qua đồng bộ.", flush=True)
         except Exception as e:
             print(f"⚠️ Lỗi khi đọc/đồng bộ file {SYMBOLS_JSON_FILE}: {e}", flush=True)
     else:
-        print(f"⚠️ Không tìm thấy file {SYMBOLS_JSON_FILE}. Server sẽ dùng danh sách hiện có trong MongoDB.", flush=True)
+        print(f"⚠️ Không tìm thấy file {SYMBOLS_JSON_FILE}. Dùng danh sách hiện có.", flush=True)
 
 except PyMongoError as e:
     print(f"❌ LỖI KẾT NỐI MONGODB: {e}", flush=True)
@@ -153,7 +152,6 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         except Exception:
             return None
 
-    # CHỐT CHẶN: Nếu OHLC = 0 là ngày nghỉ -> Bỏ qua
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
         return None
     
@@ -204,7 +202,6 @@ def update_github_file(file_path, data_dict, commit_message):
 
 def can_update_github_today() -> bool:
     global LAST_GITHUB_WRITE_TIME
-    # Lớp 4: Chống spam (Phải cách lần ghi trước ít nhất 10 phút)
     if time.time() - LAST_GITHUB_WRITE_TIME < 600: return False
     if not gh_history: 
         LAST_GITHUB_WRITE_TIME = time.time()
@@ -212,7 +209,6 @@ def can_update_github_today() -> bool:
     vn_now = datetime.utcnow() + timedelta(hours=7)
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
     count_today = gh_history.count_documents({"time": {"$gte": start_of_day_utc}})
-    # Tăng giới hạn lên 10 lần/ngày để đảm bảo chốt sổ đầy đủ
     if count_today >= 10: return False
     LAST_GITHUB_WRITE_TIME = time.time()
     return True
@@ -232,35 +228,42 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
         
         for sym in symbols:
-            # KHÓA SỔ TỪNG MÃ: Nếu đã chốt sổ hôm nay thì bỏ qua cào API
             doc = collection.find_one({"symbol": sym})
+            
+            # KHÓA SỔ TỪNG MÃ
             if doc and doc.get("chot_so_today") == trading_date:
-                print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date}. Bỏ qua cào API.", flush=True)
-                if "close" in doc:
-                    updated_data[sym] = doc["close"]
+                print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date}. Bỏ qua.", flush=True)
+                if "close" in doc: updated_data[sym] = doc["close"]
                 continue
 
             data = _fetch_one(sym)
             
             if data:
-                # 1. LƯU VÀO MONGODB (Luôn cập nhật giá realtime)
+                # Lấy prev_close cũ trong MongoDB (nếu có) để lưu lại
+                prev_close = doc.get("prev_close", 0) if doc else 0
+                # Nếu sang ngày giao dịch mới, cập nhật prev_close = close của phiên trước
+                if doc and doc.get("trading_date") != trading_date and doc.get("close", 0) > 0:
+                    prev_close = doc.get("close")
+                
+                # 1. LƯU VÀO MONGODB
                 collection.update_one(
                     {"symbol": sym},
                     {"$set": {
                         "symbol": sym, "close": data["close"], 
+                        "prev_close": prev_close, # Lưu lại để API tính %
                         "open": data["open"], "high": data["high"], 
                         "low": data["low"], "volume": data["volume"],
                         "trading_date": trading_date,
                         "updated_at": now_str,
                         "is_locked": False,
-                        "is_incomplete": False # Đánh dấu đã đầy đủ
+                        "is_incomplete": False
                     }},
                     upsert=True
                 )
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
                 
-                # 2. CHỐT SỔ SAU 15H VÀ CHƯA ĐƯỢC CHỐT
+                # 2. CHỐT SỔ SAU 15H
                 if _is_after_15h() and can_update_github_today():
                     history_path = f"history/{sym}.json"
                     hist_data, _ = get_github_file_data(history_path)
@@ -270,14 +273,14 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         w1_bars = hist_data.get("history_w1", [])
                         mn_bars = hist_data.get("history_mn", [])
                         
-                        # --- XỬ LÝ D1 ---
+                        # XỬ LÝ D1
                         d1_bar = {"time": trading_date, "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data["volume"]}
                         d1_idx = next((i for i, b in enumerate(d1_bars) if b["time"] == trading_date), -1)
                         if d1_idx == -1: d1_bars.append(d1_bar)
                         else: d1_bars[d1_idx] = d1_bar
                         d1_bars.sort(key=lambda x: x["time"])
                         
-                        # --- XỬ LÝ W1 (Tuần) ---
+                        # XỬ LÝ W1
                         vn_now = datetime.utcnow() + timedelta(hours=7)
                         start_of_week = vn_now - timedelta(days=vn_now.weekday())
                         week_str = start_of_week.strftime("%Y-%m-%d")
@@ -285,8 +288,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         week_bars_in_d1 = [b for b in d1_bars if datetime.strptime(b["time"], "%Y-%m-%d") >= start_of_week.replace(hour=0, minute=0, second=0)]
                         if week_bars_in_d1:
                             w1_bar = {
-                                "time": week_str,
-                                "open": week_bars_in_d1[0]["open"],
+                                "time": week_str, "open": week_bars_in_d1[0]["open"],
                                 "high": max(b["high"] for b in week_bars_in_d1),
                                 "low": min(b["low"] for b in week_bars_in_d1),
                                 "close": week_bars_in_d1[-1]["close"],
@@ -297,13 +299,12 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                             else: w1_bars[w1_idx] = w1_bar
                             w1_bars.sort(key=lambda x: x["time"])
 
-                        # --- XỬ LÝ MN (Tháng) ---
+                        # XỬ LÝ MN
                         month_str = vn_now.strftime("%Y-%m-01")
                         month_bars_in_d1 = [b for b in d1_bars if b["time"].startswith(vn_now.strftime("%Y-%m"))]
                         if month_bars_in_d1:
                             mn_bar = {
-                                "time": month_str,
-                                "open": month_bars_in_d1[0]["open"],
+                                "time": month_str, "open": month_bars_in_d1[0]["open"],
                                 "high": max(b["high"] for b in month_bars_in_d1),
                                 "low": min(b["low"] for b in month_bars_in_d1),
                                 "close": month_bars_in_d1[-1]["close"],
@@ -314,26 +315,20 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                             else: mn_bars[mn_idx] = mn_bar
                             mn_bars.sort(key=lambda x: x["time"])
 
-                        # Đẩy lên GitHub
                         hist_data["history_d1"] = d1_bars
                         hist_data["history_w1"] = w1_bars
                         hist_data["history_mn"] = mn_bars
                         
                         if update_github_file(history_path, hist_data, f"Chốt sổ D1/W1/MN {sym} ngày {trading_date}"):
-                            # ĐÁNH DẤU ĐÃ CHỐT SỔ VÀ KHÓA
                             collection.update_one({"symbol": sym}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
                             print(f"[GITHUB] 📤 Đã chốt sổ {sym} (D1/W1/MN) ngày {trading_date}", flush=True)
                             synced_count += 1
 
                 print(f"[CRAWL] ✅ {sym}: {data['close']:,} | KL: {data['volume']:,}", flush=True)
             else:
-                # ĐÁNH DẤU LỖI (KHÔNG ghi đè giá trị cũ của ngày khác)
                 collection.update_one(
                     {"symbol": sym},
-                    {"$set": {
-                        "is_incomplete": True,
-                        "last_error_at": now_str
-                    }},
+                    {"$set": {"is_incomplete": True, "last_error_at": now_str}},
                     upsert=True
                 )
                 print(f"[CRAWL] ⚠️ {sym}: Lỗi API. Đã đánh dấu để cào bù.", flush=True)
@@ -341,20 +336,18 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         if len(symbols) >= 5:
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
 
-        # BÁO CÁO TELEGRAM KHI CHỐT SỔ THÀNH CÔNG
         if _is_after_15h() and synced_count > 0:
             msg = f"""✅ <b>CẬP NHẬT DỮ LIỆU THÀNH CÔNG</b>
 🕒 Thời gian: {now_str}
 📤 Đã đẩy lên GitHub: <b>{synced_count} mã</b>
 📅 Ngày giao dịch: {trading_date}
-🔄 Hệ thống tự động kích hoạt Workflow Simulator & Screener.
 """
             send_telegram(msg)
 
     finally:
         is_crawling = False
 
-# ===================== BACKGROUND WORKER (AUTO 15m) =====================
+# ===================== BACKGROUND WORKER =====================
 def auto_crawler_worker():
     print("⏰ [AUTO] Đã bật luồng tự động cập nhật giá (15 phút/lần).", flush=True)
     while True:
@@ -363,72 +356,57 @@ def auto_crawler_worker():
             today_str = vn_now.strftime("%Y-%m-%d")
             is_after_15h = vn_now.hour >= 15
 
-            # 1. Reset cờ khi sang ngày mới
             collection.update_many(
                 {"chot_so_today": {"$ne": today_str}},
                 {"$unset": {"chot_so_today": "", "is_locked": ""}}
             )
 
-            # 2. Lấy danh sách tất cả các mã
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             
-            # 3. Phân loại mã cần cào
-            incomplete_symbols = []  # Mã bị lỗi API
-            unchot_symbols = []      # Mã chưa được chốt sổ hôm nay (đủ dữ liệu nhưng chưa push)
+            incomplete_symbols = []
+            unchot_symbols = []
             
             for sym in all_symbols:
                 doc = collection.find_one({"symbol": sym})
                 if not doc: 
                     incomplete_symbols.append(sym)
                     continue
-                
-                # Mã bị lỗi dữ liệu
                 if doc.get("is_incomplete"):
                     incomplete_symbols.append(sym)
                     continue
-                
-                # Mã chưa chốt sổ hôm nay (dù đã có dữ liệu)
                 if doc.get("trading_date") == today_str and doc.get("chot_so_today") != today_str:
                     if is_after_15h:
                         unchot_symbols.append(sym)
             
-            # 4. Ưu tiên 1: Cào bù các mã bị lỗi
             if incomplete_symbols:
-                print(f"[AUTO] 🔄 Phát hiện {len(incomplete_symbols)} mã bị lỗi. Đang cào bù...", flush=True)
+                print(f"[AUTO] 🔄 Phát hiện {len(incomplete_symbols)} mã lỗi. Cào bù...", flush=True)
                 _execute_crawl(incomplete_symbols, is_retry=True)
 
-            # 5. Ưu tiên 2: Chốt sổ các mã đã có dữ liệu nhưng chưa được push
             if is_after_15h and unchot_symbols:
-                print(f"[AUTO] 📤 Phát hiện {len(unchot_symbols)} mã đủ dữ liệu nhưng chưa chốt sổ. Đang xử lý...", flush=True)
+                print(f"[AUTO] 📤 Phát hiện {len(unchot_symbols)} mã chưa chốt. Xử lý...", flush=True)
                 _execute_crawl(unchot_symbols)
             
-            # 6. Ưu tiên 3: Cào mới các mã chưa có dữ liệu hôm nay (trong phiên)
             if not is_after_15h:
                 symbols_to_crawl = []
                 for sym in all_symbols:
                     doc = collection.find_one({"symbol": sym})
                     if not doc or doc.get("trading_date") != today_str:
                         symbols_to_crawl.append(sym)
-                
                 if symbols_to_crawl:
                     _execute_crawl(symbols_to_crawl)
 
-            # 7. Báo cáo tình trạng
             if is_after_15h:
                 total = len(all_symbols)
                 completed = total - len(incomplete_symbols) - len(unchot_symbols)
-                
                 if completed == total:
                     msg = f"""🎉 <b>HOÀN TẤT CHỐT SỔ NGÀY {today_str}</b>
 ✅ Trạng thái: 100% ({total}/{total} mã)
-📤 Toàn bộ dữ liệu đã được đồng bộ lên GitHub.
-🔗 Link: https://dautuchungkhoan.ddns.net
 """
                     send_telegram(msg)
-                    print(f"[AUTO] ✅ HOÀN TẤT 100%: Đã gửi báo cáo Telegram.", flush=True)
-                    time.sleep(3600) # Nghỉ 1 tiếng sau khi hoàn tất để tránh spam
+                    print(f"[AUTO] ✅ HOÀN TẤT 100%.", flush=True)
+                    time.sleep(3600)
                 else:
-                    print(f"[AUTO] ⏳ Tiến độ: {completed}/{total} mã. Còn {len(incomplete_symbols)} lỗi, {len(unchot_symbols)} chưa chốt.", flush=True)
+                    print(f"[AUTO] ⏳ Tiến độ: {completed}/{total} mã.", flush=True)
 
             time.sleep(900)
         except Exception as e:
@@ -446,7 +424,34 @@ def api_get_data():
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
-                doc["close_price"] = doc.get("close", 0)
+                close_price = doc.get("close", 0)
+                prev_close = doc.get("prev_close", 0)
+                doc["close_price"] = close_price
+                
+                # --- TÍNH % VÀ MŨI TÊN ---
+                price_change_percent = 0.0
+                price_change_available = False
+                arrow = "—"
+                color = "slate"
+                
+                if close_price > 0 and prev_close > 0:
+                    raw_pct = ((close_price - prev_close) / prev_close) * 100
+                    if -30.0 <= raw_pct <= 30.0:
+                        price_change_percent = round(raw_pct, 2)
+                        price_change_available = True
+                        
+                        if price_change_percent > 0:
+                            arrow = "▲"
+                            color = "emerald"
+                        elif price_change_percent < 0:
+                            arrow = "▼"
+                            color = "rose"
+                
+                doc["price_change_percent"] = price_change_percent
+                doc["price_change_available"] = price_change_available
+                doc["price_arrow"] = arrow
+                doc["price_color"] = color
+                
                 data[sym] = doc
         return jsonify({"status": "success", "count": len(data), "data": data})
     except PyMongoError as e:
