@@ -241,10 +241,26 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
             if data:
                 # Lấy prev_close cũ trong MongoDB (nếu có) để lưu lại
                 prev_close = doc.get("prev_close", 0) if doc else 0
+                
                 # Nếu sang ngày giao dịch mới, cập nhật prev_close = close của phiên trước
                 if doc and doc.get("trading_date") != trading_date and doc.get("close", 0) > 0:
                     prev_close = doc.get("close")
                 
+                # FALLBACK: Nếu DB chưa có prev_close (lần đầu chạy code mới) -> Lấy từ history
+                if prev_close == 0:
+                    try:
+                        hist_data, _ = get_github_file_data(f"history/{sym}.json")
+                        if hist_data and hist_data.get("history_d1"):
+                            bars = hist_data["history_d1"]
+                            # Nếu nến cuối cùng trùng ngày hôm nay thì lấy nến trước đó, nếu không lấy nến cuối
+                            if bars[-1]["time"] == trading_date and len(bars) >= 2:
+                                prev_close = bars[-2]["close"]
+                            elif bars[-1]["time"] != trading_date:
+                                prev_close = bars[-1]["close"]
+                            print(f"[CRAWL] 🔄 {sym}: Lấy prev_close từ history = {prev_close}", flush=True)
+                    except Exception:
+                        pass
+
                 # 1. LƯU VÀO MONGODB
                 collection.update_one(
                     {"symbol": sym},
