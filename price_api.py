@@ -1,8 +1,12 @@
 """
 Price API — Pro Quant Screener
 Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ OHLC & Volume.
-...
-TÍNH TOÁN % GIÁ: Tự động trích xuất prev_close từ file history để đảm bảo luôn có % ngay cả trong ngày nghỉ.
+ĐỒNG BỘ TỰ ĐỘNG: Đọc danh sách mã từ vn100_symbols.json, so sánh với MongoDB (Thiếu thêm - Thừa xóa).
+CÀO BÙ THÔNG MINH: Mã lỗi được đánh dấu is_incomplete. Chỉ cào bù các mã bị đánh dấu.
+CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ (10 lần ghi/ngày).
+CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
+TELEGRAM: Gửi thông báo khi chốt sổ thành công và khi hoàn tất 100%.
+TÍNH TOÁN % GIÁ: Lưu prev_close vào MongoDB (tự động chuẩn hóa đơn vị) để tính % và mũi tên.
 """
 
 import os
@@ -69,6 +73,7 @@ try:
     gh_history = db['github_sync_history']
     print("✅ Kết nối MongoDB thành công!", flush=True)
     
+    # TỰ ĐỘNG ĐỒNG BỘ DANH SÁCH MÃ
     if os.path.exists(SYMBOLS_JSON_FILE):
         try:
             with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
@@ -225,6 +230,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         for sym in symbols:
             doc = collection.find_one({"symbol": sym})
             
+            # KHÓA SỔ TỪNG MÃ
             if doc and doc.get("chot_so_today") == trading_date:
                 print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date}. Bỏ qua.", flush=True)
                 if "close" in doc: updated_data[sym] = doc["close"]
@@ -247,6 +253,10 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                             prev_close = bars[-1]["close"]
                     elif len(bars) == 1:
                         prev_close = bars[0]["close"]
+                        
+                    # XỬ LÝ LỖI ĐƠN VỊ (Nếu giá < 1000 thì nhân 1000)
+                    if 0 < prev_close < 1000:
+                        prev_close = prev_close * 1000
 
                 # 1. LƯU VÀO MONGODB
                 collection.update_one(
@@ -276,12 +286,14 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         w1_bars = hist_data.get("history_w1", [])
                         mn_bars = hist_data.get("history_mn", [])
                         
+                        # XỬ LÝ D1
                         d1_bar = {"time": trading_date, "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data["volume"]}
                         d1_idx = next((i for i, b in enumerate(d1_bars) if b["time"] == trading_date), -1)
                         if d1_idx == -1: d1_bars.append(d1_bar)
                         else: d1_bars[d1_idx] = d1_bar
                         d1_bars.sort(key=lambda x: x["time"])
                         
+                        # XỬ LÝ W1
                         vn_now = datetime.utcnow() + timedelta(hours=7)
                         start_of_week = vn_now - timedelta(days=vn_now.weekday())
                         week_str = start_of_week.strftime("%Y-%m-%d")
@@ -300,6 +312,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                             else: w1_bars[w1_idx] = w1_bar
                             w1_bars.sort(key=lambda x: x["time"])
 
+                        # XỬ LÝ MN
                         month_str = vn_now.strftime("%Y-%m-01")
                         month_bars_in_d1 = [b for b in d1_bars if b["time"].startswith(vn_now.strftime("%Y-%m"))]
                         if month_bars_in_d1:
