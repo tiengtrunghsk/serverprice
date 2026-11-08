@@ -1,8 +1,8 @@
 """
 Price API — Pro Quant Screener
-- Cào OHLC/Volume -> Lưu liên tục vào MongoDB (kèm trading_date).
-- Nếu OHLC = 0 (Ngày nghỉ) -> Không lưu.
-- Đẩy file history/MÃ.json lên GitHub: CHỈ 1 LẦN DUY NHẤT SAU 15H, gắn đúng ngày giao dịch.
+- Cào OHLC/Volume -> Lưu liên tục vào MongoDB.
+- Tự động chốt sổ (D1, W1, MN) lên GitHub sau 15h.
+- Nếu thiếu dữ liệu, đánh dấu để cào bù ở các phiên sau.
 """
 
 import os
@@ -36,7 +36,7 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
-COOLDOWN_SECONDS = 300 # 5 phút
+COOLDOWN_SECONDS = 300
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -68,20 +68,10 @@ def _now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
 
 def _get_trading_date_str() -> str:
-    """
-    Trả về ngày giao dịch thực tế.
-    Nếu hôm nay là T7/CN, tự động lùi về Thứ 6.
-    """
     vn_now = datetime.utcnow() + timedelta(hours=7)
-    # Nếu là T7 (5) hoặc CN (6) -> Lùi ngày
     while vn_now.weekday() >= 5:
         vn_now -= timedelta(days=1)
     return vn_now.strftime("%Y-%m-%d")
-
-def _is_trading_time() -> bool:
-    vn_now = datetime.utcnow() + timedelta(hours=7)
-    if vn_now.weekday() >= 5: return False
-    return 9 <= vn_now.hour < 15
 
 def _is_after_15h() -> bool:
     vn_time = datetime.utcnow() + timedelta(hours=7)
@@ -109,11 +99,9 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         except Exception:
             return None
 
-    # CHỐT CHẶN: Nếu OHLC = 0 là ngày nghỉ -> Bỏ qua
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
         return None
     
-    # Nhân 1000 nếu giá < 1000
     if data["close"] < 1000:
         for k in ["close", "open", "high", "low"]:
             if data[k] > 0: data[k] = data[k] * 1000
@@ -123,7 +111,7 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         "high": int(data["high"]), "low": int(data["low"]), "volume": int(data["volume"])
     }
 
-# ===================== GITHUB SYNC (PUSH HISTORY) =====================
+# ===================== GITHUB SYNC =====================
 def get_github_file_data(file_path):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
     api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{file_path}?ref={GITHUB_BRANCH}"
@@ -134,7 +122,7 @@ def get_github_file_data(file_path):
             file_info = res.json()
             return json.loads(base64.b64decode(file_info["content"]).decode("utf-8")), file_info["sha"]
         elif res.status_code == 404:
-            return {}, None
+            return {"history_d1": [], "history_w1": [], "history_mn": []}, None
         return None, None
     except Exception:
         return None, None
@@ -160,7 +148,6 @@ def update_github_file(file_path, data_dict, commit_message):
     return False
 
 def can_update_github_today() -> bool:
-    """Kiểm tra xem hôm nay đã đẩy file history này lên chưa (giới hạn 1 lần/ngày/mã)"""
     vn_now = datetime.utcnow() + timedelta(hours=7)
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
     return gh_history.count_documents({"time": {"$gte": start_of_day_utc}}) == 0
@@ -172,7 +159,7 @@ def _execute_crawl(symbols: list):
     is_crawling = True
     try:
         now_str = _now_str()
-        trading_date = _get_trading_date_str() # Ngày giao dịch thực tế
+        trading_date = _get_trading_date_str()
         updated_data = {}
         
         print(f"[CRAWL] 🚀 Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
@@ -181,14 +168,14 @@ def _execute_crawl(symbols: list):
             data = _fetch_one(sym)
             
             if data:
-                # 1. CẬP NHẬT MONGODB (Lưu cả trading_date)
+                # 1. LƯU VÀO MONGODB (Luôn cập nhật giá realtime)
                 collection.update_one(
                     {"symbol": sym},
                     {"$set": {
                         "symbol": sym, "close": data["close"], 
                         "open": data["open"], "high": data["high"], 
                         "low": data["low"], "volume": data["volume"],
-                        "trading_date": trading_date, # LƯU NGÀY GIAO DỊCH THỰC TẾ
+                        "trading_date": trading_date,
                         "updated_at": now_str
                     }},
                     upsert=True
@@ -196,33 +183,74 @@ def _execute_crawl(symbols: list):
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
                 
-                # 2. NẾU ĐÃ QUA 15H VÀ HÔM NAY CHƯA ĐẨY -> ĐẨY LÊN GITHUB
+                # 2. CHỐT SỔ SAU 15H
                 if _is_after_15h() and can_update_github_today():
+                    # Kiểm tra xem hôm nay đã chốt sổ chưa
+                    doc = collection.find_one({"symbol": sym})
+                    if doc and doc.get("chot_so_d1") == trading_date:
+                        print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date} trước đó.", flush=True)
+                        continue
+
                     history_path = f"history/{sym}.json"
                     hist_data, _ = get_github_file_data(history_path)
                     
-                    if hist_data is not None and "history_d1" in hist_data:
-                        bars = hist_data["history_d1"]
-                        # Tìm nến của ngày giao dịch thực tế
-                        today_idx = next((i for i, b in enumerate(bars) if b["time"] == trading_date), -1)
+                    if hist_data is not None:
+                        d1_bars = hist_data.get("history_d1", [])
+                        w1_bars = hist_data.get("history_w1", [])
+                        mn_bars = hist_data.get("history_mn", [])
                         
-                        new_bar = {
-                            "time": trading_date, # Dùng ngày giao dịch thực tế
-                            "open": data["open"], "high": data["high"],
-                            "low": data["low"], "close": data["close"],
-                            "volume": data["volume"]
-                        }
+                        # --- XỬ LÝ D1 ---
+                        d1_bar = {"time": trading_date, "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data["volume"]}
+                        d1_idx = next((i for i, b in enumerate(d1_bars) if b["time"] == trading_date), -1)
+                        if d1_idx == -1: d1_bars.append(d1_bar)
+                        else: d1_bars[d1_idx] = d1_bar
+                        d1_bars.sort(key=lambda x: x["time"])
                         
-                        if today_idx == -1:
-                            bars.append(new_bar) # Chưa có -> Thêm nến mới
-                        else:
-                            bars[today_idx] = new_bar # Có rồi -> Ghi đè (Cập nhật giá chốt)
-                            
-                        bars.sort(key=lambda x: x["time"])
+                        # --- XỬ LÝ W1 (Tuần) ---
+                        vn_now = datetime.utcnow() + timedelta(hours=7)
+                        start_of_week = vn_now - timedelta(days=vn_now.weekday())
+                        week_str = start_of_week.strftime("%Y-%m-%d")
                         
+                        week_bars_in_d1 = [b for b in d1_bars if datetime.strptime(b["time"], "%Y-%m-%d") >= start_of_week.replace(hour=0, minute=0, second=0)]
+                        if week_bars_in_d1:
+                            w1_bar = {
+                                "time": week_str,
+                                "open": week_bars_in_d1[0]["open"],
+                                "high": max(b["high"] for b in week_bars_in_d1),
+                                "low": min(b["low"] for b in week_bars_in_d1),
+                                "close": week_bars_in_d1[-1]["close"],
+                                "volume": sum(b["volume"] for b in week_bars_in_d1)
+                            }
+                            w1_idx = next((i for i, b in enumerate(w1_bars) if b["time"] == week_str), -1)
+                            if w1_idx == -1: w1_bars.append(w1_bar)
+                            else: w1_bars[w1_idx] = w1_bar
+                            w1_bars.sort(key=lambda x: x["time"])
+
+                        # --- XỬ LÝ MN (Tháng) ---
+                        month_str = vn_now.strftime("%Y-%m-01")
+                        month_bars_in_d1 = [b for b in d1_bars if b["time"].startswith(vn_now.strftime("%Y-%m"))]
+                        if month_bars_in_d1:
+                            mn_bar = {
+                                "time": month_str,
+                                "open": month_bars_in_d1[0]["open"],
+                                "high": max(b["high"] for b in month_bars_in_d1),
+                                "low": min(b["low"] for b in month_bars_in_d1),
+                                "close": month_bars_in_d1[-1]["close"],
+                                "volume": sum(b["volume"] for b in month_bars_in_d1)
+                            }
+                            mn_idx = next((i for i, b in enumerate(mn_bars) if b["time"] == month_str), -1)
+                            if mn_idx == -1: mn_bars.append(mn_bar)
+                            else: mn_bars[mn_idx] = mn_bar
+                            mn_bars.sort(key=lambda x: x["time"])
+
                         # Đẩy lên GitHub
-                        if update_github_file(history_path, hist_data, f"Chốt nến {sym} ngày {trading_date}"):
-                            print(f"[GITHUB] 📤 Đã chốt nến {sym} ngày {trading_date} lên history/", flush=True)
+                        hist_data["history_d1"] = d1_bars
+                        hist_data["history_w1"] = w1_bars
+                        hist_data["history_mn"] = mn_bars
+                        
+                        if update_github_file(history_path, hist_data, f"Chốt sổ D1/W1/MN {sym} ngày {trading_date}"):
+                            collection.update_one({"symbol": sym}, {"$set": {"chot_so_d1": trading_date}})
+                            print(f"[GITHUB] 📤 Đã chốt sổ {sym} (D1/W1/MN) ngày {trading_date}", flush=True)
 
                 print(f"[CRAWL] ✅ {sym}: {data['close']:,} | KL: {data['volume']:,}", flush=True)
             else:
