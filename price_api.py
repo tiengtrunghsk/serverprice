@@ -5,7 +5,7 @@ Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ O
 CÀO BÙ THÔNG MINH: Mã lỗi được đánh dấu is_incomplete. Chỉ cào bù các mã bị đánh dấu.
 CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ (10 lần ghi/ngày).
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
-TELEGRAM: Gửi thông báo khi chốt sổ thành công và khi hoàn tất 100%.
+TELEGRAM: Gửi thông báo khi chốt sổ thành công, khi hoàn tất 100%, và CẢNH BÁO BIẾN ĐỘNG MẠNH (±5%).
 TÍNH TOÁN % GIÁ: Lưu prev_close vào MongoDB (tự động chuẩn hóa đơn vị) để tính % và mũi tên.
 """
 
@@ -116,6 +116,10 @@ crawl_lock = threading.Lock()
 LAST_CRAWL_TIME = {}
 LAST_GITHUB_WRITE_TIME = 0
 
+# Biến lưu trữ cảnh báo Telegram trong ngày
+ALERT_SENT_TODAY = set()
+CURRENT_ALERT_DATE = ""
+
 # ===================== HELPERS =====================
 def _now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
@@ -215,7 +219,7 @@ def can_update_github_today() -> bool:
 
 # ===================== CORE CRAWL LOGIC =====================
 def _execute_crawl(symbols: list, is_retry: bool = False):
-    global is_crawling
+    global is_crawling, ALERT_SENT_TODAY, CURRENT_ALERT_DATE
     if is_crawling: return
     is_crawling = True
     try:
@@ -224,13 +228,17 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         updated_data = {}
         synced_count = 0
         
+        # Reset danh sách cảnh báo nếu sang ngày mới
+        if CURRENT_ALERT_DATE != trading_date:
+            ALERT_SENT_TODAY = set()
+            CURRENT_ALERT_DATE = trading_date
+        
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
         
         for sym in symbols:
             doc = collection.find_one({"symbol": sym})
             
-            # KHÓA SỔ TỪNG MÃ
             if doc and doc.get("chot_so_today") == trading_date:
                 print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date}. Bỏ qua.", flush=True)
                 if "close" in doc: updated_data[sym] = doc["close"]
@@ -239,14 +247,13 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
             data = _fetch_one(sym)
             
             if data:
-                # Lấy prev_close từ history (Luôn lấy để đảm bảo tính đúng %)
+                # Lấy prev_close từ history
                 hist_data, _ = get_github_file_data(f"history/{sym}.json")
                 prev_close = doc.get("prev_close", 0) if doc else 0
                 
                 if hist_data and hist_data.get("history_d1"):
                     bars = hist_data["history_d1"]
                     if len(bars) >= 2:
-                        # Nếu nến cuối cùng trùng ngày hôm nay (VD: đã chốt sổ hôm nay) thì prev là nến áp chót
                         if bars[-1]["time"] == trading_date:
                             prev_close = bars[-2]["close"]
                         else:
@@ -254,7 +261,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                     elif len(bars) == 1:
                         prev_close = bars[0]["close"]
                         
-                    # XỬ LÝ LỖI ĐƠN VỊ (Nếu giá < 1000 thì nhân 1000)
                     if 0 < prev_close < 1000:
                         prev_close = prev_close * 1000
 
@@ -263,7 +269,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                     {"symbol": sym},
                     {"$set": {
                         "symbol": sym, "close": data["close"], 
-                        "prev_close": prev_close, # Lưu lại để API tính %
+                        "prev_close": prev_close,
                         "open": data["open"], "high": data["high"], 
                         "low": data["low"], "volume": data["volume"],
                         "trading_date": trading_date,
@@ -276,6 +282,23 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
                 
+                # --- BẮT ĐẦU: LOGIC CẢNH BÁO BIẾN ĐỘNG MẠNH QUA TELEGRAM ---
+                if prev_close > 0 and sym not in ALERT_SENT_TODAY:
+                    pct_change = ((data["close"] - prev_close) / prev_close) * 100
+                    if pct_change >= 5.0 or pct_change <= -5.0:
+                        arrow = "🔴 GIẢM MẠNH" if pct_change < 0 else "🟢 TĂNG MẠNH"
+                        msg = f"""⚠️ <b>CẢNH BÁO BIẾN ĐỘNG MẠNH</b>
+Mã: <b>{sym}</b>
+Mức thay đổi: <b>{pct_change:+.2f}%</b> {arrow}
+Giá hiện tại: {data['close']:,} VNĐ
+Giá tham chiếu: {prev_close:,} VNĐ
+Thời gian: {now_str}
+"""
+                        send_telegram(msg)
+                        ALERT_SENT_TODAY.add(sym)
+                        print(f"[TELEGRAM] 🚀 Đã gửi cảnh báo biến động {sym}: {pct_change:.2f}%", flush=True)
+                # --- KẾT THÚC: LOGIC CẢNH BÁO ---
+
                 # 2. CHỐT SỔ SAU 15H
                 if _is_after_15h() and can_update_github_today():
                     history_path = f"history/{sym}.json"
