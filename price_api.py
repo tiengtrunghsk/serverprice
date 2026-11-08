@@ -5,8 +5,8 @@ Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ O
 CÀO BÙ THÔNG MINH: Mã lỗi được đánh dấu is_incomplete. Chỉ cào bù các mã bị đánh dấu.
 CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ (10 lần ghi/ngày).
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
-TELEGRAM: Gửi thông báo khi chốt sổ thành công, khi hoàn tất 100%, và CẢNH BÁO BIẾN ĐỘNG MẠNH (±5%).
-TÍNH TOÁN % GIÁ: Lưu prev_close vào MongoDB (tự động chuẩn hóa đơn vị) để tính % và mũi tên.
+TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất. Chỉ gửi nếu danh sách mã thay đổi.
+GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
 """
 
 import os
@@ -39,6 +39,7 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 
 SYMBOLS_JSON_FILE = "vn100_symbols.json"
+SCREENER_JSON_FILE = "screener_results.json"
 
 # TELEGRAM CONFIG
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -116,9 +117,8 @@ crawl_lock = threading.Lock()
 LAST_CRAWL_TIME = {}
 LAST_GITHUB_WRITE_TIME = 0
 
-# Biến lưu trữ cảnh báo Telegram trong ngày
-ALERT_SENT_TODAY = set()
-CURRENT_ALERT_DATE = ""
+# Lưu danh sách mã của tin nhắn gần nhất để so sánh chống trùng lặp tin nhắn
+LAST_ALERT_BATCH = []
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -217,9 +217,59 @@ def can_update_github_today() -> bool:
     LAST_GITHUB_WRITE_TIME = time.time()
     return True
 
+def update_screener_json_on_github(all_crawled_data):
+    """Cập nhật file screener_results.json 1 lần duy nhất sau khi chốt sổ"""
+    if not all_crawled_data:
+        return False
+        
+    api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{SCREENER_JSON_FILE}"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+    
+    try:
+        res = requests.get(api_url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
+        if res.status_code != 200:
+            print(f"[SCREENER] ⚠️ Không tìm thấy {SCREENER_JSON_FILE} trên Github để cập nhật.", flush=True)
+            return False
+            
+        file_info = res.json()
+        sha = file_info["sha"]
+        current_json = json.loads(base64.b64decode(file_info["content"]).decode("utf-8"))
+        
+        updated_count = 0
+        for item in current_json:
+            sym = item.get("symbol")
+            if sym in all_crawled_data:
+                cdata = all_crawled_data[sym]
+                # Ghi đè các thông số mới nhất
+                item["close_price"] = cdata["close"]
+                item["price_change_percent"] = cdata["pct_change"]
+                item["price_change_available"] = True
+                item["price_arrow"] = "▲" if cdata["pct_change"] > 0 else ("▼" if cdata["pct_change"] < 0 else "—")
+                item["price_color"] = "emerald" if cdata["pct_change"] > 0 else ("rose" if cdata["pct_change"] < 0 else "slate")
+                item["volume_percent"] = cdata["volume_percent"]
+                item["amplitude_percent"] = cdata["amplitude_percent"]
+                updated_count += 1
+        
+        if updated_count > 0:
+            payload = {
+                "message": f"Cập nhật giá chốt sổ D1 ({updated_count} mã)",
+                "content": base64.b64encode(json.dumps(current_json, ensure_ascii=False, indent=4).encode("utf-8")).decode("utf-8"),
+                "branch": GITHUB_BRANCH,
+                "sha": sha
+            }
+            put_res = requests.put(api_url, headers=headers, json=payload, timeout=15)
+            if put_res.status_code in [200, 201]:
+                print(f"[SCREENER] 📤 Đã cập nhật {updated_count} mã vào {SCREENER_JSON_FILE} trên Github.", flush=True)
+                return True
+            else:
+                print(f"[SCREENER] ❌ Lỗi cập nhật {SCREENER_JSON_FILE}: {put_res.status_code}", flush=True)
+    except Exception as e:
+        print(f"[SCREENER] ❌ Lỗi: {e}", flush=True)
+    return False
+
 # ===================== CORE CRAWL LOGIC =====================
 def _execute_crawl(symbols: list, is_retry: bool = False):
-    global is_crawling, ALERT_SENT_TODAY, CURRENT_ALERT_DATE
+    global is_crawling, LAST_ALERT_BATCH
     if is_crawling: return
     is_crawling = True
     try:
@@ -227,11 +277,10 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         trading_date = _get_trading_date_str()
         updated_data = {}
         synced_count = 0
+        alert_batch = []
         
-        # Reset danh sách cảnh báo nếu sang ngày mới
-        if CURRENT_ALERT_DATE != trading_date:
-            ALERT_SENT_TODAY = set()
-            CURRENT_ALERT_DATE = trading_date
+        # Lưu TẤT CẢ dữ liệu cào được trong phiên này để ghi vào file JSON
+        all_crawled_data = {}
         
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
@@ -247,9 +296,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
             data = _fetch_one(sym)
             
             if data:
-                # Lấy prev_close từ history
                 hist_data, _ = get_github_file_data(f"history/{sym}.json")
-                prev_close = doc.get("prev_close", 0) if doc else 0
+                prev_close = 0.0
+                avg_volume_20 = 0.0
                 
                 if hist_data and hist_data.get("history_d1"):
                     bars = hist_data["history_d1"]
@@ -263,8 +312,35 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         
                     if 0 < prev_close < 1000:
                         prev_close = prev_close * 1000
+                        
+                    recent_volumes = [b.get("volume", 0) for b in bars[-20:]]
+                    if recent_volumes:
+                        avg_volume_20 = sum(recent_volumes) / len(recent_volumes)
 
-                # 1. LƯU VÀO MONGODB
+                amplitude_percent = 0.0
+                if data["open"] > 0 and data["high"] > 0 and data["low"] > 0:
+                    raw_amp = (data["high"] - data["low"]) / data["open"] * 100
+                    if 0 <= raw_amp <= 30.0:
+                        amplitude_percent = round(raw_amp, 2)
+
+                volume_percent = 0.0
+                if avg_volume_20 > 0 and data["volume"] > 0:
+                    raw_vol = data["volume"] / avg_volume_20 * 100
+                    if 0 <= raw_vol <= 1000.0:
+                        volume_percent = round(raw_vol, 2)
+                        
+                pct_change = 0.0
+                if prev_close > 0:
+                    pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2)
+
+                # Lưu vào all_crawled_data để tí nữa ghi vào JSON
+                all_crawled_data[sym] = {
+                    "close": data["close"],
+                    "pct_change": pct_change,
+                    "volume_percent": volume_percent,
+                    "amplitude_percent": amplitude_percent
+                }
+
                 collection.update_one(
                     {"symbol": sym},
                     {"$set": {
@@ -272,6 +348,8 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         "prev_close": prev_close,
                         "open": data["open"], "high": data["high"], 
                         "low": data["low"], "volume": data["volume"],
+                        "amplitude_percent": amplitude_percent,
+                        "volume_percent": volume_percent,
                         "trading_date": trading_date,
                         "updated_at": now_str,
                         "is_locked": False,
@@ -282,22 +360,24 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
                 
-                # --- BẮT ĐẦU: LOGIC CẢNH BÁO BIẾN ĐỘNG MẠNH QUA TELEGRAM ---
-                if prev_close > 0 and sym not in ALERT_SENT_TODAY:
-                    pct_change = ((data["close"] - prev_close) / prev_close) * 100
-                    if pct_change >= 5.0 or pct_change <= -5.0:
-                        arrow = "🔴 GIẢM MẠNH" if pct_change < 0 else "🟢 TĂNG MẠNH"
-                        msg = f"""⚠️ <b>CẢNH BÁO BIẾN ĐỘNG MẠNH</b>
-Mã: <b>{sym}</b>
-Mức thay đổi: <b>{pct_change:+.2f}%</b> {arrow}
-Giá hiện tại: {data['close']:,} VNĐ
-Giá tham chiếu: {prev_close:,} VNĐ
-Thời gian: {now_str}
-"""
-                        send_telegram(msg)
-                        ALERT_SENT_TODAY.add(sym)
-                        print(f"[TELEGRAM] 🚀 Đã gửi cảnh báo biến động {sym}: {pct_change:.2f}%", flush=True)
-                # --- KẾT THÚC: LOGIC CẢNH BÁO ---
+                # --- KIỂM TRA ĐIỀU KIỆN CẢNH BÁO (TELEGRAM) ---
+                if prev_close > 0:
+                    is_price_shock = (pct_change >= 3.0) or (pct_change <= -3.0)
+                    is_volume_shock = (volume_percent >= 120.0)
+                    
+                    if is_price_shock and is_volume_shock:
+                        trend_icon = "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"
+                        cash_flow = "BÁN RÒNG" if pct_change < 0 else "MUA VÀO"
+                        
+                        alert_batch.append({
+                            "sym": sym,
+                            "pct_change": pct_change,
+                            "volume_percent": volume_percent,
+                            "price": data["close"],
+                            "volume": data["volume"],
+                            "trend": trend_icon,
+                            "flow": cash_flow
+                        })
 
                 # 2. CHỐT SỔ SAU 15H
                 if _is_after_15h() and can_update_github_today():
@@ -309,14 +389,12 @@ Thời gian: {now_str}
                         w1_bars = hist_data.get("history_w1", [])
                         mn_bars = hist_data.get("history_mn", [])
                         
-                        # XỬ LÝ D1
                         d1_bar = {"time": trading_date, "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data["volume"]}
                         d1_idx = next((i for i, b in enumerate(d1_bars) if b["time"] == trading_date), -1)
                         if d1_idx == -1: d1_bars.append(d1_bar)
                         else: d1_bars[d1_idx] = d1_bar
                         d1_bars.sort(key=lambda x: x["time"])
                         
-                        # XỬ LÝ W1
                         vn_now = datetime.utcnow() + timedelta(hours=7)
                         start_of_week = vn_now - timedelta(days=vn_now.weekday())
                         week_str = start_of_week.strftime("%Y-%m-%d")
@@ -335,7 +413,6 @@ Thời gian: {now_str}
                             else: w1_bars[w1_idx] = w1_bar
                             w1_bars.sort(key=lambda x: x["time"])
 
-                        # XỬ LÝ MN
                         month_str = vn_now.strftime("%Y-%m-01")
                         month_bars_in_d1 = [b for b in d1_bars if b["time"].startswith(vn_now.strftime("%Y-%m"))]
                         if month_bars_in_d1:
@@ -360,7 +437,7 @@ Thời gian: {now_str}
                             print(f"[GITHUB] 📤 Đã chốt sổ {sym} (D1/W1/MN) ngày {trading_date}", flush=True)
                             synced_count += 1
 
-                print(f"[CRAWL] ✅ {sym}: {data['close']:,} | Prev: {prev_close:,} | KL: {data['volume']:,}", flush=True)
+                print(f"[CRAWL] ✅ {sym}: {data['close']:,} | Prev: {prev_close:,} | Amplitude: {amplitude_percent}% | Vol: {volume_percent}%", flush=True)
             else:
                 collection.update_one(
                     {"symbol": sym},
@@ -372,7 +449,39 @@ Thời gian: {now_str}
         if len(symbols) >= 5:
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
 
+        # ================= GỬI TIN NHẮN TELEGRAM TỔNG HỢP =================
+        if alert_batch:
+            current_symbols = [item['sym'] for item in alert_batch]
+            current_symbols_sorted = sorted(current_symbols)
+            last_symbols_sorted = sorted(LAST_ALERT_BATCH)
+            
+            if current_symbols_sorted == last_symbols_sorted:
+                print(f"[TELEGRAM] ⏭️ Bỏ qua gửi tin vì danh sách mã giống hệt tin trước đó: {current_symbols_sorted}", flush=True)
+            else:
+                alert_batch.sort(key=lambda x: x["volume_percent"], reverse=True)
+                msg_lines = [f"🚨 <b>CẢNH BÁO DÒNG TIỀN ({len(alert_batch)} MÃ)</b>", "----------------------------------"]
+                
+                for item in alert_batch:
+                    line = (f"• <b>{item['sym']}</b>: {item['pct_change']:+.2f}% {item['trend']} | "
+                            f"Vol: {item['volume_percent']:.0f}% ({item['flow']})\n"
+                            f"  Giá: {item['price']:,} | KL: {item['volume']:,}")
+                    msg_lines.append(line)
+                    
+                msg_lines.append("----------------------------------")
+                msg_lines.append(f"🕒 Lúc: {now_str}")
+                
+                final_msg = "\n".join(msg_lines)
+                send_telegram(final_msg)
+                print(f"[TELEGRAM] 🚀 Đã gửi tin nhắn cảnh báo {len(alert_batch)} mã.", flush=True)
+                
+                LAST_ALERT_BATCH.clear()
+                LAST_ALERT_BATCH.extend(current_symbols)
+
+        # ================= CẬP NHẬT SCREENER_RESULTS.JSON (1 LẦN) =================
+        # Chỉ chạy khi đã qua 15h và có mã chốt sổ thành công trong đợt này
         if _is_after_15h() and synced_count > 0:
+            update_screener_json_on_github(all_crawled_data)
+            
             msg = f"""✅ <b>CẬP NHẬT DỮ LIỆU THÀNH CÔNG</b>
 🕒 Thời gian: {now_str}
 📤 Đã đẩy lên GitHub: <b>{synced_count} mã</b>
@@ -464,7 +573,6 @@ def api_get_data():
                 prev_close = doc.get("prev_close", 0)
                 doc["close_price"] = close_price
                 
-                # --- TÍNH % VÀ MŨI TÊN ---
                 price_change_percent = 0.0
                 price_change_available = False
                 arrow = "—"
@@ -487,6 +595,9 @@ def api_get_data():
                 doc["price_change_available"] = price_change_available
                 doc["price_arrow"] = arrow
                 doc["price_color"] = color
+
+                doc["amplitude_percent"] = doc.get("amplitude_percent", 0.0)
+                doc["volume_percent"] = doc.get("volume_percent", 0.0)
                 
                 data[sym] = doc
         return jsonify({"status": "success", "count": len(data), "data": data})
