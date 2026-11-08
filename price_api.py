@@ -1,6 +1,7 @@
 """
 Price API — Pro Quant Screener
 Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ OHLC & Volume.
+ĐỒNG BỘ TỰ ĐỘNG: Đọc danh sách mã từ vn100_symbols.json, so sánh với MongoDB (Thiếu thêm - Thừa xóa).
 BẢO VỆ GITHUB 4 LỚP: 5 phút/mã, 10 phút/lần ghi, 3 lần/ngày, chống spam.
 CHỐNG RÁC: Tự động bỏ qua (không lưu DB, không đẩy Github) nếu API trả về OHLC = 0.
 KHÓA SỔ TỪNG MÃ: Đã chốt sổ hôm nay thì không cào API nữa.
@@ -36,6 +37,9 @@ GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 
+# Đường dẫn file danh sách mã (nằm cùng thư mục với app.py)
+SYMBOLS_JSON_FILE = "vn100_symbols.json"
+
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
 COOLDOWN_SECONDS = 300
@@ -43,7 +47,7 @@ COOLDOWN_SECONDS = 300
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
-# ===================== DATABASE =====================
+# ===================== DATABASE & AUTO SYNC =====================
 print(f"🔌 Đang kết nối MongoDB...", flush=True)
 try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -53,6 +57,44 @@ try:
     settings_col = db['settings']
     gh_history = db['github_sync_history']
     print("✅ Kết nối MongoDB thành công!", flush=True)
+    
+    # -----------------------------------------------------------
+    # TỰ ĐỘNG ĐỒNG BỘ DANH SÁCH MÃ TỪ FILE JSON SANG MONGODB
+    # -----------------------------------------------------------
+    if os.path.exists(SYMBOLS_JSON_FILE):
+        try:
+            with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
+                json_symbols = set([str(s).upper().strip() for s in json.load(f)])
+            
+            if len(json_symbols) > 0:
+                print(f"🔄 Đang đồng bộ danh sách mã từ {SYMBOLS_JSON_FILE} sang MongoDB...", flush=True)
+                
+                # 1. Lấy danh sách mã hiện có trong MongoDB
+                db_symbols = set([doc["symbol"] for doc in collection.find({}, {"symbol": 1})])
+                
+                # 2. Tìm mã cần THÊM (có trong JSON, chưa có trong DB)
+                symbols_to_add = json_symbols - db_symbols
+                if symbols_to_add:
+                    print(f"➕ Thêm {len(symbols_to_add)} mã mới vào DB: {', '.join(symbols_to_add)}", flush=True)
+                    for sym in symbols_to_add:
+                        collection.insert_one({"symbol": sym})
+
+                # 3. Tìm mã cần XÓA (có trong DB, không có trong JSON)
+                symbols_to_remove = db_symbols - json_symbols
+                if symbols_to_remove:
+                    print(f"➖ Xóa {len(symbols_to_remove)} mã không còn trong JSON khỏi DB: {', '.join(symbols_to_remove)}", flush=True)
+                    collection.delete_many({"symbol": {"$in": list(symbols_to_remove)}})
+                
+                if not symbols_to_add and not symbols_to_remove:
+                    print("ℹ️ Danh sách mã trên MongoDB đã đồng bộ hoàn toàn với file JSON.", flush=True)
+            else:
+                print(f"⚠️ File {SYMBOLS_JSON_FILE} rỗng. Bỏ qua đồng bộ để bảo vệ dữ liệu.", flush=True)
+        except Exception as e:
+            print(f"⚠️ Lỗi khi đọc/đồng bộ file {SYMBOLS_JSON_FILE}: {e}", flush=True)
+    else:
+        print(f"⚠️ Không tìm thấy file {SYMBOLS_JSON_FILE}. Server sẽ dùng danh sách hiện có trong MongoDB.", flush=True)
+    # -----------------------------------------------------------
+
 except PyMongoError as e:
     print(f"❌ LỖI KẾT NỐI MONGODB: {e}", flush=True)
     sys.exit(1)
