@@ -1,6 +1,7 @@
 """
 Price API — Pro Quant Screener
-Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ OHLC & Volume.
+Cơ chế Tối giản & Ổn định + Lấy đầy đủ OHLC & Volume + Cào bù dữ liệu thiếu.
+BẢO VỆ GITHUB 4 LỚP: 5 phút/mã, 10 phút/lần ghi, 3 lần/ngày, chống spam.
 """
 
 import os
@@ -35,7 +36,7 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
-COOLDOWN_SECONDS = 300
+COOLDOWN_SECONDS = 300 # Lớp 1: 5 phút chống spam cào 1 mã
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -63,6 +64,9 @@ is_crawling = False
 crawl_lock = threading.Lock()
 LAST_CRAWL_TIME = {}
 
+# BIẾN TOÀN CỤC CHO LỚP 4 (Chống spam ghi Github)
+LAST_GITHUB_WRITE_TIME = 0
+
 # ===================== HELPERS =====================
 def _now_str() -> str:
     vn_time = datetime.utcnow() + timedelta(hours=7)
@@ -78,32 +82,27 @@ def _is_after_15h() -> bool:
     return vn_time.hour >= 15
 
 def _fetch_one(symbol: str) -> Optional[dict]:
-    """Lấy đầy đủ dữ liệu OHLC và Volume"""
+    """Lấy đầy đủ dữ liệu OHLC và Volume từ Lotusmarket"""
     def _do():
         try:
             stock = fetchers.vps(symbol)
             if not stock: return None
             
-            # Trích xuất dữ liệu từ lotusmarket
             close = getattr(stock, "close", 0) or 0
-            open_p = getattr(stock, "open", 0) or close
-            high = getattr(stock, "high", 0) or close
-            low = getattr(stock, "low", 0) or close
+            open_p = getattr(stock, "open", 0) or 0
+            high = getattr(stock, "high", 0) or 0
+            low = getattr(stock, "low", 0) or 0
             
-            # Một số API dùng 'nmVolume', số khác dùng 'volume', 'v' hoặc 'vol'
             volume = getattr(stock, "volume", 0)
             if not volume: volume = getattr(stock, "nmVolume", 0)
             if not volume: volume = getattr(stock, "vol", 0)
             
             return {
-                "close": close,
-                "open": open_p,
-                "high": high,
-                "low": low,
-                "volume": volume
+                "close": close, "open": open_p, 
+                "high": high, "low": low, "volume": volume
             }
         except Exception as e:
-            print(f"Lỗi lấy dữ liệu {symbol}: {e}", flush=True)
+            print(f"Lỗi fetch {symbol}: {e}", flush=True)
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
@@ -117,12 +116,10 @@ def _fetch_one(symbol: str) -> Optional[dict]:
 
     if not data or data["close"] <= 0: return None
     
-    # Nhân 1000 nếu giá < 1000 (đơn vị nghìn đồng)
     if data["close"] < 1000:
         for k in ["close", "open", "high", "low"]:
-            data[k] = data[k] * 1000
+            if data[k] > 0: data[k] = data[k] * 1000
             
-    # Ép kiểu int cho sạch dữ liệu và trả về
     return {
         "close": int(data["close"]),
         "open": int(data["open"]),
@@ -168,14 +165,35 @@ def update_github_file(data_dict, commit_message):
     return False
 
 def can_update_github() -> bool:
-    if not _is_after_15h(): return False
-    if not gh_history: return True
+    """
+    LỚP 2, 3, 4 BẢO VỆ GITHUB
+    """
+    global LAST_GITHUB_WRITE_TIME
+    
+    # Lớp 4: Chống spam (Phải cách lần ghi trước ít nhất 10 phút = 600s)
+    # Tránh trường hợp user bấm "Làm mới giá" liên tục trong thời gian ngắn
+    if time.time() - LAST_GITHUB_WRITE_TIME < 600:
+        print("[GITHUB] ⏳ Bỏ qua ghi Github — chưa đủ 10 phút từ lần ghi trước", flush=True)
+        return False
+        
+    # Lớp 3: Giới hạn tối đa 3 lần/ngày
+    if not gh_history: 
+        LAST_GITHUB_WRITE_TIME = time.time()
+        return True
+        
     vn_now = datetime.utcnow() + timedelta(hours=7)
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
-    return gh_history.count_documents({"time": {"$gte": start_of_day_utc}}) < 3
+    count_today = gh_history.count_documents({"time": {"$gte": start_of_day_utc}})
+    
+    if count_today >= 3:
+        print(f"[GITHUB] ⏳ Bỏ qua ghi Github — đã đạt giới hạn {count_today}/3 lần hôm nay", flush=True)
+        return False
+    
+    LAST_GITHUB_WRITE_TIME = time.time()
+    return True
 
 # ===================== CORE CRAWL LOGIC =====================
-def _execute_crawl(symbols: list):
+def _execute_crawl(symbols: list, force_update: bool = False):
     global is_crawling
     
     if is_crawling:
@@ -187,37 +205,54 @@ def _execute_crawl(symbols: list):
         now_str = _now_str()
         updated_data = {}
         
-        print(f"[CRAWL] 🚀 Bắt đầu cào tuần tự {len(symbols)} mã...", flush=True)
+        print(f"[CRAWL] 🚀 Bắt đầu cào {len(symbols)} mã...", flush=True)
         
-        # CÀO TUẦN TỰ TỪNG MÃ
         for sym in symbols:
             data = _fetch_one(sym)
+            
+            # Kiểm tra dữ liệu thiếu
+            is_incomplete = False
             if data:
-                # Lưu ĐẦY ĐỦ OHLC + Volume vào MongoDB
+                if data["open"] == 0 or data["high"] == 0 or data["low"] == 0 or data["volume"] == 0:
+                    is_incomplete = True
+            else:
+                old_doc = collection.find_one({"symbol": sym})
+                if old_doc:
+                    data = old_doc
+                is_incomplete = True
+
+            if data and data.get("close", 0) > 0:
+                update_fields = {
+                    "symbol": sym, 
+                    "close": data["close"], 
+                    "updated_at": now_str
+                }
+                
+                if data.get("open", 0) > 0: update_fields["open"] = data["open"]
+                if data.get("high", 0) > 0: update_fields["high"] = data["high"]
+                if data.get("low", 0) > 0: update_fields["low"] = data["low"]
+                if data.get("volume", 0) > 0: update_fields["volume"] = data["volume"]
+                
+                update_fields["is_complete"] = not is_incomplete
+
                 collection.update_one(
                     {"symbol": sym},
-                    {"$set": {
-                        "symbol": sym, 
-                        "close": data["close"], 
-                        "open": data["open"],
-                        "high": data["high"],
-                        "low": data["low"],
-                        "volume": data["volume"],
-                        "updated_at": now_str
-                    }},
+                    {"$set": update_fields},
                     upsert=True
                 )
+                
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
-                print(f"[CRAWL] ✅ {sym}: {data['close']:,} | KL: {data['volume']:,}", flush=True)
+                
+                status_icon = "⚠️" if is_incomplete else "✅"
+                print(f"[CRAWL] {status_icon} {sym}: {data['close']:,} | KL: {data.get('volume', 0):,}", flush=True)
             else:
-                print(f"[CRAWL] ❌ {sym}: Lỗi/Timeout", flush=True)
+                print(f"[CRAWL] ❌ {sym}: Không lấy được giá", flush=True)
 
-        # Cập nhật giờ toàn cục
         if len(symbols) >= 5:
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
 
-        # Ghi Github
+        # Ghi Github (Đã được bảo vệ bởi 3 lớp can_update_github)
         if updated_data and GITHUB_TOKEN and can_update_github():
             print("[GITHUB] 🚀 Bắt đầu ghi Github...", flush=True)
             old_gh_data, _ = get_github_file_data()
@@ -238,10 +273,27 @@ def auto_crawler_worker():
     print("⏰ [AUTO] Đã bật luồng tự động cập nhật giá (15 phút/lần).", flush=True)
     while True:
         try:
-            if _is_trading_time():
-                symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-                if symbols:
-                    _execute_crawl(symbols)
+            symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+            
+            # Tìm mã bị thiếu dữ liệu OHLC/Volume để cào bù
+            incomplete_docs = collection.find({
+                "$or": [
+                    {"is_complete": {"$ne": True}},
+                    {"open": {"$in": [None, 0]}},
+                    {"high": {"$in": [None, 0]}},
+                    {"low": {"$in": [None, 0]}},
+                    {"volume": {"$in": [None, 0]}}
+                ]
+            })
+            incomplete_symbols = list(set([doc["symbol"] for doc in incomplete_docs]))
+
+            if _is_trading_time() and symbols:
+                print(f"[AUTO] Trong giờ giao dịch. Cào {len(symbols)} mã...", flush=True)
+                _execute_crawl(symbols)
+            elif incomplete_symbols:
+                print(f"[AUTO] Ngoài giờ. Phát hiện {len(incomplete_symbols)} mã thiếu dữ liệu. Đang cào bù...", flush=True)
+                _execute_crawl(incomplete_symbols)
+
             time.sleep(900) # 15 phút
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
@@ -262,14 +314,12 @@ def api_last_update():
 
 @app.get("/api/data")
 def api_get_data():
-    """Trả toàn bộ dữ liệu, đồng bộ các trường để Frontend dễ dùng."""
     try:
         cursor = collection.find({}, {"_id": 0})
         data = {}
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
-                # Đảm bảo Frontend luôn nhận được 'close_price' và 'updated_at'
                 doc["close_price"] = doc.get("close", 0)
                 data[sym] = doc
         return jsonify({"status": "success", "count": len(data), "data": data})
@@ -285,9 +335,7 @@ def api_sync():
 
     now_str = _now_str()
     
-    # Nếu đang cào -> Trả về MongoDB ngay lập tức
     if is_crawling:
-        print(f"[SYNC] ⏳ Hệ thống đang cào. Trả về MongoDB.", flush=True)
         updated_data = {}
         for sym in symbols:
             doc = collection.find_one({"symbol": sym})
@@ -295,12 +343,12 @@ def api_sync():
                 updated_data[sym] = doc["close"]
         return jsonify({
             "status": "success",
-            "updated_at": now_str + " (Đang cào)",
+            "updated_at": now_str + " (Hệ thống đang cào)",
             "updated_count": len(updated_data),
             "updated_data": updated_data,
         })
 
-    # Kiểm tra giãn cách 5 phút
+    # Lớp 1: Kiểm tra giãn cách 5 phút
     can_crawl = True
     for sym in symbols:
         if time.time() - LAST_CRAWL_TIME.get(sym, 0) < COOLDOWN_SECONDS:
@@ -308,7 +356,6 @@ def api_sync():
             break
             
     if not can_crawl:
-        print(f"[SYNC] ⏳ Chưa đủ 5 phút. Trả về MongoDB.", flush=True)
         updated_data = {}
         for sym in symbols:
             doc = collection.find_one({"symbol": sym})
@@ -321,7 +368,6 @@ def api_sync():
             "updated_data": updated_data,
         })
 
-    # Đủ điều kiện -> Cào ngầm
     print(f"[SYNC] 🚀 Kích hoạt cào ngầm {len(symbols)} mã...", flush=True)
     threading.Thread(target=_execute_crawl, args=(symbols,)).start()
     
