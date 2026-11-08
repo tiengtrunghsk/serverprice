@@ -5,6 +5,7 @@ Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ O
 CÀO BÙ THÔNG MINH: Mã lỗi được đánh dấu is_incomplete. Chỉ cào bù các mã bị đánh dấu.
 CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ (10 lần ghi/ngày).
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
+TELEGRAM: Gửi thông báo khi chốt sổ thành công và khi hoàn tất 100%.
 """
 
 import os
@@ -38,12 +39,28 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 
 SYMBOLS_JSON_FILE = "vn100_symbols.json"
 
+# TELEGRAM CONFIG
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
 COOLDOWN_SECONDS = 300
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+# ===================== TELEGRAM HELPER =====================
+def send_telegram(message: str):
+    """Gửi tin nhắn về Telegram (nếu có cấu hình)"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"[TELEGRAM] Lỗi gửi tin: {e}", flush=True)
 
 # ===================== DATABASE & AUTO SYNC =====================
 print(f"🔌 Đang kết nối MongoDB...", flush=True)
@@ -209,6 +226,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         now_str = _now_str()
         trading_date = _get_trading_date_str()
         updated_data = {}
+        synced_count = 0
         
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
@@ -305,6 +323,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                             # ĐÁNH DẤU ĐÃ CHỐT SỔ VÀ KHÓA
                             collection.update_one({"symbol": sym}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
                             print(f"[GITHUB] 📤 Đã chốt sổ {sym} (D1/W1/MN) ngày {trading_date}", flush=True)
+                            synced_count += 1
 
                 print(f"[CRAWL] ✅ {sym}: {data['close']:,} | KL: {data['volume']:,}", flush=True)
             else:
@@ -321,6 +340,16 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
 
         if len(symbols) >= 5:
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
+
+        # BÁO CÁO TELEGRAM KHI CHỐT SỔ THÀNH CÔNG
+        if _is_after_15h() and synced_count > 0:
+            msg = f"""✅ <b>CẬP NHẬT DỮ LIỆU THÀNH CÔNG</b>
+🕒 Thời gian: {now_str}
+📤 Đã đẩy lên GitHub: <b>{synced_count} mã</b>
+📅 Ngày giao dịch: {trading_date}
+🔄 Hệ thống tự động kích hoạt Workflow Simulator & Screener.
+"""
+            send_telegram(msg)
 
     finally:
         is_crawling = False
@@ -388,10 +417,18 @@ def auto_crawler_worker():
             if is_after_15h:
                 total = len(all_symbols)
                 completed = total - len(incomplete_symbols) - len(unchot_symbols)
-                if incomplete_symbols or unchot_symbols:
-                    print(f"[AUTO] ⏳ Tiến độ chốt sổ: {completed}/{total} mã. Còn {len(incomplete_symbols)} lỗi, {len(unchot_symbols)} chưa chốt.", flush=True)
+                
+                if completed == total:
+                    msg = f"""🎉 <b>HOÀN TẤT CHỐT SỔ NGÀY {today_str}</b>
+✅ Trạng thái: 100% ({total}/{total} mã)
+📤 Toàn bộ dữ liệu đã được đồng bộ lên GitHub.
+🔗 Link: https://dautuchungkhoan.ddns.net
+"""
+                    send_telegram(msg)
+                    print(f"[AUTO] ✅ HOÀN TẤT 100%: Đã gửi báo cáo Telegram.", flush=True)
+                    time.sleep(3600) # Nghỉ 1 tiếng sau khi hoàn tất để tránh spam
                 else:
-                    print(f"[AUTO] ✅ HOÀN TẤT 100%: Đã chốt sổ toàn bộ {total} mã hôm nay!", flush=True)
+                    print(f"[AUTO] ⏳ Tiến độ: {completed}/{total} mã. Còn {len(incomplete_symbols)} lỗi, {len(unchot_symbols)} chưa chốt.", flush=True)
 
             time.sleep(900)
         except Exception as e:
