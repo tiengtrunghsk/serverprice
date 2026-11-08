@@ -1,7 +1,8 @@
 """
 Price API — Pro Quant Screener
-Cơ chế Tối giản & Ổn định + Lấy đầy đủ OHLC & Volume + Cào bù dữ liệu thiếu.
+Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ OHLC & Volume + Tự động cào bù dữ liệu thiếu.
 BẢO VỆ GITHUB 4 LỚP: 5 phút/mã, 10 phút/lần ghi, 3 lần/ngày, chống spam.
+CHỐNG RÁC: Tự động bỏ qua (không lưu DB, không đẩy Github) nếu API trả về OHLC = 0 (Ngày nghỉ/Lễ).
 """
 
 import os
@@ -77,12 +78,8 @@ def _is_trading_time() -> bool:
     if vn_now.weekday() >= 5: return False
     return 9 <= vn_now.hour < 15
 
-def _is_after_15h() -> bool:
-    vn_time = datetime.utcnow() + timedelta(hours=7)
-    return vn_time.hour >= 15
-
 def _fetch_one(symbol: str) -> Optional[dict]:
-    """Lấy đầy đủ dữ liệu OHLC và Volume từ Lotusmarket"""
+    """Lấy đầy đủ dữ liệu OHLC và Volume. Trả về None nếu là ngày nghỉ (OHLC=0)."""
     def _do():
         try:
             stock = fetchers.vps(symbol)
@@ -114,7 +111,11 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         except Exception:
             return None
 
-    if not data or data["close"] <= 0: return None
+    # =======================================================
+    # CHỐT CHẶN RÁC: Nếu OHLC = 0 thì đây là ngày nghỉ -> Bỏ qua
+    # =======================================================
+    if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
+        return None
     
     if data["close"] < 1000:
         for k in ["close", "open", "high", "low"]:
@@ -165,13 +166,10 @@ def update_github_file(data_dict, commit_message):
     return False
 
 def can_update_github() -> bool:
-    """
-    LỚP 2, 3, 4 BẢO VỆ GITHUB
-    """
+    """LỚP 2, 3, 4 BẢO VỆ GITHUB"""
     global LAST_GITHUB_WRITE_TIME
     
-    # Lớp 4: Chống spam (Phải cách lần ghi trước ít nhất 10 phút = 600s)
-    # Tránh trường hợp user bấm "Làm mới giá" liên tục trong thời gian ngắn
+    # Lớp 4: Chống spam ghi Github (10 phút/lần)
     if time.time() - LAST_GITHUB_WRITE_TIME < 600:
         print("[GITHUB] ⏳ Bỏ qua ghi Github — chưa đủ 10 phút từ lần ghi trước", flush=True)
         return False
@@ -210,44 +208,23 @@ def _execute_crawl(symbols: list, force_update: bool = False):
         for sym in symbols:
             data = _fetch_one(sym)
             
-            # Kiểm tra dữ liệu thiếu
-            is_incomplete = False
             if data:
-                if data["open"] == 0 or data["high"] == 0 or data["low"] == 0 or data["volume"] == 0:
-                    is_incomplete = True
-            else:
-                old_doc = collection.find_one({"symbol": sym})
-                if old_doc:
-                    data = old_doc
-                is_incomplete = True
-
-            if data and data.get("close", 0) > 0:
-                update_fields = {
-                    "symbol": sym, 
-                    "close": data["close"], 
-                    "updated_at": now_str
-                }
-                
-                if data.get("open", 0) > 0: update_fields["open"] = data["open"]
-                if data.get("high", 0) > 0: update_fields["high"] = data["high"]
-                if data.get("low", 0) > 0: update_fields["low"] = data["low"]
-                if data.get("volume", 0) > 0: update_fields["volume"] = data["volume"]
-                
-                update_fields["is_complete"] = not is_incomplete
-
+                # Lưu vào DB vì data hợp lệ (đã qua chốt chặn OHLC > 0)
                 collection.update_one(
                     {"symbol": sym},
-                    {"$set": update_fields},
+                    {"$set": {
+                        "symbol": sym, "close": data["close"], 
+                        "open": data["open"], "high": data["high"], 
+                        "low": data["low"], "volume": data["volume"],
+                        "updated_at": now_str
+                    }},
                     upsert=True
                 )
-                
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
-                
-                status_icon = "⚠️" if is_incomplete else "✅"
-                print(f"[CRAWL] {status_icon} {sym}: {data['close']:,} | KL: {data.get('volume', 0):,}", flush=True)
+                print(f"[CRAWL] ✅ {sym}: {data['close']:,} | KL: {data['volume']:,}", flush=True)
             else:
-                print(f"[CRAWL] ❌ {sym}: Không lấy được giá", flush=True)
+                print(f"[CRAWL] 💤 {sym}: Ngày nghỉ hoặc API không có data (OHLC=0). Bỏ qua.", flush=True)
 
         if len(symbols) >= 5:
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
