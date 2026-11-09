@@ -7,6 +7,7 @@ CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất c�
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
 TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất. Chỉ gửi nếu danh sách mã thay đổi.
 GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
+GIỮ NGUYÊN PHIÊN CŨ: Trước 9h sáng, giữ nguyên ngày giao dịch của phiên hôm trước để giao diện không hiển thị 0.00%.
 """
 
 import os
@@ -126,8 +127,15 @@ def _now_str() -> str:
 
 def _get_trading_date_str() -> str:
     vn_now = datetime.utcnow() + timedelta(hours=7)
+    
+    # NẾU TRƯỚC 9H SÁNG, VẪN TÍNH LÀ NGÀY GIAO DỊCH CỦA HÔM TRƯỚC
+    if vn_now.hour < 9:
+        vn_now -= timedelta(days=1)
+        
+    # Xử lý ngày nghỉ (T7, CN)
     while vn_now.weekday() >= 5:
         vn_now -= timedelta(days=1)
+        
     return vn_now.strftime("%Y-%m-%d")
 
 def _is_after_15h() -> bool:
