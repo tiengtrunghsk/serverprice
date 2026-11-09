@@ -35,7 +35,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
-MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
 COOLDOWN_SECONDS = 300
 
 # ===================== VOLUME MULTIPLIER =====================
@@ -150,9 +149,7 @@ def _fetch_one(symbol: str) -> Optional[dict]:
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
         return None
     
-    # =====================================================================
     # TỰ ĐỘNG TÍNH TOÁN LẠI ĐỂ CHUẨN HÓA VỀ ĐƠN VỊ NGHÌN ĐỒNG (VD: 52.0)
-    # =====================================================================
     if data["close"] >= 1000:
         for k in ["close", "open", "high", "low"]:
             if data[k] > 0: 
@@ -249,7 +246,7 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str):
             return False
         new_commit_sha = commit_res.json()["sha"]
 
-        update_ref_payload = {"sha": new_commit_sha, "force": True}
+        update_ref_payload = {"sha": new_commit_sha}
         update_res = requests.patch(f"{base_url}/git/refs/heads/{GITHUB_BRANCH}", headers=headers, json=update_ref_payload, timeout=10)
         if update_res.status_code != 200:
             print(f"[GITHUB] ❌ Lỗi cập nhật nhánh", flush=True)
@@ -276,6 +273,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         
         pending_history_files = {}
         need_update_screener = False
+        
+        # Mảng lưu các mã đã cào thành công trong phiên này
+        success_symbols = []
         
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày: {trading_date})...", flush=True)
@@ -329,7 +329,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 if prev_close > 0:
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2)
 
-                # Lưu dữ liệu chuẩn (Nghìn đồng) vào DB và bộ nhớ chờ ghi Screener
                 all_crawled_data[sym] = {
                     "close": data["close"],
                     "pct_change": pct_change,
@@ -355,6 +354,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 )
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
+                success_symbols.append(sym) # Thêm vào danh sách chờ đánh dấu
                 
                 if prev_close > 0:
                     is_price_shock = (pct_change >= 3.0) or (pct_change <= -3.0)
@@ -469,9 +469,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                             sym = item.get("symbol")
                             if sym in all_crawled_data:
                                 cdata = all_crawled_data[sym]
-                                # GHI VÀO SCREENER JSON: Tự động nhân 1000 (Từ 52.0 lên 52000)
                                 item["close_price"] = cdata["close"] * 1000
-                                
                                 item["price_change_percent"] = cdata["pct_change"]
                                 item["price_change_available"] = True
                                 item["price_arrow"] = "▲" if cdata["pct_change"] > 0 else ("▼" if cdata["pct_change"] < 0 else "—")
@@ -488,6 +486,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
 
             commit_msg = f"Cập nhật dữ liệu ngày {trading_date}"
             if commit_multiple_files_to_github(pending_history_files, commit_msg):
+                # LÚC NÀY MỚI ĐÁNH DẤU CHỐT SỔ (VÀ CHỈ ĐÁNH DẤU NHỮNG MÃ ĐÃ ĐƯỢC GHI)
                 for path in pending_history_files:
                     if path.startswith("history/"):
                         sym = path.split("/")[1].replace(".json", "")
@@ -655,12 +654,29 @@ def api_sync():
 
     return jsonify({"status": "success", "updated_at": _now_str() + " (Đang cào ngầm)", "updated_data": updated_data})
 
+@app.get("/api/reset-today")
+def reset_today():
+    """Xóa cờ chốt sổ của ngày hôm nay để test lại"""
+    today_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d")
+    
+    # Chỉ xóa cờ chốt sổ của những mã đã chốt trong hôm nay
+    result = collection.update_many(
+        {"chot_so_today": today_str},
+        {"$unset": {"chot_so_today": "", "is_locked": ""}}
+    )
+    
+    return jsonify({
+        "status": "success", 
+        "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã trong ngày hôm nay. Bạn có thể test lại!"
+    })
+
 @app.get("/api/force-fix")
 def force_fix_data():
+    """Xóa TẤT CẢ cờ chốt sổ của MỌI NGÀY và cào lại từ đầu"""
     collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols,)).start()
-    return jsonify({"status": "success", "message": f"Đang ép cào lại {len(all_symbols)} mã. Vui lòng đợi 1-2 phút!"})
+    return jsonify({"status": "success", "message": f"Đang ép cào lại toàn bộ {len(all_symbols)} mã. Vui lòng đợi 1-2 phút!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
