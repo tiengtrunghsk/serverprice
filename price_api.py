@@ -1,17 +1,3 @@
-"""
-Price API — Pro Quant Screener
-ĐỒNG BỘ TỰ ĐỘNG: Đọc danh sách mã từ vn100_symbols.json, so sánh với MongoDB.
-CÀO BÙ THÔNG MINH: Mã lỗi được đánh dấu is_incomplete. Chỉ cào bù các mã bị đánh dấu.
-CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ.
-CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
-TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất.
-GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
-CHUẨN HÓA TỪ LOTUS: Tự động chia 1000 nếu giá > 1000 (đưa về đơn vị nghìn đồng).
-GHI SCREENER JSON: Tự động nhân 1000 close_price trước khi ghi vào file JSON.
-VOLUME MULTIPLIER: Tự động nhân Volume với VOLUME_MULTIPLIER nếu API trả về quá nhỏ.
-FIX PYMONGO 4.x: Sửa lỗi "Collection objects do not implement truth value testing".
-"""
-
 import os
 import sys
 import time
@@ -77,7 +63,6 @@ try:
     db = mongo_client['quant_db']
     collection = db['stocks']
     settings_col = db['settings']
-    gh_history = db['github_sync_history']
     print("✅ Kết nối MongoDB thành công!", flush=True)
     
     # TỰ ĐỘNG ĐỒNG BỘ DANH SÁCH MÃ
@@ -121,9 +106,8 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 is_crawling = False
 crawl_lock = threading.Lock()
 LAST_CRAWL_TIME = {}
-LAST_GITHUB_WRITE_TIME = 0
-
 LAST_ALERT_BATCH = []
+LAST_GITHUB_WRITE_TIME = 0
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -166,7 +150,9 @@ def _fetch_one(symbol: str) -> Optional[dict]:
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
         return None
     
-    # TỰ ĐỘNG CHUẨN HÓA ĐƠN VỊ TỪ LOTUS (Nếu > 1000 thì chia 1000)
+    # =====================================================================
+    # TỰ ĐỘNG TÍNH TOÁN LẠI ĐỂ CHUẨN HÓA VỀ ĐƠN VỊ NGHÌN ĐỒNG (VD: 52.0)
+    # =====================================================================
     if data["close"] >= 1000:
         for k in ["close", "open", "high", "low"]:
             if data[k] > 0: 
@@ -183,7 +169,14 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         "volume": int(data["volume"])
     }
 
-# ===================== GITHUB SYNC =====================
+def can_update_github_today() -> bool:
+    global LAST_GITHUB_WRITE_TIME
+    if time.time() - LAST_GITHUB_WRITE_TIME < 5: 
+        return False
+    LAST_GITHUB_WRITE_TIME = time.time()
+    return True
+
+# ===================== GITHUB BULK UPLOAD (TREES API) =====================
 def get_github_file_data(file_path):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
     api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{file_path}?ref={GITHUB_BRANCH}"
@@ -199,90 +192,75 @@ def get_github_file_data(file_path):
     except Exception:
         return None, None
 
-def update_github_file(file_path, data_dict, commit_message):
-    if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return False
-    api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{file_path}"
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    _, sha = get_github_file_data(file_path)
-    payload = {
-        "message": commit_message, 
-        "content": base64.b64encode(json.dumps(data_dict, ensure_ascii=False, indent=4).encode("utf-8")).decode("utf-8"), 
-        "branch": GITHUB_BRANCH
-    }
-    if sha: payload["sha"] = sha
-    try:
-        res = requests.put(api_url, headers=headers, json=payload, timeout=15)
-        if res.status_code in [200, 201]:
-            if gh_history is not None:
-                gh_history.insert_one({"time": datetime.utcnow(), "file": file_path})
-            return True
-    except Exception:
-        pass
-    return False
-
-def can_update_github_today() -> bool:
-    global LAST_GITHUB_WRITE_TIME
-    if time.time() - LAST_GITHUB_WRITE_TIME < 600: return False
-    if gh_history is None: 
-        LAST_GITHUB_WRITE_TIME = time.time()
-        return True
-    vn_now = datetime.utcnow() + timedelta(hours=7)
-    start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
-    count_today = gh_history.count_documents({"time": {"$gte": start_of_day_utc}})
-    if count_today >= 10: return False
-    LAST_GITHUB_WRITE_TIME = time.time()
-    return True
-
-def update_screener_json_on_github(all_crawled_data):
-    """Cập nhật file screener_results.json 1 lần duy nhất sau khi chốt sổ"""
-    if not all_crawled_data:
+def commit_multiple_files_to_github(files_to_update: dict, commit_message: str):
+    if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): 
         return False
-        
-    api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{SCREENER_JSON_FILE}"
+    if not files_to_update:
+        return True
+
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
-    
+    base_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}"
+
     try:
-        res = requests.get(api_url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
-        if res.status_code != 200:
-            print(f"[SCREENER] ⚠️ Không tìm thấy {SCREENER_JSON_FILE} trên Github để cập nhật.", flush=True)
+        print(f"[GITHUB] 🚀 Bắt đầu đẩy {len(files_to_update)} file lên Github cùng lúc...", flush=True)
+        
+        ref_res = requests.get(f"{base_url}/git/ref/heads/{GITHUB_BRANCH}", headers=headers, timeout=10)
+        if ref_res.status_code != 200:
+            print(f"[GITHUB] ❌ Lỗi lấy ref: {ref_res.status_code}", flush=True)
             return False
+        base_commit_sha = ref_res.json()["object"]["sha"]
+
+        tree_items = []
+        for path, content_dict in files_to_update.items():
+            content_str = json.dumps(content_dict, ensure_ascii=False, indent=4)
+            b64_content = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
             
-        file_info = res.json()
-        sha = file_info["sha"]
-        current_json = json.loads(base64.b64decode(file_info["content"]).decode("utf-8"))
-        
-        updated_count = 0
-        for item in current_json:
-            sym = item.get("symbol")
-            if sym in all_crawled_data:
-                cdata = all_crawled_data[sym]
-                # GHI SCREENER JSON: Nhân 1000 cho close_price
-                item["close_price"] = cdata["close"] * 1000
+            blob_payload = {"content": b64_content, "encoding": "base64"}
+            blob_res = requests.post(f"{base_url}/git/blobs", headers=headers, json=blob_payload, timeout=10)
+            if blob_res.status_code != 201:
+                print(f"[GITHUB] ❌ Lỗi tạo blob cho {path}", flush=True)
+                return False
                 
-                item["price_change_percent"] = cdata["pct_change"]
-                item["price_change_available"] = True
-                item["price_arrow"] = "▲" if cdata["pct_change"] > 0 else ("▼" if cdata["pct_change"] < 0 else "—")
-                item["price_color"] = "emerald" if cdata["pct_change"] > 0 else ("rose" if cdata["pct_change"] < 0 else "slate")
-                item["volume_percent"] = cdata["volume_percent"]
-                item["amplitude_percent"] = cdata["amplitude_percent"]
-                updated_count += 1
-        
-        if updated_count > 0:
-            payload = {
-                "message": f"Cập nhật giá chốt sổ D1 ({updated_count} mã)",
-                "content": base64.b64encode(json.dumps(current_json, ensure_ascii=False, indent=4).encode("utf-8")).decode("utf-8"),
-                "branch": GITHUB_BRANCH,
-                "sha": sha
-            }
-            put_res = requests.put(api_url, headers=headers, json=payload, timeout=15)
-            if put_res.status_code in [200, 201]:
-                print(f"[SCREENER] 📤 Đã cập nhật {updated_count} mã vào {SCREENER_JSON_FILE} trên Github.", flush=True)
-                return True
-            else:
-                print(f"[SCREENER] ❌ Lỗi cập nhật {SCREENER_JSON_FILE}: {put_res.status_code}", flush=True)
+            tree_items.append({
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": blob_res.json()["sha"]
+            })
+
+        tree_payload = {
+            "base_tree": base_commit_sha,
+            "tree": tree_items
+        }
+        tree_res = requests.post(f"{base_url}/git/trees", headers=headers, json=tree_payload, timeout=15)
+        if tree_res.status_code != 201:
+            print(f"[GITHUB] ❌ Lỗi tạo tree: {tree_res.text}", flush=True)
+            return False
+        new_tree_sha = tree_res.json()["sha"]
+
+        commit_payload = {
+            "message": commit_message,
+            "tree": new_tree_sha,
+            "parents": [base_commit_sha]
+        }
+        commit_res = requests.post(f"{base_url}/git/commits", headers=headers, json=commit_payload, timeout=10)
+        if commit_res.status_code != 201:
+            print(f"[GITHUB] ❌ Lỗi tạo commit", flush=True)
+            return False
+        new_commit_sha = commit_res.json()["sha"]
+
+        update_ref_payload = {"sha": new_commit_sha, "force": True}
+        update_res = requests.patch(f"{base_url}/git/refs/heads/{GITHUB_BRANCH}", headers=headers, json=update_ref_payload, timeout=10)
+        if update_res.status_code != 200:
+            print(f"[GITHUB] ❌ Lỗi cập nhật nhánh", flush=True)
+            return False
+
+        print(f"[GITHUB] ✅ Đã gom {len(files_to_update)} file vào 1 commit duy nhất thành công!", flush=True)
+        return True
+
     except Exception as e:
-        print(f"[SCREENER] ❌ Lỗi: {e}", flush=True)
-    return False
+        print(f"[GITHUB] ❌ Lỗi ngoại lệ khi bulk commit: {e}", flush=True)
+        return False
 
 # ===================== CORE CRAWL LOGIC =====================
 def _execute_crawl(symbols: list, is_retry: bool = False):
@@ -293,12 +271,14 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         now_str = _now_str()
         trading_date = _get_trading_date_str()
         updated_data = {}
-        synced_count = 0
         alert_batch = []
         all_crawled_data = {}
         
+        pending_history_files = {}
+        need_update_screener = False
+        
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
-        print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày giao dịch: {trading_date})...", flush=True)
+        print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày: {trading_date})...", flush=True)
         
         for sym in symbols:
             doc = collection.find_one({"symbol": sym})
@@ -319,7 +299,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                     bars = hist_data["history_d1"]
                     if len(bars) >= 2:
                         vn_now = datetime.utcnow() + timedelta(hours=7)
-                        
                         if vn_now.hour < 9:
                             prev_close = bars[-2]["close"]
                         else:
@@ -350,6 +329,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 if prev_close > 0:
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2)
 
+                # Lưu dữ liệu chuẩn (Nghìn đồng) vào DB và bộ nhớ chờ ghi Screener
                 all_crawled_data[sym] = {
                     "close": data["close"],
                     "pct_change": pct_change,
@@ -379,25 +359,15 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 if prev_close > 0:
                     is_price_shock = (pct_change >= 3.0) or (pct_change <= -3.0)
                     is_volume_shock = (volume_percent >= 120.0)
-                    
                     if is_price_shock and is_volume_shock:
                         trend_icon = "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"
                         cash_flow = "BÁN RÒNG" if pct_change < 0 else "MUA VÀO"
-                        
                         alert_batch.append({
-                            "sym": sym,
-                            "pct_change": pct_change,
-                            "volume_percent": volume_percent,
-                            "price": data["close"],
-                            "volume": data["volume"],
-                            "trend": trend_icon,
-                            "flow": cash_flow
+                            "sym": sym, "pct_change": pct_change, "volume_percent": volume_percent,
+                            "price": data["close"], "volume": data["volume"], "trend": trend_icon, "flow": cash_flow
                         })
 
                 if _is_after_15h() and can_update_github_today():
-                    history_path = f"history/{sym}.json"
-                    hist_data, _ = get_github_file_data(history_path)
-                    
                     if hist_data is not None:
                         d1_bars = hist_data.get("history_d1", [])
                         w1_bars = hist_data.get("history_w1", [])
@@ -446,12 +416,11 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         hist_data["history_w1"] = w1_bars
                         hist_data["history_mn"] = mn_bars
                         
-                        if update_github_file(history_path, hist_data, f"Chốt sổ D1/W1/MN {sym} ngày {trading_date}"):
-                            collection.update_one({"symbol": sym}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
-                            print(f"[GITHUB] 📤 Đã chốt sổ {sym} (D1/W1/MN) ngày {trading_date}", flush=True)
-                            synced_count += 1
+                        pending_history_files[f"history/{sym}.json"] = hist_data
+                    
+                    need_update_screener = True
 
-                print(f"[CRAWL] ✅ {sym}: {data['close']:,} | Prev: {prev_close:,} | Amplitude: {amplitude_percent}% | Vol: {volume_percent}%", flush=True)
+                print(f"[CRAWL] ✅ {sym}: {data['close']:,} | Prev: {prev_close:,} | Vol: {volume_percent}%", flush=True)
             else:
                 collection.update_one(
                     {"symbol": sym},
@@ -464,41 +433,74 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
 
         if alert_batch:
-            current_symbols = [item['sym'] for item in alert_batch]
-            current_symbols_sorted = sorted(current_symbols)
+            current_symbols_sorted = sorted([item['sym'] for item in alert_batch])
             last_symbols_sorted = sorted(LAST_ALERT_BATCH)
             
-            if current_symbols_sorted == last_symbols_sorted:
-                print(f"[TELEGRAM] ⏭️ Bỏ qua gửi tin vì danh sách mã giống hệt tin trước đó: {current_symbols_sorted}", flush=True)
-            else:
+            if current_symbols_sorted != last_symbols_sorted:
                 alert_batch.sort(key=lambda x: x["volume_percent"], reverse=True)
                 msg_lines = [f"🚨 <b>CẢNH BÁO DÒNG TIỀN ({len(alert_batch)} MÃ)</b>", "----------------------------------"]
-                
                 for item in alert_batch:
                     line = (f"• <b>{item['sym']}</b>: {item['pct_change']:+.2f}% {item['trend']} | "
                             f"Vol: {item['volume_percent']:.0f}% ({item['flow']})\n"
                             f"  Giá: {item['price']:,} | KL: {item['volume']:,}")
                     msg_lines.append(line)
-                    
                 msg_lines.append("----------------------------------")
                 msg_lines.append(f"🕒 Lúc: {now_str}")
                 
-                final_msg = "\n".join(msg_lines)
-                send_telegram(final_msg)
-                print(f"[TELEGRAM] 🚀 Đã gửi tin nhắn cảnh báo {len(alert_batch)} mã.", flush=True)
+                send_telegram("\n".join(msg_lines))
+                print(f"[TELEGRAM] 🚀 Đã gửi tin cảnh báo {len(alert_batch)} mã.", flush=True)
                 
                 LAST_ALERT_BATCH.clear()
-                LAST_ALERT_BATCH.extend(current_symbols)
+                LAST_ALERT_BATCH.extend(current_symbols_sorted)
 
-        if _is_after_15h() and synced_count > 0:
-            update_screener_json_on_github(all_crawled_data)
+        # GHI SCREENER JSON VÀ HISTORY (BULK COMMIT)
+        if pending_history_files or need_update_screener:
+            print(f"[GITHUB] 📦 Đang gom file để đẩy lên Github...", flush=True)
             
-            msg = f"""✅ <b>CẬP NHẬT DỮ LIỆU THÀNH CÔNG</b>
+            if need_update_screener and all_crawled_data:
+                try:
+                    api_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{SCREENER_JSON_FILE}"
+                    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+                    res = requests.get(api_url + f"?ref={GITHUB_BRANCH}", headers=headers, timeout=10)
+                    if res.status_code == 200:
+                        current_json = json.loads(base64.b64decode(res.json()["content"]).decode("utf-8"))
+                        updated_count = 0
+                        for item in current_json:
+                            sym = item.get("symbol")
+                            if sym in all_crawled_data:
+                                cdata = all_crawled_data[sym]
+                                # GHI VÀO SCREENER JSON: Tự động nhân 1000 (Từ 52.0 lên 52000)
+                                item["close_price"] = cdata["close"] * 1000
+                                
+                                item["price_change_percent"] = cdata["pct_change"]
+                                item["price_change_available"] = True
+                                item["price_arrow"] = "▲" if cdata["pct_change"] > 0 else ("▼" if cdata["pct_change"] < 0 else "—")
+                                item["price_color"] = "emerald" if cdata["pct_change"] > 0 else ("rose" if cdata["pct_change"] < 0 else "slate")
+                                item["volume_percent"] = cdata["volume_percent"]
+                                item["amplitude_percent"] = cdata["amplitude_percent"]
+                                updated_count += 1
+                        
+                        if updated_count > 0:
+                            pending_history_files[SCREENER_JSON_FILE] = current_json
+                            print(f"[GITHUB] 📝 Đã chuẩn bị cập nhật {updated_count} mã vào {SCREENER_JSON_FILE}", flush=True)
+                except Exception as e:
+                    print(f"[GITHUB] ⚠️ Lỗi khi đọc {SCREENER_JSON_FILE}: {e}", flush=True)
+
+            commit_msg = f"Cập nhật dữ liệu ngày {trading_date}"
+            if commit_multiple_files_to_github(pending_history_files, commit_msg):
+                for path in pending_history_files:
+                    if path.startswith("history/"):
+                        sym = path.split("/")[1].replace(".json", "")
+                        collection.update_one({"symbol": sym}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
+                
+                msg = f"""✅ <b>CẬP NHẬT DỮ LIỆU THÀNH CÔNG</b>
 🕒 Thời gian: {now_str}
-📤 Đã đẩy lên GitHub: <b>{synced_count} mã</b>
+📤 Đã đẩy lên GitHub: <b>{len(pending_history_files)} files</b> (1 commit)
 📅 Ngày giao dịch: {trading_date}
 """
-            send_telegram(msg)
+                send_telegram(msg)
+            else:
+                print("[GITHUB] ❌ Bulk commit thất bại, sẽ thử lại sau.", flush=True)
 
     finally:
         is_crawling = False
@@ -658,7 +660,7 @@ def force_fix_data():
     collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols,)).start()
-    return jsonify({"status": "success", "message": f"Đang ép cào lại {len(all_symbols)} mã với đơn vị mới (Nghìn đồng). Vui lòng đợi 1-2 phút rồi F5 web!"})
+    return jsonify({"status": "success", "message": f"Đang ép cào lại {len(all_symbols)} mã. Vui lòng đợi 1-2 phút!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
