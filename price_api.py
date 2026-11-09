@@ -53,7 +53,7 @@ COOLDOWN_SECONDS = 300
 
 # ===================== VOLUME MULTIPLIER =====================
 # Hệ số nhân Volume (Sửa lỗi API trả về KL bị lệch đơn vị, ví dụ chỉ bằng 1/10 thực tế)
-VOLUME_MULTIPLIER = 10
+VOLUME_MULTIPLIER = 100
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
