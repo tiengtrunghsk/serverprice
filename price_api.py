@@ -7,7 +7,7 @@ CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất c�
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
 TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất. Chỉ gửi nếu danh sách mã thay đổi.
 GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
-GIỮ NGUYÊN PHIÊN CŨ: Trước 9h sáng, giữ nguyên ngày giao dịch của phiên hôm trước để giao diện không hiển thị 0.00%.
+PREV_CLOSE: Trước 9h sáng luôn lấy giá phiên áp chót để hiển thị đúng % của phiên gần nhất.
 """
 
 import os
@@ -311,10 +311,17 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 if hist_data and hist_data.get("history_d1"):
                     bars = hist_data["history_d1"]
                     if len(bars) >= 2:
-                        if bars[-1]["time"] == trading_date:
+                        vn_now = datetime.utcnow() + timedelta(hours=7)
+                        
+                        # SỬA LỖI PREV_CLOSE TRƯỚC 9H SÁNG
+                        # Nếu chưa tới 9h, luôn lấy nến áp chót (giá phiên trước đó) làm giá tham chiếu
+                        if vn_now.hour < 9:
                             prev_close = bars[-2]["close"]
                         else:
-                            prev_close = bars[-1]["close"]
+                            if bars[-1]["time"] == trading_date:
+                                prev_close = bars[-2]["close"]
+                            else:
+                                prev_close = bars[-1]["close"]
                     elif len(bars) == 1:
                         prev_close = bars[0]["close"]
                         
