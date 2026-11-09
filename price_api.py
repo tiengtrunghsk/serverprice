@@ -7,7 +7,7 @@ CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất c�
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
 TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất. Chỉ gửi nếu danh sách mã thay đổi.
 GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
-PREV_CLOSE: Trước 9h sáng luôn lấy giá phiên áp chót để hiển thị đúng % của phiên gần nhất.
+CHUẨN HÓA API: Tự động nhân 1000 nếu giá < 1000 trước khi trả về Frontend (Fix lỗi biểu đồ).
 """
 
 import os
@@ -314,7 +314,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         vn_now = datetime.utcnow() + timedelta(hours=7)
                         
                         # SỬA LỖI PREV_CLOSE TRƯỚC 9H SÁNG
-                        # Nếu chưa tới 9h, luôn lấy nến áp chót (giá phiên trước đó) làm giá tham chiếu
                         if vn_now.hour < 9:
                             prev_close = bars[-2]["close"]
                         else:
@@ -584,10 +583,25 @@ def api_get_data():
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
+                # ==========================================
+                # LỚP BẢO VỆ CUỐI CÙNG: TỰ ĐỘNG CHUẨN HÓA ĐƠN VỊ
+                # ==========================================
                 close_price = doc.get("close", 0)
                 prev_close = doc.get("prev_close", 0)
-                doc["close_price"] = close_price
                 
+                # Nếu giá < 1000 (bị lỗi đơn vị nghìn đồng) -> Nhân 1000
+                if 0 < close_price < 1000: close_price = close_price * 1000
+                if 0 < prev_close < 1000: prev_close = prev_close * 1000
+                
+                doc["close"] = close_price
+                doc["close_price"] = close_price
+                doc["prev_close"] = prev_close
+                
+                for field in ["open", "high", "low"]:
+                    val = doc.get(field, 0)
+                    if 0 < val < 1000: doc[field] = val * 1000
+
+                # --- TÍNH % VÀ MŨI TÊN ---
                 price_change_percent = 0.0
                 price_change_available = False
                 arrow = "—"
