@@ -139,22 +139,20 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         except Exception:
             return None
 
-    # Ép timeout nghiêm ngặt, nếu quá 15 giây không trả về thì HỦY luôn
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(_do)
         try:
-            data = fut.result(timeout=15) # 15s
+            data = fut.result(timeout=15) 
         except concurrent.futures.TimeoutError:
-            print(f"[FETCH] ⏰ {symbol}: Quá thời gian chờ (Timeout), tự động bỏ qua!", flush=True)
+            print(f"[FETCH] ⏰ {symbol}: Quá thời gian chờ, bỏ qua!", flush=True)
             return None
         except Exception as e:
-            print(f"[FETCH] ❌ {symbol}: Lỗi kết nối ({e}), tự động bỏ qua!", flush=True)
+            print(f"[FETCH] ❌ {symbol}: Lỗi kết nối, bỏ qua!", flush=True)
             return None
 
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
         return None
     
-    # TỰ ĐỘNG TÍNH TOÁN LẠI ĐỂ CHUẨN HÓA VỀ ĐƠN VỊ NGHÌN ĐỒNG (VD: 52.0)
     if data["close"] >= 1000:
         for k in ["close", "open", "high", "low"]:
             if data[k] > 0: 
@@ -209,7 +207,7 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
             
             ref_res = requests.get(f"{base_url}/git/ref/heads/{GITHUB_BRANCH}", headers=headers, timeout=10)
             if ref_res.status_code != 200:
-                print(f"[GITHUB] ❌ Lỗi lấy ref: {ref_res.status_code} - {ref_res.text}", flush=True)
+                print(f"[GITHUB] ❌ Lỗi lấy ref: {ref_res.status_code}", flush=True)
                 time.sleep(2)
                 continue
             base_commit_sha = ref_res.json()["object"]["sha"]
@@ -244,7 +242,7 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
             }
             tree_res = requests.post(f"{base_url}/git/trees", headers=headers, json=tree_payload, timeout=15)
             if tree_res.status_code != 201:
-                print(f"[GITHUB] ❌ Lỗi tạo tree: {tree_res.status_code} - {tree_res.text}", flush=True)
+                print(f"[GITHUB] ❌ Lỗi tạo tree: {tree_res.status_code}", flush=True)
                 time.sleep(2)
                 continue
             new_tree_sha = tree_res.json()["sha"]
@@ -256,7 +254,7 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
             }
             commit_res = requests.post(f"{base_url}/git/commits", headers=headers, json=commit_payload, timeout=10)
             if commit_res.status_code != 201:
-                print(f"[GITHUB] ❌ Lỗi tạo commit: {commit_res.status_code} - {commit_res.text}", flush=True)
+                print(f"[GITHUB] ❌ Lỗi tạo commit: {commit_res.status_code}", flush=True)
                 time.sleep(2)
                 continue
             new_commit_sha = commit_res.json()["sha"]
@@ -265,17 +263,17 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
             update_res = requests.patch(f"{base_url}/git/refs/heads/{GITHUB_BRANCH}", headers=headers, json=update_ref_payload, timeout=10)
             
             if update_res.status_code == 200:
-                print(f"[GITHUB] ✅ Đã gom {len(files_to_update)} file vào 1 commit duy nhất thành công!", flush=True)
+                print(f"[GITHUB] ✅ Đã gom {len(files_to_update)} file vào 1 commit thành công!", flush=True)
                 return True
             else:
-                print(f"[GITHUB] ❌ Lỗi cập nhật nhánh (Mã {update_res.status_code}): {update_res.text}", flush=True)
+                print(f"[GITHUB] ❌ Lỗi cập nhật nhánh (Mã {update_res.status_code})", flush=True)
                 time.sleep(3)
 
         except Exception as e:
             print(f"[GITHUB] ❌ Lỗi ngoại lệ: {e}", flush=True)
             time.sleep(3)
 
-    print(f"[GITHUB] 🛑 Đã thử {max_retries} lần nhưng thất bại. Sẽ thử lại ở chu kỳ sau.", flush=True)
+    print(f"[GITHUB] 🛑 Đã thử {max_retries} lần nhưng thất bại.", flush=True)
     return False
 
 # ===================== CORE CRAWL LOGIC =====================
@@ -296,13 +294,17 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày: {trading_date})...", flush=True)
         
-        for sym in symbols:
+        for i, sym in enumerate(symbols):
             doc = collection.find_one({"symbol": sym})
             
             if doc and doc.get("chot_so_today") == trading_date:
                 print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date}. Bỏ qua.", flush=True)
                 if "close" in doc: updated_data[sym] = doc["close"]
                 continue
+
+            # Nghỉ 0.5s mỗi 10 mã để xả RAM, tránh bị Render kill
+            if i > 0 and i % 10 == 0:
+                time.sleep(0.5)
 
             data = _fetch_one(sym)
             
@@ -501,7 +503,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
 
             commit_msg = f"Cập nhật dữ liệu ngày {trading_date}"
             if commit_multiple_files_to_github(pending_history_files, commit_msg):
-                # ĐÁNH DẤU CHỐT SỔ SAU KHI ĐẨY THÀNH CÔNG
                 for path in pending_history_files:
                     if path.startswith("history/"):
                         sym = path.split("/")[1].replace(".json", "")
@@ -509,7 +510,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 
                 msg = f"""✅ <b>CẬP NHẬT DỮ LIỆU THÀNH CÔNG</b>
 🕒 Thời gian: {now_str}
-📤 Đã đẩy lên GitHub: <b>{len(pending_history_files)} files</b> (1 commit)
+📤 Đã đẩy lên GitHub: <b>{len(pending_history_files)} files</b>
 📅 Ngày giao dịch: {trading_date}
 """
                 send_telegram(msg)
@@ -588,6 +589,11 @@ def auto_crawler_worker():
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
 
 # ===================== ROUTES =====================
+# THÊM ROUTE NÀY ĐỂ UPTIMEROBOT PING VÀO KHÔNG BỊ 404, TRÁNH RENDER RESTART
+@app.get("/")
+def home():
+    return "API is running!", 200
+
 @app.get("/api/data")
 def api_get_data():
     try:
@@ -684,6 +690,21 @@ def force_fix_data():
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols,)).start()
     return jsonify({"status": "success", "message": f"Đang ép cào lại toàn bộ {len(all_symbols)} mã. Vui lòng đợi 1-2 phút!"})
+
+@app.get("/api/retry-now")
+def retry_now():
+    """Ép chạy cào bù ngay lập tức các mã bị lỗi"""
+    if is_crawling:
+        return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
+        
+    incomplete_symbols = [doc["symbol"] for doc in collection.find({"is_incomplete": True}, {"symbol": 1})]
+    
+    if not incomplete_symbols:
+        return jsonify({"status": "success", "message": "Không có mã nào bị lỗi cần cào bù!"})
+        
+    threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True)).start()
+    
+    return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù ngay lập tức cho {len(incomplete_symbols)} mã bị lỗi!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
