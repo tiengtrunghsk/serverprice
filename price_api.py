@@ -202,7 +202,6 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
         try:
             print(f"[GITHUB] 🚀 Đang đẩy {len(files_to_update)} file (Lần thử {attempt + 1}/{max_retries})...", flush=True)
             
-            # 1. Lấy commit mới nhất
             ref_res = requests.get(f"{base_url}/git/ref/heads/{GITHUB_BRANCH}", headers=headers, timeout=10)
             if ref_res.status_code != 200:
                 print(f"[GITHUB] ❌ Lỗi lấy ref: {ref_res.status_code} - {ref_res.text}", flush=True)
@@ -210,7 +209,6 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
                 continue
             base_commit_sha = ref_res.json()["object"]["sha"]
 
-            # 2. Tạo Blobs
             tree_items = []
             blob_failed = False
             for path, content_dict in files_to_update.items():
@@ -235,7 +233,6 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
                 time.sleep(2)
                 continue
 
-            # 3. Tạo Tree mới
             tree_payload = {
                 "base_tree": base_commit_sha,
                 "tree": tree_items
@@ -247,7 +244,6 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
                 continue
             new_tree_sha = tree_res.json()["sha"]
 
-            # 4. Tạo Commit mới
             commit_payload = {
                 "message": commit_message,
                 "tree": new_tree_sha,
@@ -260,7 +256,6 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
                 continue
             new_commit_sha = commit_res.json()["sha"]
 
-            # 5. Cập nhật nhánh (Có sử dụng Force để tránh xung đột)
             update_ref_payload = {"sha": new_commit_sha, "force": True}
             update_res = requests.patch(f"{base_url}/git/refs/heads/{GITHUB_BRANCH}", headers=headers, json=update_ref_payload, timeout=10)
             
@@ -292,8 +287,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         
         pending_history_files = {}
         need_update_screener = False
-        
-        success_symbols = []
         
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày: {trading_date})...", flush=True)
@@ -372,7 +365,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 )
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
-                success_symbols.append(sym)
                 
                 if prev_close > 0:
                     is_price_shock = (pct_change >= 3.0) or (pct_change <= -3.0)
