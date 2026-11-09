@@ -189,7 +189,7 @@ def get_github_file_data(file_path):
     except Exception:
         return None, None
 
-def commit_multiple_files_to_github(files_to_update: dict, commit_message: str):
+def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, max_retries: int = 3):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): 
         return False
     if not files_to_update:
@@ -198,66 +198,85 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str):
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     base_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}"
 
-    try:
-        print(f"[GITHUB] 🚀 Bắt đầu đẩy {len(files_to_update)} file lên Github cùng lúc...", flush=True)
-        
-        ref_res = requests.get(f"{base_url}/git/ref/heads/{GITHUB_BRANCH}", headers=headers, timeout=10)
-        if ref_res.status_code != 200:
-            print(f"[GITHUB] ❌ Lỗi lấy ref: {ref_res.status_code}", flush=True)
-            return False
-        base_commit_sha = ref_res.json()["object"]["sha"]
-
-        tree_items = []
-        for path, content_dict in files_to_update.items():
-            content_str = json.dumps(content_dict, ensure_ascii=False, indent=4)
-            b64_content = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+    for attempt in range(max_retries):
+        try:
+            print(f"[GITHUB] 🚀 Đang đẩy {len(files_to_update)} file (Lần thử {attempt + 1}/{max_retries})...", flush=True)
             
-            blob_payload = {"content": b64_content, "encoding": "base64"}
-            blob_res = requests.post(f"{base_url}/git/blobs", headers=headers, json=blob_payload, timeout=10)
-            if blob_res.status_code != 201:
-                print(f"[GITHUB] ❌ Lỗi tạo blob cho {path}", flush=True)
-                return False
+            # 1. Lấy commit mới nhất
+            ref_res = requests.get(f"{base_url}/git/ref/heads/{GITHUB_BRANCH}", headers=headers, timeout=10)
+            if ref_res.status_code != 200:
+                print(f"[GITHUB] ❌ Lỗi lấy ref: {ref_res.status_code} - {ref_res.text}", flush=True)
+                time.sleep(2)
+                continue
+            base_commit_sha = ref_res.json()["object"]["sha"]
+
+            # 2. Tạo Blobs
+            tree_items = []
+            blob_failed = False
+            for path, content_dict in files_to_update.items():
+                content_str = json.dumps(content_dict, ensure_ascii=False, indent=4)
+                b64_content = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
                 
-            tree_items.append({
-                "path": path,
-                "mode": "100644",
-                "type": "blob",
-                "sha": blob_res.json()["sha"]
-            })
+                blob_payload = {"content": b64_content, "encoding": "base64"}
+                blob_res = requests.post(f"{base_url}/git/blobs", headers=headers, json=blob_payload, timeout=10)
+                if blob_res.status_code != 201:
+                    print(f"[GITHUB] ❌ Lỗi tạo blob cho {path}: {blob_res.status_code}", flush=True)
+                    blob_failed = True
+                    break
+                    
+                tree_items.append({
+                    "path": path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha": blob_res.json()["sha"]
+                })
+            
+            if blob_failed:
+                time.sleep(2)
+                continue
 
-        tree_payload = {
-            "base_tree": base_commit_sha,
-            "tree": tree_items
-        }
-        tree_res = requests.post(f"{base_url}/git/trees", headers=headers, json=tree_payload, timeout=15)
-        if tree_res.status_code != 201:
-            print(f"[GITHUB] ❌ Lỗi tạo tree: {tree_res.text}", flush=True)
-            return False
-        new_tree_sha = tree_res.json()["sha"]
+            # 3. Tạo Tree mới
+            tree_payload = {
+                "base_tree": base_commit_sha,
+                "tree": tree_items
+            }
+            tree_res = requests.post(f"{base_url}/git/trees", headers=headers, json=tree_payload, timeout=15)
+            if tree_res.status_code != 201:
+                print(f"[GITHUB] ❌ Lỗi tạo tree: {tree_res.status_code} - {tree_res.text}", flush=True)
+                time.sleep(2)
+                continue
+            new_tree_sha = tree_res.json()["sha"]
 
-        commit_payload = {
-            "message": commit_message,
-            "tree": new_tree_sha,
-            "parents": [base_commit_sha]
-        }
-        commit_res = requests.post(f"{base_url}/git/commits", headers=headers, json=commit_payload, timeout=10)
-        if commit_res.status_code != 201:
-            print(f"[GITHUB] ❌ Lỗi tạo commit", flush=True)
-            return False
-        new_commit_sha = commit_res.json()["sha"]
+            # 4. Tạo Commit mới
+            commit_payload = {
+                "message": commit_message,
+                "tree": new_tree_sha,
+                "parents": [base_commit_sha]
+            }
+            commit_res = requests.post(f"{base_url}/git/commits", headers=headers, json=commit_payload, timeout=10)
+            if commit_res.status_code != 201:
+                print(f"[GITHUB] ❌ Lỗi tạo commit: {commit_res.status_code} - {commit_res.text}", flush=True)
+                time.sleep(2)
+                continue
+            new_commit_sha = commit_res.json()["sha"]
 
-        update_ref_payload = {"sha": new_commit_sha}
-        update_res = requests.patch(f"{base_url}/git/refs/heads/{GITHUB_BRANCH}", headers=headers, json=update_ref_payload, timeout=10)
-        if update_res.status_code != 200:
-            print(f"[GITHUB] ❌ Lỗi cập nhật nhánh", flush=True)
-            return False
+            # 5. Cập nhật nhánh (Có sử dụng Force để tránh xung đột)
+            update_ref_payload = {"sha": new_commit_sha, "force": True}
+            update_res = requests.patch(f"{base_url}/git/refs/heads/{GITHUB_BRANCH}", headers=headers, json=update_ref_payload, timeout=10)
+            
+            if update_res.status_code == 200:
+                print(f"[GITHUB] ✅ Đã gom {len(files_to_update)} file vào 1 commit duy nhất thành công!", flush=True)
+                return True
+            else:
+                print(f"[GITHUB] ❌ Lỗi cập nhật nhánh (Mã {update_res.status_code}): {update_res.text}", flush=True)
+                time.sleep(3)
 
-        print(f"[GITHUB] ✅ Đã gom {len(files_to_update)} file vào 1 commit duy nhất thành công!", flush=True)
-        return True
+        except Exception as e:
+            print(f"[GITHUB] ❌ Lỗi ngoại lệ: {e}", flush=True)
+            time.sleep(3)
 
-    except Exception as e:
-        print(f"[GITHUB] ❌ Lỗi ngoại lệ khi bulk commit: {e}", flush=True)
-        return False
+    print(f"[GITHUB] 🛑 Đã thử {max_retries} lần nhưng thất bại. Sẽ thử lại ở chu kỳ sau.", flush=True)
+    return False
 
 # ===================== CORE CRAWL LOGIC =====================
 def _execute_crawl(symbols: list, is_retry: bool = False):
@@ -274,7 +293,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         pending_history_files = {}
         need_update_screener = False
         
-        # Mảng lưu các mã đã cào thành công trong phiên này
         success_symbols = []
         
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
@@ -354,7 +372,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 )
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
-                success_symbols.append(sym) # Thêm vào danh sách chờ đánh dấu
+                success_symbols.append(sym)
                 
                 if prev_close > 0:
                     is_price_shock = (pct_change >= 3.0) or (pct_change <= -3.0)
@@ -486,7 +504,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
 
             commit_msg = f"Cập nhật dữ liệu ngày {trading_date}"
             if commit_multiple_files_to_github(pending_history_files, commit_msg):
-                # LÚC NÀY MỚI ĐÁNH DẤU CHỐT SỔ (VÀ CHỈ ĐÁNH DẤU NHỮNG MÃ ĐÃ ĐƯỢC GHI)
+                # ĐÁNH DẤU CHỐT SỔ SAU KHI ĐẨY THÀNH CÔNG
                 for path in pending_history_files:
                     if path.startswith("history/"):
                         sym = path.split("/")[1].replace(".json", "")
@@ -656,23 +674,15 @@ def api_sync():
 
 @app.get("/api/reset-today")
 def reset_today():
-    """Xóa cờ chốt sổ của ngày hôm nay để test lại"""
     today_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d")
-    
-    # Chỉ xóa cờ chốt sổ của những mã đã chốt trong hôm nay
     result = collection.update_many(
         {"chot_so_today": today_str},
         {"$unset": {"chot_so_today": "", "is_locked": ""}}
     )
-    
-    return jsonify({
-        "status": "success", 
-        "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã trong ngày hôm nay. Bạn có thể test lại!"
-    })
+    return jsonify({"status": "success", "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã trong ngày hôm nay. Bạn có thể test lại!"})
 
 @app.get("/api/force-fix")
 def force_fix_data():
-    """Xóa TẤT CẢ cờ chốt sổ của MỌI NGÀY và cào lại từ đầu"""
     collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols,)).start()
