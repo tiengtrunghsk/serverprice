@@ -139,11 +139,16 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         except Exception:
             return None
 
+    # Ép timeout nghiêm ngặt, nếu quá 15 giây không trả về thì HỦY luôn
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(_do)
         try:
-            data = fut.result(timeout=FETCH_TIMEOUT)
-        except Exception:
+            data = fut.result(timeout=15) # 15s
+        except concurrent.futures.TimeoutError:
+            print(f"[FETCH] ⏰ {symbol}: Quá thời gian chờ (Timeout), tự động bỏ qua!", flush=True)
+            return None
+        except Exception as e:
+            print(f"[FETCH] ❌ {symbol}: Lỗi kết nối ({e}), tự động bỏ qua!", flush=True)
             return None
 
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
