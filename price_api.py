@@ -7,7 +7,7 @@ CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất c�
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
 TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất. Chỉ gửi nếu danh sách mã thay đổi.
 GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
-CHUẨN HÓA API: BỎ HOÀN TOÀN LOGIC TỰ ĐỘNG NHÂN 1000 (Giữ nguyên đơn vị gốc từ VPS).
+CHUẨN HÓA TỪ LOTUS: Tự động chia 1000 nếu giá > 1000 (đưa về đơn vị nghìn đồng).
 VOLUME MULTIPLIER: Tự động nhân Volume với hằng số VOLUME_MULTIPLIER (mặc định 10) nếu API trả về quá nhỏ.
 """
 
@@ -173,17 +173,24 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         return None
     
     # =========================================================
-    # ĐÃ XÓA LOGIC TỰ ĐỘNG NHÂN 1000 TẠI ĐÂY
-    # (Giữ nguyên đơn vị gốc từ VPS)
+    # TỰ ĐỘNG CHUẨN HÓA ĐƠN VỊ TỪ LOTUS (Nếu > 1000 thì chia 1000)
+    # Đảm bảo tất cả lưu vào DB đều là đơn vị Nghìn đồng (VD: 11.9)
     # =========================================================
+    if data["close"] >= 1000:
+        for k in ["close", "open", "high", "low"]:
+            if data[k] > 0: 
+                data[k] = data[k] / 1000.0
             
     # SỬA LỖI VOLUME BỊ LỆCH ĐƠN VỊ (Sử dụng hằng số VOLUME_MULTIPLIER)
     if 0 < data["volume"] < 100000:
         data["volume"] = data["volume"] * VOLUME_MULTIPLIER
             
     return {
-        "close": int(data["close"]), "open": int(data["open"]),
-        "high": int(data["high"]), "low": int(data["low"]), "volume": int(data["volume"])
+        "close": round(data["close"], 2), 
+        "open": round(data["open"], 2),
+        "high": round(data["high"], 2), 
+        "low": round(data["low"], 2), 
+        "volume": int(data["volume"])
     }
 
 # ===================== GITHUB SYNC =====================
@@ -595,10 +602,7 @@ def api_get_data():
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
-                # ==========================================
-                # ĐÃ XÓA LỚP BẢO VỆ TỰ ĐỘNG NHÂN 1000 TẠI ĐÂY
-                # Trả về đúng dữ liệu đang lưu trong MongoDB
-                # ==========================================
+                # Trả về đúng dữ liệu đang lưu trong MongoDB (Đơn vị Nghìn đồng)
                 close_price = doc.get("close", 0)
                 prev_close = doc.get("prev_close", 0)
                 
@@ -672,6 +676,19 @@ def api_sync():
         if doc and "close" in doc: updated_data[sym] = doc["close"]
 
     return jsonify({"status": "success", "updated_at": _now_str() + " (Đang cào ngầm)", "updated_data": updated_data})
+
+@app.get("/api/force-fix")
+def force_fix_data():
+    # Xóa cờ chốt sổ của tất cả các mã để ép cào lại từ đầu
+    collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
+    
+    # Lấy toàn bộ mã
+    all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+    
+    # Chạy cào ngầm
+    threading.Thread(target=_execute_crawl, args=(all_symbols,)).start()
+    
+    return jsonify({"status": "success", "message": f"Đang ép cào lại {len(all_symbols)} mã với đơn vị mới (Nghìn đồng). Vui lòng đợi 1-2 phút rồi F5 web!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
