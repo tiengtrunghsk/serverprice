@@ -9,6 +9,7 @@ TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nh
 GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
 CHUẨN HÓA TỪ LOTUS: Tự động chia 1000 nếu giá > 1000 (đưa về đơn vị nghìn đồng).
 VOLUME MULTIPLIER: Tự động nhân Volume với hằng số VOLUME_MULTIPLIER (mặc định 10) nếu API trả về quá nhỏ.
+FIX PYMONGO 4.x: Đã sửa lỗi "Collection objects do not implement truth value testing".
 """
 
 import os
@@ -223,7 +224,9 @@ def update_github_file(file_path, data_dict, commit_message):
     try:
         res = requests.put(api_url, headers=headers, json=payload, timeout=15)
         if res.status_code in [200, 201]:
-            if gh_history: gh_history.insert_one({"time": datetime.utcnow(), "file": file_path})
+            # SỬA LỖI PYMONGO 4.X TẠI ĐÂY
+            if gh_history is not None:
+                gh_history.insert_one({"time": datetime.utcnow(), "file": file_path})
             return True
     except Exception:
         pass
@@ -232,9 +235,12 @@ def update_github_file(file_path, data_dict, commit_message):
 def can_update_github_today() -> bool:
     global LAST_GITHUB_WRITE_TIME
     if time.time() - LAST_GITHUB_WRITE_TIME < 600: return False
-    if not gh_history: 
+    
+    # SỬA LỖI PYMONGO 4.X TẠI ĐÂY
+    if gh_history is None: 
         LAST_GITHUB_WRITE_TIME = time.time()
         return True
+        
     vn_now = datetime.utcnow() + timedelta(hours=7)
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
     count_today = gh_history.count_documents({"time": {"$gte": start_of_day_utc}})
@@ -340,11 +346,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                                 prev_close = bars[-1]["close"]
                     elif len(bars) == 1:
                         prev_close = bars[0]["close"]
-                        
-                    # =====================================================
-                    # ĐÃ XÓA LOGIC NHÂN 1000 CHO PREV_CLOSE
-                    # Giữ nguyên prev_close theo đúng đơn vị đang lưu trong file
-                    # =====================================================
                         
                     recent_volumes = [b.get("volume", 0) for b in bars[-20:]]
                     if recent_volumes:
