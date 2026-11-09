@@ -8,6 +8,7 @@ CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được ch�
 TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất. Chỉ gửi nếu danh sách mã thay đổi.
 GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
 CHUẨN HÓA API: Tự động nhân 1000 nếu giá < 1000 trước khi trả về Frontend (Fix lỗi biểu đồ).
+VOLUME MULTIPLIER: Tự động nhân Volume với hằng số VOLUME_MULTIPLIER (mặc định 10) nếu API trả về quá nhỏ.
 """
 
 import os
@@ -49,6 +50,10 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
 COOLDOWN_SECONDS = 300
+
+# ===================== VOLUME MULTIPLIER =====================
+# Hệ số nhân Volume (Sửa lỗi API trả về KL bị lệch đơn vị, ví dụ chỉ bằng 1/10 thực tế)
+VOLUME_MULTIPLIER = 10
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
@@ -170,6 +175,12 @@ def _fetch_one(symbol: str) -> Optional[dict]:
     if data["close"] < 1000:
         for k in ["close", "open", "high", "low"]:
             if data[k] > 0: data[k] = data[k] * 1000
+            
+    # =========================================================
+    # SỬA LỖI VOLUME BỊ LỆCH ĐƠN VỊ (Sử dụng hằng số VOLUME_MULTIPLIER)
+    # =========================================================
+    if 0 < data["volume"] < 100000:
+        data["volume"] = data["volume"] * VOLUME_MULTIPLIER
             
     return {
         "close": int(data["close"]), "open": int(data["open"]),
