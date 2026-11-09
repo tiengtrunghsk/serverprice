@@ -1,15 +1,15 @@
 """
 Price API — Pro Quant Screener
-Cơ chế Tối giản & Ổn định (Chống lỗi 500) + Lấy đầy đủ OHLC & Volume.
-ĐỒNG BỘ TỰ ĐỘNG: Đọc danh sách mã từ vn100_symbols.json, so sánh với MongoDB (Thiếu thêm - Thừa xóa).
+ĐỒNG BỘ TỰ ĐỘNG: Đọc danh sách mã từ vn100_symbols.json, so sánh với MongoDB.
 CÀO BÙ THÔNG MINH: Mã lỗi được đánh dấu is_incomplete. Chỉ cào bù các mã bị đánh dấu.
-CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ (10 lần ghi/ngày).
+CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất cả các mã được chốt sổ.
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
-TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất. Chỉ gửi nếu danh sách mã thay đổi.
+TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất.
 GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
 CHUẨN HÓA TỪ LOTUS: Tự động chia 1000 nếu giá > 1000 (đưa về đơn vị nghìn đồng).
-VOLUME MULTIPLIER: Tự động nhân Volume với hằng số VOLUME_MULTIPLIER (mặc định 10) nếu API trả về quá nhỏ.
-FIX PYMONGO 4.x: Đã sửa lỗi "Collection objects do not implement truth value testing".
+GHI SCREENER JSON: Tự động nhân 1000 close_price trước khi ghi vào file JSON.
+VOLUME MULTIPLIER: Tự động nhân Volume với VOLUME_MULTIPLIER nếu API trả về quá nhỏ.
+FIX PYMONGO 4.x: Sửa lỗi "Collection objects do not implement truth value testing".
 """
 
 import os
@@ -53,7 +53,6 @@ MAX_SYMBOLS_PER_REQUEST = int(os.environ.get("MAX_SYMBOLS_PER_REQUEST", "20"))
 COOLDOWN_SECONDS = 300
 
 # ===================== VOLUME MULTIPLIER =====================
-# Hệ số nhân Volume (Sửa lỗi API trả về KL bị lệch đơn vị, ví dụ chỉ bằng 1/10 thực tế)
 VOLUME_MULTIPLIER = 10
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
@@ -124,7 +123,6 @@ crawl_lock = threading.Lock()
 LAST_CRAWL_TIME = {}
 LAST_GITHUB_WRITE_TIME = 0
 
-# Lưu danh sách mã của tin nhắn gần nhất để so sánh chống trùng lặp tin nhắn
 LAST_ALERT_BATCH = []
 
 # ===================== HELPERS =====================
@@ -133,15 +131,10 @@ def _now_str() -> str:
 
 def _get_trading_date_str() -> str:
     vn_now = datetime.utcnow() + timedelta(hours=7)
-    
-    # NẾU TRƯỚC 9H SÁNG, VẪN TÍNH LÀ NGÀY GIAO DỊCH CỦA HÔM TRƯỚC
     if vn_now.hour < 9:
         vn_now -= timedelta(days=1)
-        
-    # Xử lý ngày nghỉ (T7, CN)
     while vn_now.weekday() >= 5:
         vn_now -= timedelta(days=1)
-        
     return vn_now.strftime("%Y-%m-%d")
 
 def _is_after_15h() -> bool:
@@ -173,16 +166,12 @@ def _fetch_one(symbol: str) -> Optional[dict]:
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
         return None
     
-    # =========================================================
     # TỰ ĐỘNG CHUẨN HÓA ĐƠN VỊ TỪ LOTUS (Nếu > 1000 thì chia 1000)
-    # Đảm bảo tất cả lưu vào DB đều là đơn vị Nghìn đồng (VD: 11.9)
-    # =========================================================
     if data["close"] >= 1000:
         for k in ["close", "open", "high", "low"]:
             if data[k] > 0: 
                 data[k] = data[k] / 1000.0
             
-    # SỬA LỖI VOLUME BỊ LỆCH ĐƠN VỊ (Sử dụng hằng số VOLUME_MULTIPLIER)
     if 0 < data["volume"] < 100000:
         data["volume"] = data["volume"] * VOLUME_MULTIPLIER
             
@@ -224,7 +213,6 @@ def update_github_file(file_path, data_dict, commit_message):
     try:
         res = requests.put(api_url, headers=headers, json=payload, timeout=15)
         if res.status_code in [200, 201]:
-            # SỬA LỖI PYMONGO 4.X TẠI ĐÂY
             if gh_history is not None:
                 gh_history.insert_one({"time": datetime.utcnow(), "file": file_path})
             return True
@@ -235,12 +223,9 @@ def update_github_file(file_path, data_dict, commit_message):
 def can_update_github_today() -> bool:
     global LAST_GITHUB_WRITE_TIME
     if time.time() - LAST_GITHUB_WRITE_TIME < 600: return False
-    
-    # SỬA LỖI PYMONGO 4.X TẠI ĐÂY
     if gh_history is None: 
         LAST_GITHUB_WRITE_TIME = time.time()
         return True
-        
     vn_now = datetime.utcnow() + timedelta(hours=7)
     start_of_day_utc = vn_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(hours=7)
     count_today = gh_history.count_documents({"time": {"$gte": start_of_day_utc}})
@@ -271,8 +256,9 @@ def update_screener_json_on_github(all_crawled_data):
             sym = item.get("symbol")
             if sym in all_crawled_data:
                 cdata = all_crawled_data[sym]
-                # Ghi đè các thông số mới nhất
-                item["close_price"] = cdata["close"]
+                # GHI SCREENER JSON: Nhân 1000 cho close_price
+                item["close_price"] = cdata["close"] * 1000
+                
                 item["price_change_percent"] = cdata["pct_change"]
                 item["price_change_available"] = True
                 item["price_arrow"] = "▲" if cdata["pct_change"] > 0 else ("▼" if cdata["pct_change"] < 0 else "—")
@@ -309,8 +295,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         updated_data = {}
         synced_count = 0
         alert_batch = []
-        
-        # Lưu TẤT CẢ dữ liệu cào được trong phiên này để ghi vào file JSON
         all_crawled_data = {}
         
         mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
@@ -336,7 +320,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                     if len(bars) >= 2:
                         vn_now = datetime.utcnow() + timedelta(hours=7)
                         
-                        # SỬA LỖI PREV_CLOSE TRƯỚC 9H SÁNG
                         if vn_now.hour < 9:
                             prev_close = bars[-2]["close"]
                         else:
@@ -367,7 +350,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 if prev_close > 0:
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2)
 
-                # Lưu vào all_crawled_data để tí nữa ghi vào JSON
                 all_crawled_data[sym] = {
                     "close": data["close"],
                     "pct_change": pct_change,
@@ -394,7 +376,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 updated_data[sym] = data["close"]
                 LAST_CRAWL_TIME[sym] = time.time()
                 
-                # --- KIỂM TRA ĐIỀU KIỆN CẢNH BÁO (TELEGRAM) ---
                 if prev_close > 0:
                     is_price_shock = (pct_change >= 3.0) or (pct_change <= -3.0)
                     is_volume_shock = (volume_percent >= 120.0)
@@ -413,7 +394,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                             "flow": cash_flow
                         })
 
-                # 2. CHỐT SỔ SAU 15H
                 if _is_after_15h() and can_update_github_today():
                     history_path = f"history/{sym}.json"
                     hist_data, _ = get_github_file_data(history_path)
@@ -483,7 +463,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         if len(symbols) >= 5:
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
 
-        # ================= GỬI TIN NHẮN TELEGRAM TỔNG HỢP =================
         if alert_batch:
             current_symbols = [item['sym'] for item in alert_batch]
             current_symbols_sorted = sorted(current_symbols)
@@ -511,8 +490,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 LAST_ALERT_BATCH.clear()
                 LAST_ALERT_BATCH.extend(current_symbols)
 
-        # ================= CẬP NHẬT SCREENER_RESULTS.JSON (1 LẦN) =================
-        # Chỉ chạy khi đã qua 15h và có mã chốt sổ thành công trong đợt này
         if _is_after_15h() and synced_count > 0:
             update_screener_json_on_github(all_crawled_data)
             
@@ -603,7 +580,6 @@ def api_get_data():
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
-                # Trả về đúng dữ liệu đang lưu trong MongoDB (Đơn vị Nghìn đồng)
                 close_price = doc.get("close", 0)
                 prev_close = doc.get("prev_close", 0)
                 
@@ -611,7 +587,6 @@ def api_get_data():
                 doc["close_price"] = close_price
                 doc["prev_close"] = prev_close
 
-                # --- TÍNH % VÀ MŨI TÊN ---
                 price_change_percent = 0.0
                 price_change_available = False
                 arrow = "—"
@@ -680,15 +655,9 @@ def api_sync():
 
 @app.get("/api/force-fix")
 def force_fix_data():
-    # Xóa cờ chốt sổ của tất cả các mã để ép cào lại từ đầu
     collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
-    
-    # Lấy toàn bộ mã
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-    
-    # Chạy cào ngầm
     threading.Thread(target=_execute_crawl, args=(all_symbols,)).start()
-    
     return jsonify({"status": "success", "message": f"Đang ép cào lại {len(all_symbols)} mã với đơn vị mới (Nghìn đồng). Vui lòng đợi 1-2 phút rồi F5 web!"})
 
 if __name__ == "__main__":
