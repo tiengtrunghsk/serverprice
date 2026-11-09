@@ -7,7 +7,7 @@ CHỐT SỔ LINH HOẠT: Sau 15h, tiếp tục cào bù cho đến khi tất c�
 CHỐNG MẤT DỮ LIỆU: Mã chưa đủ dữ liệu sẽ không được chốt sổ, giữ nguyên dữ liệu cũ.
 TELEGRAM: Gom nhóm cảnh báo biến động mạnh thành 1 tin nhắn duy nhất. Chỉ gửi nếu danh sách mã thay đổi.
 GHI JSON: Cập nhật file screener_results.json 1 LẦN DUY NHẤT sau 15h khi chốt sổ thành công.
-CHUẨN HÓA API: Tự động nhân 1000 nếu giá < 1000 trước khi trả về Frontend (Fix lỗi biểu đồ).
+CHUẨN HÓA API: BỎ HOÀN TOÀN LOGIC TỰ ĐỘNG NHÂN 1000 (Giữ nguyên đơn vị gốc từ VPS).
 VOLUME MULTIPLIER: Tự động nhân Volume với hằng số VOLUME_MULTIPLIER (mặc định 10) nếu API trả về quá nhỏ.
 """
 
@@ -172,13 +172,12 @@ def _fetch_one(symbol: str) -> Optional[dict]:
     if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
         return None
     
-    if data["close"] < 1000:
-        for k in ["close", "open", "high", "low"]:
-            if data[k] > 0: data[k] = data[k] * 1000
+    # =========================================================
+    # ĐÃ XÓA LOGIC TỰ ĐỘNG NHÂN 1000 TẠI ĐÂY
+    # (Giữ nguyên đơn vị gốc từ VPS)
+    # =========================================================
             
-    # =========================================================
     # SỬA LỖI VOLUME BỊ LỆCH ĐƠN VỊ (Sử dụng hằng số VOLUME_MULTIPLIER)
-    # =========================================================
     if 0 < data["volume"] < 100000:
         data["volume"] = data["volume"] * VOLUME_MULTIPLIER
             
@@ -335,8 +334,10 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                     elif len(bars) == 1:
                         prev_close = bars[0]["close"]
                         
-                    if 0 < prev_close < 1000:
-                        prev_close = prev_close * 1000
+                    # =====================================================
+                    # ĐÃ XÓA LOGIC NHÂN 1000 CHO PREV_CLOSE
+                    # Giữ nguyên prev_close theo đúng đơn vị đang lưu trong file
+                    # =====================================================
                         
                     recent_volumes = [b.get("volume", 0) for b in bars[-20:]]
                     if recent_volumes:
@@ -595,22 +596,15 @@ def api_get_data():
             sym = doc.get("symbol")
             if sym:
                 # ==========================================
-                # LỚP BẢO VỆ CUỐI CÙNG: TỰ ĐỘNG CHUẨN HÓA ĐƠN VỊ
+                # ĐÃ XÓA LỚP BẢO VỆ TỰ ĐỘNG NHÂN 1000 TẠI ĐÂY
+                # Trả về đúng dữ liệu đang lưu trong MongoDB
                 # ==========================================
                 close_price = doc.get("close", 0)
                 prev_close = doc.get("prev_close", 0)
                 
-                # Nếu giá < 1000 (bị lỗi đơn vị nghìn đồng) -> Nhân 1000
-                if 0 < close_price < 1000: close_price = close_price * 1000
-                if 0 < prev_close < 1000: prev_close = prev_close * 1000
-                
                 doc["close"] = close_price
                 doc["close_price"] = close_price
                 doc["prev_close"] = prev_close
-                
-                for field in ["open", "high", "low"]:
-                    val = doc.get(field, 0)
-                    if 0 < val < 1000: doc[field] = val * 1000
 
                 # --- TÍNH % VÀ MŨI TÊN ---
                 price_change_percent = 0.0
