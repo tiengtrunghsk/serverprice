@@ -107,6 +107,7 @@ crawl_lock = threading.Lock()
 LAST_CRAWL_TIME = {}
 LAST_ALERT_BATCH = []
 LAST_GITHUB_WRITE_TIME = 0
+LAST_TELEGRAM_TIME = 0 # Biến chống spam Telegram
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -199,7 +200,7 @@ def get_github_file_data(file_path):
     except Exception:
         return None, None
 
-def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, max_retries: int = 3):
+def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, max_retries: int = 5):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): 
         return False
     if not files_to_update:
@@ -284,8 +285,8 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
     return False
 
 # ===================== CORE CRAWL LOGIC =====================
-def _execute_crawl(symbols: list, is_retry: bool = False):
-    global is_crawling, LAST_ALERT_BATCH
+def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
+    global is_crawling, LAST_ALERT_BATCH, LAST_TELEGRAM_TIME
     if is_crawling: return
     is_crawling = True
     try:
@@ -298,7 +299,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
         pending_history_files = {}
         need_update_screener = False
         
-        mode_str = "CÀO BÙ" if is_retry else "CÀO MỚI"
+        mode_str = "CÀO BÙ" if is_retry else ("CÀO TAY" if is_manual else "CÀO TỰ ĐỘNG")
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày: {trading_date})...", flush=True)
         
         for i, sym in enumerate(symbols):
@@ -347,7 +348,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 volume_percent = 0.0
                 if avg_volume_20 > 0 and data["volume"] > 0:
                     raw_vol = data["volume"] / avg_volume_20 * 100
-                    # BỎ GIỚI HẠN <= 1000 ĐỂ BẮT CÁC MÃ ĐỘT BIẾN CỰC MẠNH
                     if raw_vol >= 0:
                         volume_percent = round(raw_vol, 2)
                         
@@ -362,7 +362,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                     "amplitude_percent": amplitude_percent
                 }
 
-                # LẤY THỜI GIAN CHÍNH XÁC CHO TỪNG MÃ
                 current_update_time = _get_current_update_time()
 
                 collection.update_one(
@@ -375,7 +374,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         "amplitude_percent": amplitude_percent,
                         "volume_percent": volume_percent,
                         "trading_date": trading_date,
-                        "updated_at": current_update_time, # <-- LƯU GIỜ CHUẨN
+                        "updated_at": current_update_time,
                         "is_locked": _is_after_15h(),
                         "is_incomplete": False
                     }},
@@ -514,17 +513,39 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
 
             commit_msg = f"Cập nhật dữ liệu ngày {trading_date}"
             if commit_multiple_files_to_github(pending_history_files, commit_msg):
+                success_symbols = []
                 for path in pending_history_files:
                     if path.startswith("history/"):
                         sym = path.split("/")[1].replace(".json", "")
                         collection.update_one({"symbol": sym}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
+                        success_symbols.append(sym)
                 
-                msg = f"""✅ <b>CẬP NHẬT DỮ LIỆU THÀNH CÔNG</b>
-🕒 Thời gian: {now_str}
-📤 Đã đẩy lên GitHub: <b>{len(pending_history_files)} files</b>
-📅 Ngày giao dịch: {trading_date}
-"""
-                send_telegram(msg)
+                # === LOGIC GỬI TELEGRAM (CÁCH NHAU 4 TIẾNG) ===
+                current_time = time.time()
+                # 14.400 giây = 4 tiếng
+                if (current_time - LAST_TELEGRAM_TIME > 14400) or is_manual:
+                    error_docs = collection.find({"is_incomplete": True}, {"symbol": 1})
+                    error_symbols = [d["symbol"] for d in error_docs]
+                    
+                    msg = f"✅ <b>CẬP NHẬT DỮ LIỆU THÀNH CÔNG</b>\n"
+                    msg += f"🕒 Thời gian: {now_str}\n"
+                    msg += f"📤 Đã đẩy lên GitHub: <b>{len(success_symbols)} files</b>\n"
+                    msg += f"📅 Ngày giao dịch: {trading_date}\n"
+                    
+                    if len(error_symbols) > 0:
+                        msg += f"\n⚠️ <b>{len(error_symbols)} MÃ BỊ LỖI:</b>\n"
+                        msg += f"<code>{', '.join(error_symbols[:15])}</code>"
+                        if len(error_symbols) > 15:
+                            msg += f"... và {len(error_symbols) - 15} mã khác."
+                    else:
+                        msg += "\n🎉 <b>Hoàn hảo! Không có mã nào bị lỗi.</b>"
+                        
+                    send_telegram(msg)
+                    LAST_TELEGRAM_TIME = current_time
+                    print(f"[TELEGRAM] Đã gửi báo cáo (Giãn cách 4h).", flush=True)
+                else:
+                    print(f"[TELEGRAM] Bỏ qua gửi tin nhắn (Chưa đủ 4 tiếng).", flush=True)
+
             else:
                 print("[GITHUB] ❌ Bulk commit thất bại, sẽ thử lại sau.", flush=True)
 
@@ -564,11 +585,11 @@ def auto_crawler_worker():
             
             if incomplete_symbols:
                 print(f"[AUTO] 🔄 Phát hiện {len(incomplete_symbols)} mã lỗi. Cào bù...", flush=True)
-                _execute_crawl(incomplete_symbols, is_retry=True)
+                _execute_crawl(incomplete_symbols, is_retry=True, is_manual=False)
 
             if is_after_15h and unchot_symbols:
                 print(f"[AUTO] 📤 Phát hiện {len(unchot_symbols)} mã chưa chốt. Xử lý...", flush=True)
-                _execute_crawl(unchot_symbols)
+                _execute_crawl(unchot_symbols, is_manual=False)
             
             if not is_after_15h:
                 symbols_to_crawl = []
@@ -577,20 +598,7 @@ def auto_crawler_worker():
                     if not doc or doc.get("trading_date") != today_str:
                         symbols_to_crawl.append(sym)
                 if symbols_to_crawl:
-                    _execute_crawl(symbols_to_crawl)
-
-            if is_after_15h:
-                total = len(all_symbols)
-                completed = total - len(incomplete_symbols) - len(unchot_symbols)
-                if completed == total:
-                    msg = f"""🎉 <b>HOÀN TẤT CHỐT SỔ NGÀY {today_str}</b>
-✅ Trạng thái: 100% ({total}/{total} mã)
-"""
-                    send_telegram(msg)
-                    print(f"[AUTO] ✅ HOÀN TẤT 100%.", flush=True)
-                    time.sleep(3600)
-                else:
-                    print(f"[AUTO] ⏳ Tiến độ: {completed}/{total} mã.", flush=True)
+                    _execute_crawl(symbols_to_crawl, is_manual=False)
 
             time.sleep(900)
         except Exception as e:
@@ -600,7 +608,6 @@ def auto_crawler_worker():
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
 
 # ===================== ROUTES =====================
-# THÊM ROUTE NÀY ĐỂ UPTIMEROBOT PING VÀO KHÔNG BỊ 404, TRÁNH RENDER RESTART
 @app.get("/")
 def home():
     return "API is running!", 200
@@ -677,7 +684,7 @@ def api_sync():
             if doc and "close" in doc: updated_data[sym] = doc["close"]
         return jsonify({"status": "success", "updated_at": _now_str() + " (Cache 5 phút)", "updated_data": updated_data})
 
-    threading.Thread(target=_execute_crawl, args=(symbols,)).start()
+    threading.Thread(target=_execute_crawl, args=(symbols, False, True)).start()
     
     updated_data = {}
     for sym in symbols:
@@ -699,7 +706,7 @@ def reset_today():
 def force_fix_data():
     collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-    threading.Thread(target=_execute_crawl, args=(all_symbols,)).start()
+    threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
     return jsonify({"status": "success", "message": f"Đang ép cào lại toàn bộ {len(all_symbols)} mã. Vui lòng đợi 1-2 phút!"})
 
 @app.get("/api/retry-now")
@@ -713,7 +720,7 @@ def retry_now():
     if not incomplete_symbols:
         return jsonify({"status": "success", "message": "Không có mã nào bị lỗi cần cào bù!"})
         
-    threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True)).start()
+    threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù ngay lập tức cho {len(incomplete_symbols)} mã bị lỗi!"})
 
