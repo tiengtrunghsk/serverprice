@@ -112,6 +112,13 @@ LAST_GITHUB_WRITE_TIME = 0
 def _now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
 
+def _get_current_update_time() -> str:
+    """Lấy thời gian cào. Nếu sau 15h thì ghim cứng 15:00:00 để không bị nhảy giờ"""
+    vn_now = datetime.utcnow() + timedelta(hours=7)
+    if vn_now.hour >= 15:
+        return vn_now.replace(hour=15, minute=0, second=0).strftime("%d/%m/%Y %H:%M:%S")
+    return vn_now.strftime("%d/%m/%Y %H:%M:%S")
+
 def _get_trading_date_str() -> str:
     vn_now = datetime.utcnow() + timedelta(hours=7)
     if vn_now.hour < 9:
@@ -340,7 +347,8 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                 volume_percent = 0.0
                 if avg_volume_20 > 0 and data["volume"] > 0:
                     raw_vol = data["volume"] / avg_volume_20 * 100
-                    if 0 <= raw_vol <= 1000.0:
+                    # BỎ GIỚI HẠN <= 1000 ĐỂ BẮT CÁC MÃ ĐỘT BIẾN CỰC MẠNH
+                    if raw_vol >= 0:
                         volume_percent = round(raw_vol, 2)
                         
                 pct_change = 0.0
@@ -354,6 +362,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                     "amplitude_percent": amplitude_percent
                 }
 
+                # LẤY THỜI GIAN CHÍNH XÁC CHO TỪNG MÃ
+                current_update_time = _get_current_update_time()
+
                 collection.update_one(
                     {"symbol": sym},
                     {"$set": {
@@ -364,8 +375,8 @@ def _execute_crawl(symbols: list, is_retry: bool = False):
                         "amplitude_percent": amplitude_percent,
                         "volume_percent": volume_percent,
                         "trading_date": trading_date,
-                        "updated_at": now_str,
-                        "is_locked": False,
+                        "updated_at": current_update_time, # <-- LƯU GIỜ CHUẨN
+                        "is_locked": _is_after_15h(),
                         "is_incomplete": False
                     }},
                     upsert=True
