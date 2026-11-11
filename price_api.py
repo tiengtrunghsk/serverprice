@@ -5,17 +5,18 @@ import json
 import base64
 import threading
 import concurrent.futures
+import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Set
 
 import requests
+import pandas as pd
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-# Sử dụng Vnstock thế hệ 6 cho nguồn SSI
-from vnstock import Market
+from vnstock import Market, Quote, Finance
 
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
@@ -23,7 +24,6 @@ if not MONGO_URI:
     print("❌ LỖI: Thiếu MONGO_URI!", flush=True)
     sys.exit(1)
 
-# Ép nạp biến môi trường SSI
 SSI_API_KEY = os.environ.get("SSI_API_KEY", "").strip()
 SSI_API_SECRET = os.environ.get("SSI_API_SECRET", "").strip()
 if SSI_API_KEY and SSI_API_SECRET:
@@ -37,15 +37,16 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 
 SYMBOLS_JSON_FILE = "vn100_symbols.json"
 SCREENER_JSON_FILE = "screener_results.json"
+DATA_FILE = "data.json"
+LAST_UPDATE_FILE = "last_update.json"
+CHEAP_STOCKS_FILE = "cheap_stocks.json"  
+HISTORY_DIR = "history"
+BCTC_DIR = "bctc_data"
 
-# TELEGRAM CONFIG
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 COOLDOWN_SECONDS = 300
-
-# ===================== VOLUME MULTIPLIER =====================
 VOLUME_MULTIPLIER = 10
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
@@ -53,14 +54,11 @@ ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip
 
 # ===================== TELEGRAM HELPER =====================
 def send_telegram(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"[TELEGRAM] Lỗi gửi tin: {e}", flush=True)
+    try: requests.post(url, json=payload, timeout=10)
+    except Exception: pass
 
 # ===================== DATABASE & AUTO SYNC =====================
 print(f"🔌 Đang kết nối MongoDB...", flush=True)
@@ -69,14 +67,12 @@ try:
     mongo_client.admin.command('ping')
     db = mongo_client['quant_db']
     collection = db['stocks']
-    settings_col = db['settings']
     print("✅ Kết nối MongoDB thành công!", flush=True)
     
     if os.path.exists(SYMBOLS_JSON_FILE):
         try:
             with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
                 json_symbols = set([str(s).upper().strip() for s in json.load(f)])
-            
             if len(json_symbols) > 0:
                 db_symbols = set([doc["symbol"] for doc in collection.find({}, {"symbol": 1})])
                 symbols_to_add = json_symbols - db_symbols
@@ -98,27 +94,22 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 is_crawling = False
 LAST_CRAWL_TIME = {}
-LAST_ALERT_BATCH = []
-LAST_TELEGRAM_TIME = 0
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
-    """Trả về giờ hiện tại thực tế (VN)"""
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
 
 def _get_trading_date_str() -> str:
     vn_now = datetime.utcnow() + timedelta(hours=7)
-    if vn_now.hour < 9:
-        vn_now -= timedelta(days=1)
-    while vn_now.weekday() >= 5:
-        vn_now -= timedelta(days=1)
+    if vn_now.hour < 9: vn_now -= timedelta(days=1)
+    while vn_now.weekday() >= 5: vn_now -= timedelta(days=1)
     return vn_now.strftime("%Y-%m-%d")
 
 def _is_after_15h() -> bool:
-    vn_time = datetime.utcnow() + timedelta(hours=7)
-    return vn_time.hour >= 15
+    return (datetime.utcnow() + timedelta(hours=7)).hour >= 15
 
-def _fetch_one(symbol: str) -> Optional[dict]:
+# ===================== VNSTOCK SSI FUNCTIONS =====================
+def _fetch_price_ssi(symbol: str) -> Optional[dict]:
     def _do():
         try:
             today = datetime.now().strftime("%Y-%m-%d")
@@ -127,11 +118,7 @@ def _fetch_one(symbol: str) -> Optional[dict]:
             df = market.equity(symbol).ohlcv(start=past_7d, end=today, source="ssi")
             if df is not None and not df.empty:
                 latest = df.iloc[-1]
-                return {
-                    "close": float(latest['close']), "open": float(latest['open']),
-                    "high": float(latest['high']), "low": float(latest['low']),
-                    "volume": int(latest['volume'])
-                }
+                return {"close": float(latest['close']), "open": float(latest['open']), "high": float(latest['high']), "low": float(latest['low']), "volume": int(latest['volume'])}
             return None
         except Exception: return None
 
@@ -141,17 +128,38 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         except Exception: return None
 
     if not data or data["close"] <= 0 or data["open"] <= 0: return None
-    
     if data["close"] >= 1000:
         for k in ["close", "open", "high", "low"]:
             if data[k] > 0: data[k] = data[k] / 1000.0
-    if 0 < data["volume"] < 100000:
-        data["volume"] = data["volume"] * VOLUME_MULTIPLIER
-            
-    return {
-        "close": round(data["close"], 2), "open": round(data["open"], 2),
-        "high": round(data["high"], 2), "low": round(data["low"], 2), "volume": int(data["volume"])
-    }
+    if 0 < data["volume"] < 100000: data["volume"] = data["volume"] * VOLUME_MULTIPLIER
+    return {"close": round(data["close"], 2), "open": round(data["open"], 2), "high": round(data["high"], 2), "low": round(data["low"], 2), "volume": int(data["volume"])}
+
+def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
+    try:
+        quote = Quote(source="ssi", symbol=symbol)
+        df = quote.history(start=start_date, end=end_date)
+        if df is not None and not df.empty: return df
+    except Exception: pass
+    return None
+
+def _fetch_bctc_ssi(symbol: str):
+    try:
+        stock_obj = Finance(symbol=symbol, source='SSI')
+        df_balance = stock_obj.balance_sheet(period='quarter')
+        df_income = stock_obj.income_statement(period='quarter')
+        try: df_cashflow = stock_obj.cash_flow(period='quarter')
+        except: df_cashflow = None
+        try: df_ratio = stock_obj.ratio(period='quarter')
+        except: df_ratio = None
+        
+        reports = {}
+        if df_balance is not None and not df_balance.empty: reports['balance_sheet'] = df_balance.to_dict(orient="records")
+        if df_income is not None and not df_income.empty: reports['income_statement'] = df_income.to_dict(orient="records")
+        if df_cashflow is not None and not df_cashflow.empty: reports['cash_flow'] = df_cashflow.to_dict(orient="records")
+        if df_ratio is not None and not df_ratio.empty: reports['ratios'] = df_ratio.to_dict(orient="records")
+        if not reports: return None
+        return json.loads(json.dumps(reports, default=str))
+    except Exception: return None
 
 # ===================== GITHUB BULK UPLOAD =====================
 def get_github_file_data(file_path):
@@ -160,10 +168,7 @@ def get_github_file_data(file_path):
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     try:
         res = requests.get(api_url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            return json.loads(base64.b64decode(res.json()["content"]).decode("utf-8")), res.json()["sha"]
-        elif res.status_code == 404:
-            return {"history_d1": [], "history_w1": [], "history_mn": []}, None
+        if res.status_code == 200: return json.loads(base64.b64decode(res.json()["content"]).decode("utf-8")), res.json()["sha"]
         return None, None
     except Exception: return None, None
 
@@ -195,197 +200,338 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
         except Exception: time.sleep(2)
     return False
 
-# ===================== CORE CRAWL LOGIC =====================
+# ===================== DATA PROCESSING HELPERS =====================
+def translate_sector(sector_name):
+    mapping = {
+        "BANKS": "NGAN_HANG", "FINANCIALS": "CHUNG_KHOAN", "SECURITIES": "CHUNG_KHOAN", "REAL ESTATE": "BAT_DONG_SAN", "REAL_ESTATE": "BAT_DONG_SAN",
+        "TECHNOLOGY": "CONG_NGHE_BAN_LE", "RETAIL": "CONG_NGHE_BAN_LE", "UTILITIES": "DIEN_NUOC_HA_TANG", "ENERGY": "DIEN_NUOC_HA_TANG",
+        "MATERIALS": "NGUYEN_VAT_LIEU_CHU_KY", "INDUSTRIALS": "NGUYEN_VAT_LIEU_CHU_KY", "CONSUMER STAPLES": "SAN_XUAT_TIEU_DUNG_PHONG_THU",
+        "CONSUMER DISCRETIONARY": "SAN_XUAT_TIEU_DUNG_PHONG_THU", "HEALTHCARE": "SAN_XUAT_TIEU_DUNG_PHONG_THU"
+    }
+    upper_name = str(sector_name).upper()
+    for eng, vn in mapping.items():
+        if eng in upper_name: return vn
+    return "SAN_XUAT_TIEU_DUNG_PHONG_THU"
+
+def aggregate_candles(data, interval):
+    if not data or interval == 'D1': return data
+    groups = {}
+    for bar in data:
+        date = datetime.strptime(bar['time'], '%Y-%m-%d')
+        if interval == 'W1':
+            start_of_week = date - timedelta(days=date.weekday())
+            key = start_of_week.strftime('%Y-%m-%d')
+        elif interval == 'MN':
+            key = date.strftime('%Y-%m-01')
+        if key not in groups:
+            groups[key] = {"time": key, "open": bar['open'], "high": bar['high'], "low": bar['low'], "close": bar['close'], "volume": bar['volume']}
+        else:
+            groups[key]['high'] = max(groups[key]['high'], bar['high'])
+            groups[key]['low'] = min(groups[key]['low'], bar['low'])
+            groups[key]['close'] = bar['close']
+            groups[key]['volume'] += bar['volume']
+    return sorted(list(groups.values()), key=lambda x: x['time'])
+
+def extract_advanced_metrics_from_bctc(bctc_data):
+    if not bctc_data: return {"cfo_latest": 0, "debt_to_equity": 0, "gross_margin": 0, "net_profit_ttm": 0}
+    balance_sheet = bctc_data.get("balance_sheet", [])
+    cash_flow = bctc_data.get("cash_flow", [])
+    income_statement = bctc_data.get("income_statement", [])
+    latest_period = balance_sheet[0].get("period") if balance_sheet else (income_statement[0].get("period") if income_statement else None)
+    
+    latest_cfo = 0
+    cfo_ids = ["CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES", "CF_OPERATE_CASH_FLOW", "CFO", "CF_NET_CASH"]
+    if cash_flow:
+        for item in cash_flow:
+            if latest_period and item.get("period") == latest_period and item.get("id") in cfo_ids:
+                latest_cfo = item.get("value", 0); break
+        if latest_cfo == 0:
+            for item in cash_flow:
+                if item.get("id") in cfo_ids: latest_cfo = item.get("value", 0); break
+
+    total_liabilities, equity = 0, 0
+    if balance_sheet:
+        for item in balance_sheet:
+            if latest_period and item.get("period") == latest_period:
+                item_id = item.get("id", ""); val = item.get("value", 0)
+                if item_id in ["BS_TOTAL_LIABILITIES", "TOTAL_LIABILITIES"]: total_liabilities = val
+                elif item_id in ["BS_EQUITY", "EQUITY"]: equity = val
+    debt_to_equity = round(total_liabilities / equity, 2) if equity > 0 else 0
+
+    gross_profit, revenue, is_bank_or_sec = 0, 0, False
+    if income_statement:
+        for item in income_statement:
+            if latest_period and item.get("period") == latest_period:
+                item_id = item.get("id", ""); val = item.get("value", 0)
+                if item_id in ["IS_GROSS_PROFIT", "GROSS_PROFIT"]: gross_profit = val
+                elif item_id in ["IS_NET_REVENUE", "REVENUE", "NET_REVENUE", "IS_TOTAL_REVENUE"]: revenue = val
+                elif item_id in ["IS_NET_INTEREST_INCOME"]: is_bank_or_sec = True
+
+    gross_margin = 0.0 if is_bank_or_sec else (round((gross_profit / revenue) * 100, 1) if revenue > 0 else 0)
+    net_profit_ttm = 0
+    pat_ids = ["IS_NET_PROFIT_AFTER_TAX", "NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX"]
+    pat_items = [item for item in income_statement if item.get("id") in pat_ids]
+    if pat_items:
+        pat_items = sorted(pat_items, key=lambda x: x.get("period", ""), reverse=True)
+        net_profit_ttm = sum([q.get("value", 0) for q in pat_items[:4]])
+    return {"cfo_latest": round(latest_cfo / 1e9, 2), "debt_to_equity": debt_to_equity, "gross_margin": gross_margin, "net_profit_ttm": round(net_profit_ttm / 1e9, 2)}
+
+def parse_bctc_history(bctc_data):
+    if not bctc_data: return []
+    balance_sheet = bctc_data.get("balance_sheet", [])
+    income_statement = bctc_data.get("income_statement", [])
+    if not balance_sheet or not income_statement: return []
+
+    bs_dict = {item.get("period"): {} for item in balance_sheet}
+    for item in balance_sheet: bs_dict[item.get("period")][item.get("id")] = item.get("value")
+    is_dict = {item.get("period"): {} for item in income_statement}
+    for item in income_statement: is_dict[item.get("period")][item.get("id")] = item.get("value")
+
+    periods = sorted(list(set(bs_dict.keys()).intersection(set(is_dict.keys()))), reverse=True)
+    bctc_records = []
+    for idx, curr_p in enumerate(periods):
+        if not curr_p or "-" not in curr_p: continue
+        prev_p = periods[idx + 1] if idx + 1 < len(periods) else None
+        year, q_str = curr_p.split("-")
+        yoy_p = f"{int(year) - 1}-{q_str}"
+
+        total_assets = bs_dict[curr_p].get("BS_TOTAL_ASSETS", 0)
+        loans = bs_dict[curr_p].get("BS_LOANS_TO_CUSTOMERS", 0)
+        equity = bs_dict[curr_p].get("BS_EQUITY", 0)
+        nii = is_dict[curr_p].get("IS_NET_INTEREST_INCOME", 0)
+        pat = is_dict[curr_p].get("IS_NET_PROFIT_AFTER_TAX", 0)
+
+        loans_prev = bs_dict.get(prev_p, {}).get("BS_LOANS_TO_CUSTOMERS", 0) if prev_p else 0
+        loans_yoy = bs_dict.get(yoy_p, {}).get("BS_LOANS_TO_CUSTOMERS", 0)
+        credit_growth_qoq = ((loans - loans_prev) / loans_prev * 100) if loans_prev else 0
+        credit_growth_yoy = ((loans - loans_yoy) / loans_yoy * 100) if loans_yoy else 0
+
+        pat_prev = is_dict.get(prev_p, {}).get("IS_NET_PROFIT_AFTER_TAX", 0) if prev_p else 0
+        pat_yoy = is_dict.get(yoy_p, {}).get("IS_NET_PROFIT_AFTER_TAX", 0)
+        pat_growth_qoq = ((pat - pat_prev) / pat_prev * 100) if pat_prev else 0
+        pat_growth_yoy = ((pat - pat_yoy) / pat_yoy * 100) if pat_yoy else 0
+        roe_q = (pat / equity * 100) if equity else 0
+
+        bctc_records.append({
+            "period": curr_p, "total_assets": round(total_assets / 1e9, 2), "loans": round(loans / 1e9, 2),
+            "equity": round(equity / 1e9, 2), "net_interest_income": round(nii / 1e9, 2), "net_profit": round(pat / 1e9, 2),
+            "credit_growth_qoq": round(credit_growth_qoq, 2), "credit_growth_yoy": round(credit_growth_yoy, 2),
+            "profit_growth_qoq": round(pat_growth_qoq, 2), "profit_growth_yoy": round(pat_growth_yoy, 2), "roe_quarter": round(roe_q, 2)
+        })
+    return bctc_records
+
+def filter_and_save_cheap_stocks(stock_db):
+    sector_cheap_groups = {}
+    for symbol, info in stock_db.items():
+        pe, pb, roe, net_profit = info.get("pe", 0), info.get("pb", 0), info.get("roe", 0), info.get("net_profit_ttm", 0)
+        if 0 < pe <= 12 and 0 < pb <= 1.5 and roe >= 8.0 and net_profit > 0:
+            sector = translate_sector(info.get("sector", ""))
+            info['sector'] = sector
+            sector_cheap_groups.setdefault(sector, []).append(info)
+    for sector in sector_cheap_groups: sector_cheap_groups[sector] = sorted(sector_cheap_groups[sector], key=lambda x: x['pe'])
+    if sector_cheap_groups: commit_multiple_files_to_github({CHEAP_STOCKS_FILE: sector_cheap_groups}, f"Update Cheap Stocks {_get_trading_date_str()}")
+
+# ===================== REAL-TIME CRAWL =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
-    global is_crawling, LAST_ALERT_BATCH, LAST_TELEGRAM_TIME
+    global is_crawling
     if is_crawling: return
     is_crawling = True
     try:
         trading_date = _get_trading_date_str()
-        mode_str = "CÀO BÙ" if is_retry else ("CÀO TAY" if is_manual else "REAL-TIME")
-        
-        print(f"\n[CRAWL] 🚀 [{mode_str}] Bắt đầu xử lý {len(symbols)} mã (Ngày: {trading_date})...", flush=True)
-        
-        alert_batch = []
-        all_crawled_data = {}
-        pending_history_files = {}
-        need_update_screener = False
-
-        # Chia lô 5 mã
+        print(f"\n[CRAWL] 🚀 Cào Real-time {len(symbols)} mã...", flush=True)
         for chunk_idx in range(0, len(symbols), 5):
             chunk = symbols[chunk_idx:chunk_idx+5]
             for sym in chunk:
                 doc = collection.find_one({"symbol": sym})
-                if doc and doc.get("chot_so_today") == trading_date:
-                    continue
+                if doc and doc.get("chot_so_today") == trading_date: continue
 
-                data = _fetch_one(sym)
-                
+                data = _fetch_price_ssi(sym)
                 if data:
                     hist_data, _ = get_github_file_data(f"history/{sym}.json")
-                    prev_close = 0.0
-                    avg_volume_20 = 0.0
+                    prev_close, avg_volume_20 = 0.0, 0.0
                     
                     if hist_data and hist_data.get("history_d1"):
                         bars = hist_data["history_d1"]
-                        if len(bars) >= 2:
-                            prev_close = bars[-2]["close"] if bars[-1]["time"] == trading_date else bars[-1]["close"]
-                        elif len(bars) == 1:
-                            prev_close = bars[0]["close"]
+                        if len(bars) >= 2: prev_close = bars[-2]["close"] if bars[-1]["time"] == trading_date else bars[-1]["close"]
+                        elif len(bars) == 1: prev_close = bars[0]["close"]
                         valid_vols = [b.get("volume", 0) for b in bars[-20:] if b.get("volume", 0) > 0]
                         if valid_vols: avg_volume_20 = sum(valid_vols) / len(valid_vols)
 
-                    amplitude_percent = 0.0
-                    if data["open"] > 0 and data["high"] > 0 and data["low"] > 0:
-                        raw_amp = (data["high"] - data["low"]) / data["open"] * 100
-                        if 0 <= raw_amp <= 30.0: amplitude_percent = round(raw_amp, 2)
+                    amp_pct = round((data["high"] - data["low"]) / data["open"] * 100, 2) if data["open"] > 0 else 0
+                    vol_pct = round(data["volume"] / avg_volume_20 * 100, 2) if avg_volume_20 > 0 else 0
+                    pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0
 
-                    volume_percent = 0.0
-                    if avg_volume_20 > 0 and data["volume"] > 0:
-                        volume_percent = round(data["volume"] / avg_volume_20 * 100, 2)
-                            
-                    pct_change = 0.0
-                    if prev_close > 0:
-                        pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2)
-
-                    all_crawled_data[sym] = {"close": data["close"], "pct_change": pct_change}
-
-                    # Lấy giờ thực tế hiện tại
-                    real_time_str = _now_str()
-
-                    # Cập nhật Database (updated_at chính là giờ thực tế)
-                    collection.update_one(
-                        {"symbol": sym},
-                        {"$set": {
-                            "close": data["close"], "prev_close": prev_close,
-                            "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
-                            "amplitude_percent": amplitude_percent, "volume_percent": volume_percent,
-                            "avg_volume_20": round(avg_volume_20, 2),
-                            "trading_date": trading_date, 
-                            "updated_at": real_time_str, # <-- Ghi giờ thực tế vào đây luôn
-                            "is_locked": _is_after_15h(), "is_incomplete": False
-                        }}, upsert=True
-                    )
-                    LAST_CRAWL_TIME[sym] = time.time()
+                    collection.update_one({"symbol": sym}, {"$set": {
+                        "close": data["close"], "prev_close": prev_close, "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
+                        "amplitude_percent": amp_pct, "volume_percent": vol_pct, "avg_volume_20": round(avg_volume_20, 2),
+                        "trading_date": trading_date, "updated_at": _now_str(), "is_locked": _is_after_15h(), "is_incomplete": False
+                    }}, upsert=True)
                     
-                    # LOG CHI TIẾT
-                    print(f"  ✅ [OK] {sym}: Giá {data['close']:,} | KL: {data['volume']:,} | Vol%: {volume_percent}% (Lúc: {real_time_str})", flush=True)
+                    print(f"  ✅ [OK] {sym}: Giá {data['close']:,} | Vol: {vol_pct}% (Lúc: {_now_str()})", flush=True)
                     
-                    if prev_close > 0 and abs(pct_change) >= 3.0 and volume_percent >= 120.0:
-                        alert_batch.append({
-                            "sym": sym, "pct_change": pct_change, "volume_percent": volume_percent,
-                            "price": data["close"], "volume": data["volume"],
-                            "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG",
-                            "flow": "BÁN RÒNG" if pct_change < 0 else "MUA VÀO"
-                        })
-
                     if _is_after_15h() and hist_data is not None:
                         d1_bars = hist_data.get("history_d1", [])
                         d1_bar = {"time": trading_date, "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data["volume"]}
                         d1_idx = next((i for i, b in enumerate(d1_bars) if b["time"] == trading_date), -1)
                         if d1_idx == -1: d1_bars.append(d1_bar)
                         else: d1_bars[d1_idx] = d1_bar
-                        d1_bars.sort(key=lambda x: x["time"])
                         hist_data["history_d1"] = d1_bars
-                        pending_history_files[f"history/{sym}.json"] = hist_data
-                        need_update_screener = True
+                        commit_multiple_files_to_github({f"history/{sym}.json": hist_data}, f"Update {sym}")
                 else:
-                    print(f"  ❌ [LỖI] {sym}: Không lấy được dữ liệu.", flush=True)
-                    collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": _now_str()}}, upsert=True)
-
-            time.sleep(1) # Nghỉ 1 giây sau mỗi lô 5 mã
-
-        # ĐẨY GITHUB 1 LẦN NẾU ĐÃ QUA 15H
-        if _is_after_15h() and pending_history_files:
-            print(f"\n[GITHUB] 📦 Đẩy {len(pending_history_files)} file...", flush=True)
-            if need_update_screener and all_crawled_data:
-                try:
-                    res = requests.get(f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{SCREENER_JSON_FILE}?ref={GITHUB_BRANCH}", headers={"Authorization": f"token {GITHUB_TOKEN}"}, timeout=10)
-                    if res.status_code == 200:
-                        current_json = json.loads(base64.b64decode(res.json()["content"]).decode("utf-8"))
-                        for item in current_json:
-                            sym = item.get("symbol")
-                            if sym in all_crawled_data:
-                                cdata = all_crawled_data[sym]
-                                item["close_price"] = cdata["close"] * 1000
-                                item["price_change_percent"] = cdata["pct_change"]
-                        pending_history_files[SCREENER_JSON_FILE] = current_json
-                except Exception: pass
-
-            if commit_multiple_files_to_github(pending_history_files, f"Cập nhật dữ liệu {trading_date}"):
-                print(f"[GITHUB] ✅ Đẩy Github thành công!", flush=True)
-                for path in pending_history_files:
-                    if path.startswith("history/"):
-                        collection.update_one({"symbol": path.split("/")[1].replace(".json", "")}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
-
-        if alert_batch:
-            alert_batch.sort(key=lambda x: x["volume_percent"], reverse=True)
-            msg_lines = [f"🚨 <b>CẢNH BÁO DÒNG TIỀN ({len(alert_batch)} MÃ)</b>"]
-            for item in alert_batch:
-                msg_lines.append(f"• <b>{item['sym']}</b>: {item['pct_change']:+.2f}% {item['trend']} | Vol: {item['volume_percent']:.0f}%")
-            send_telegram("\n".join(msg_lines))
-            print(f"[TELEGRAM] 🚀 Đã gửi cảnh báo {len(alert_batch)} mã.", flush=True)
-
+                    print(f"  ❌ [LỖI] {sym}", flush=True)
+            time.sleep(1)
     finally:
         is_crawling = False
-        print("[CRAWL] 🏁 Đã kết thúc đợt cào.\n", flush=True)
 
-# ===================== BACKGROUND WORKER (TỐI ƯU NGHỈ ĐÊM) =====================
+# ===================== STATIC DATA CRAWL (16H00) - TỐI ƯU INCREMENTAL =====================
+def full_data_crawler_worker():
+    print("⏰ [FULL-DATA] Đã bật luồng cào dữ liệu tĩnh (16h00).", flush=True)
+    while True:
+        try:
+            vn_now = datetime.utcnow() + timedelta(hours=7)
+            if vn_now.hour == 16 and vn_now.minute == 0:
+                print("\n[FULL-DATA] 🚀 Bắt đầu cập nhật dữ liệu tĩnh (Incremental Update)...", flush=True)
+                target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+                
+                stock_db = {}
+                if os.path.exists(DATA_FILE):
+                    try:
+                        with open(DATA_FILE, "r", encoding="utf-8") as f: stock_db = json.load(f)
+                    except: pass
+
+                end_date = datetime.now().strftime("%Y-%m-%d")
+                # Chỉ lấy 30 ngày gần nhất để cập nhật
+                start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+                
+                for i, symbol in enumerate(target_symbols):
+                    print(f"  [{i+1}/{len(target_symbols)}] Xử lý tĩnh: {symbol}...", flush=True)
+                    
+                    # 1. CÀO BCTC & MERGE (Chỉ thêm quý mới)
+                    new_bctc = _fetch_bctc_ssi(symbol)
+                    old_bctc, _ = get_github_file_data(f"bctc_data/{symbol}.json")
+                    
+                    if new_bctc:
+                        if old_bctc and "balance_sheet" in old_bctc:
+                            # Gộp bảng cân đối kế toán
+                            old_bs = {item['period']: item for item in old_bctc.get('balance_sheet', []) if 'period' in item}
+                            for item in new_bctc.get('balance_sheet', []):
+                                if 'period' in item: old_bs[item['period']] = item
+                            new_bctc['balance_sheet'] = list(old_bs.values())
+                            
+                            # Gộp báo cáo kết quả kinh doanh
+                            old_is = {item['period']: item for item in old_bctc.get('income_statement', []) if 'period' in item}
+                            for item in new_bctc.get('income_statement', []):
+                                if 'period' in item: old_is[item['period']] = item
+                            new_bctc['income_statement'] = list(old_is.values())
+                            
+                            # Gộp lưu chuyển tiền tệ
+                            if 'cash_flow' in new_bctc:
+                                old_cf = {item['period']: item for item in old_bctc.get('cash_flow', []) if 'period' in item}
+                                for item in new_bctc.get('cash_flow', []):
+                                    if 'period' in item: old_cf[item['period']] = item
+                                new_bctc['cash_flow'] = list(old_cf.values())
+                                
+                        new_bctc['updated_at'] = _now_str()
+                        commit_multiple_files_to_github({f"bctc_data/{symbol}.json": new_bctc}, f"BCTC {symbol}")
+                        bctc_data = new_bctc
+                    else:
+                        bctc_data = old_bctc
+                    
+                    # 2. CÀO LỊCH SỬ GIÁ 30 NGÀY & MERGE
+                    df = _fetch_history_ssi(symbol, start_date, end_date)
+                    if df is not None and not df.empty:
+                        new_bars = []
+                        for _, row in df.iterrows():
+                            time_val = row['time']
+                            time_str = time_val.strftime('%Y-%m-%d') if hasattr(time_val, 'strftime') else str(time_val)[:10]
+                            new_bars.append({
+                                "time": time_str, "open": float(row.get('open', row['close'])), 
+                                "high": float(row.get('high', row['close'])),
+                                "low": float(row.get('low', row['close'])), 
+                                "close": float(row['close']), "volume": int(row.get('volume', 0))
+                            })
+                        
+                        old_hist, _ = get_github_file_data(f"history/{symbol}.json")
+                        old_d1 = old_hist.get("history_d1", []) if old_hist else []
+                        
+                        # Gộp nến cũ và nến mới (Dùng dict để ghi đè nến trùng ngày)
+                        merged_dict = {bar['time']: bar for bar in old_d1}
+                        for bar in new_bars: merged_dict[bar['time']] = bar
+                        history_d1 = sorted(list(merged_dict.values()), key=lambda x: x['time'])
+                        
+                        hist_file = {
+                            "history_d1": history_d1, 
+                            "history_w1": aggregate_candles(history_d1, 'W1'), 
+                            "history_mn": aggregate_candles(history_d1, 'MN')
+                        }
+                        commit_multiple_files_to_github({f"history/{symbol}.json": hist_file}, f"History {symbol}")
+                        
+                        adv_metrics = extract_advanced_metrics_from_bctc(bctc_data)
+                        
+                        stock_db[symbol] = {
+                            "symbol": symbol, "company_name": symbol, "market_cap": 0, "total_shares": 0,
+                            "close": int(df['close'].iloc[-1] * 1000), "volume": int(df['volume'].iloc[-1]),
+                            "pe": 0, "pb": 0, "ps": 0, "eps": 0, "roe": 0, "roa": 0, "dividend_yield": 0,
+                            "cfo_latest": adv_metrics["cfo_latest"], "debt_to_equity": adv_metrics["debt_to_equity"],
+                            "gross_margin": adv_metrics["gross_margin"], "net_profit_ttm": adv_metrics["net_profit_ttm"],
+                            "recommendation": "Tích lũy", "price_zone": "—", "updated_at": _now_str(),
+                            "bctc_history": parse_bctc_history(bctc_data),
+                        }
+                    time.sleep(1.5)
+                
+                if stock_db:
+                    commit_multiple_files_to_github({DATA_FILE: stock_db, LAST_UPDATE_FILE: {"last_update": _now_str()}}, "Update Data JSON")
+                    filter_and_save_cheap_stocks(stock_db)
+                
+                print(f"[FULL-DATA] ✅ Đã cập nhật xong dữ liệu tĩnh (Incremental).", flush=True)
+                time.sleep(120) 
+            time.sleep(30)
+        except Exception as e:
+            print(f"❌ [FULL-DATA] Lỗi: {e}", flush=True)
+            time.sleep(60)
+
+# ===================== BACKGROUND WORKER =====================
 def auto_crawler_worker():
-    print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu Real-time (tự ngủ sau 15h)!", flush=True)
+    print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu Real-time!", flush=True)
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
-            current_hour = vn_now.hour
-            
-            # 1. QUA NGÀY MỚI: Xóa cờ chốt sổ của hôm qua
-            collection.update_many(
-                {"chot_so_today": {"$ne": today_str}}, 
-                {"$unset": {"chot_so_today": "", "is_locked": ""}}
-            )
+            is_after_15h = vn_now.hour >= 15
 
-            # 2. KIỂM TRA XEM ĐÃ CÀO XONG TOÀN BỘ CHƯA (Để cho ngủ đêm)
+            collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
+
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             total_symbols = len(all_symbols)
             crawled_count = collection.count_documents({"chot_so_today": today_str})
 
-            # NẾU ĐÃ QUA 15H VÀ ĐÃ CÀO ĐỦ 100% MÃ -> NGỦ ĐẾN 8H55 SÁNG MAI
-            if current_hour >= 15 and crawled_count >= total_symbols:
+            if is_after_15h and crawled_count >= total_symbols:
                 tomorrow = vn_now + timedelta(days=1)
                 wake_up_time = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
                 sleep_seconds = (wake_up_time - vn_now).total_seconds()
-                
                 if sleep_seconds > 0:
-                    print(f"🌙 [AUTO] Đã chốt sổ xong {crawled_count}/{total_symbols} mã. Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
+                    print(f"🌙 [AUTO] Đã chốt sổ xong {crawled_count}/{total_symbols}. Ngủ đông đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
                     time.sleep(min(sleep_seconds, 3600)) 
                     continue
 
-            # 3. NẾU CHƯA ĐỦ MÃ (HOẶC ĐANG TRONG GIỜ GIAO DỊCH) -> TIẾP TỤC CÀO
             if not is_crawling:
                 symbols_to_crawl = []
                 for sym in all_symbols:
                     doc = collection.find_one({"symbol": sym}, {"chot_so_today": 1})
-                    if not doc or doc.get("chot_so_today") != today_str:
-                        symbols_to_crawl.append(sym)
-                
-                if not symbols_to_crawl:
-                    symbols_to_crawl = all_symbols 
-                
+                    if not doc or doc.get("chot_so_today") != today_str: symbols_to_crawl.append(sym)
+                if not symbols_to_crawl: symbols_to_crawl = all_symbols 
                 _execute_crawl(symbols_to_crawl, is_manual=False)
-
-            time.sleep(15) # Nghỉ 15s trước khi bắt đầu vòng quét tiếp theo
-            
+            time.sleep(15)
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
 
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
+threading.Thread(target=full_data_crawler_worker, daemon=True).start()
 
 # ===================== ROUTES =====================
 @app.get("/")
-def home(): 
-    return "API is running!", 200
+def home(): return "API is running!", 200
 
 @app.get("/api/status")
 def api_status():
@@ -405,18 +551,13 @@ def api_get_data():
                 doc["close_price"] = close_price
                 doc["prev_close"] = prev_close
 
-                pct = 0.0
-                avail = False
-                arrow = "—"
-                color = "slate"
-                
+                pct, avail, arrow, color = 0.0, False, "—", "slate"
                 if close_price > 0 and prev_close > 0:
                     raw_pct = ((close_price - prev_close) / prev_close) * 100
                     if -30.0 <= raw_pct <= 30.0:
-                        pct = round(raw_pct, 2)
-                        avail = True
-                        if pct > 0: arrow = "▲"; color = "emerald"
-                        elif pct < 0: arrow = "▼"; color = "rose"
+                        pct = round(raw_pct, 2); avail = True
+                        if pct > 0: arrow, color = "▲", "emerald"
+                        elif pct < 0: arrow, color = "▼", "rose"
                 
                 doc["price_change_percent"] = pct
                 doc["price_change_available"] = avail
@@ -424,7 +565,6 @@ def api_get_data():
                 doc["price_color"] = color
                 doc["amplitude_percent"] = doc.get("amplitude_percent", 0.0)
                 doc["volume_percent"] = doc.get("volume_percent", 0.0)
-                
                 data[sym] = doc
         return jsonify({"status": "success", "count": len(data), "data": data})
     except PyMongoError as e:
@@ -437,14 +577,12 @@ def api_sync():
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
     
     if is_crawling:
-        updated_data = {}
-        for sym in symbols:
-            doc = collection.find_one({"symbol": sym})
-            if doc and "close" in doc: updated_data[sym] = doc["close"]
+        updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) for sym in symbols if collection.find_one({"symbol": sym})}
         return jsonify({"status": "success", "updated_at": _now_str() + " (Đang cào ngầm)", "updated_data": updated_data})
 
     threading.Thread(target=_execute_crawl, args=(symbols, False, True)).start()
-    return jsonify({"status": "success", "updated_at": _now_str() + " (Bắt đầu cào)", "updated_data": {}})
+    updated_data = {sym: collection.find_one({"symbol": sym}).get("close", 0) for sym in symbols if collection.find_one({"symbol": sym})}
+    return jsonify({"status": "success", "updated_at": _now_str() + " (Bắt đầu cào)", "updated_data": updated_data})
 
 @app.get("/api/reset-today")
 def reset_today():
@@ -457,17 +595,15 @@ def force_fix_data():
     collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
-    return jsonify({"status": "success", "message": f"Đang ép cào lại toàn bộ {len(all_symbols)} mã."})
+    return jsonify({"status": "success", "message": f"Đang ép cào lại {len(all_symbols)} mã."})
 
 @app.get("/api/retry-now")
 def retry_now():
-    if is_crawling:
-        return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
+    if is_crawling: return jsonify({"status": "error", "message": "Đang chạy!"})
     incomplete_symbols = [doc["symbol"] for doc in collection.find({"is_incomplete": True}, {"symbol": 1})]
-    if not incomplete_symbols:
-        return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
+    if not incomplete_symbols: return jsonify({"status": "success", "message": "Không có mã lỗi!"})
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
-    return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
+    return jsonify({"status": "success", "message": f"Đang cào bù {len(incomplete_symbols)} mã!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
