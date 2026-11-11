@@ -16,10 +16,10 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-# Sử dụng Vnstock thế hệ 6 cho nguồn SSI
-from vnstock import Market, Quote, Finance
+# ===================== VNSTOCK THẾ HỆ 6 =====================
+from vnstock import Market, Fundamental
 
-# Import thư viện PTKT
+# Import thư viện PTKT của bạn
 try:
     from ptkt import ProfessionalTechnicalAnalyzer
 except ImportError:
@@ -28,9 +28,7 @@ except ImportError:
 
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
-if not MONGO_URI:
-    print("❌ LỖI: Thiếu MONGO_URI!", flush=True)
-    sys.exit(1)
+if not MONGO_URI: sys.exit(1)
 
 SSI_API_KEY = os.environ.get("SSI_API_KEY", "").strip()
 SSI_API_SECRET = os.environ.get("SSI_API_SECRET", "").strip()
@@ -62,7 +60,7 @@ def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
     try: requests.post(url, json=payload, timeout=10)
-    except Exception as e: print(f"[TELEGRAM] Lỗi gửi tin: {e}", flush=True)
+    except Exception: pass
 
 # ===================== DATABASE & AUTO SYNC =====================
 print(f"🔌 Đang kết nối MongoDB...", flush=True)
@@ -81,7 +79,6 @@ try:
         try:
             with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
                 json_symbols = set([str(s).upper().strip() for s in json.load(f)])
-            
             if len(json_symbols) > 0:
                 db_symbols = set([doc["symbol"] for doc in collection.find({}, {"symbol": 1})])
                 symbols_to_add = json_symbols - db_symbols
@@ -90,9 +87,7 @@ try:
                 symbols_to_remove = db_symbols - json_symbols
                 if symbols_to_remove:
                     collection.delete_many({"symbol": {"$in": list(symbols_to_remove)}})
-                print("ℹ️ Đã đồng bộ danh sách mã.", flush=True)
-        except Exception as e:
-            print(f"⚠️ Lỗi đồng bộ JSON: {e}", flush=True)
+        except Exception: pass
 except PyMongoError as e:
     print(f"❌ LỖI MONGODB: {e}", flush=True)
     sys.exit(1)
@@ -124,8 +119,7 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            market = Market()
-            df = market.equity(symbol).ohlcv(start=past_7d, end=today, source="ssi")
+            df = Market().equity(symbol).ohlcv(start=past_7d, end=today, source="ssi")
             if df is not None and not df.empty:
                 latest = df.iloc[-1]
                 return {"close": float(latest['close']), "open": float(latest['open']), "high": float(latest['high']), "low": float(latest['low']), "volume": int(latest['volume'])}
@@ -144,22 +138,26 @@ def _fetch_one(symbol: str) -> Optional[dict]:
     if 0 < data["volume"] < 100000: data["volume"] = data["volume"] * VOLUME_MULTIPLIER
     return {"close": round(data["close"], 2), "open": round(data["open"], 2), "high": round(data["high"], 2), "low": round(data["low"], 2), "volume": int(data["volume"])}
 
-# ===================== VNSTOCK TĨNH (NẾN 10 NĂM + BCTC) =====================
+# ===================== VNSTOCK TĨNH =====================
 def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
     try:
-        df = Quote(source="ssi", symbol=symbol).history(start=start_date, end=end_date)
+        df = Market().equity(symbol).ohlcv(start=start_date, end=end_date, source="ssi")
         if df is not None and not df.empty: return df
     except Exception: pass
     return None
 
 def _fetch_bctc_ssi(symbol: str):
     try:
-        stock = Finance(symbol=symbol, source='SSI')
+        equity = Fundamental().equity(symbol)
         reports = {}
-        if not stock.balance_sheet(period='quarter').empty: reports['balance_sheet'] = stock.balance_sheet(period='quarter').to_dict(orient="records")
-        if not stock.income_statement(period='quarter').empty: reports['income_statement'] = stock.income_statement(period='quarter').to_dict(orient="records")
-        if not stock.cash_flow(period='quarter').empty: reports['cash_flow'] = stock.cash_flow(period='quarter').to_dict(orient="records")
-        if not stock.ratio(period='quarter').empty: reports['ratios'] = stock.ratio(period='quarter').to_dict(orient="records")
+        if not equity.balance_sheet(period="quarter").empty: reports['balance_sheet'] = equity.balance_sheet(period="quarter").to_dict(orient="records")
+        if not equity.income_statement(period="quarter").empty: reports['income_statement'] = equity.income_statement(period="quarter").to_dict(orient="records")
+        try:
+            if not equity.cash_flow(period="quarter").empty: reports['cash_flow'] = equity.cash_flow(period="quarter").to_dict(orient="records")
+        except: pass
+        try:
+            if not equity.ratio().empty: reports['ratios'] = equity.ratio().to_dict(orient="records")
+        except: pass
         return json.loads(json.dumps(reports, default=str)) if reports else None
     except Exception: return None
 
@@ -319,45 +317,132 @@ def compute_final_decision(fund_score, tech_score, val_score, total_score, verdi
 
 def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     sector = get_sector(symbol)
-    fund_score = 0
-    if sector == "NGAN_HANG":
-        if nd["credit_growth_yoy"] >= 12: fund_score += 18
-        if nd["roe"] >= 18: fund_score += 17
-    else:
-        if nd["profit_growth_yoy"] >= 10: fund_score += 15
-        if nd["roe"] >= 14: fund_score += 20
+    pe = nd["pe"]; pb = nd["pb"]; ps = nd["ps"]; roe = nd["roe"]; roa = nd["roa"]; dividend_yield = nd["dividend_yield"]
+    close_price = nd["close_price"]; cfo_latest = nd["cfo_latest"]; net_profit_ttm = nd["net_profit_ttm"]
+    debt_to_equity = nd["debt_to_equity"]; profit_growth_yoy = nd["profit_growth_yoy"]; credit_growth_yoy = nd["credit_growth_yoy"]
     
-    val_score = 30 if (0 < nd["pe"] < 15 or nd["dividend_yield"] >= 5) else (18 if nd["pe"] < 20 else 8)
+    fundamental_score = 0
+    fund_notes = []
+    
+    if sector == "NGAN_HANG":
+        if credit_growth_yoy >= 12: fundamental_score += 18; fund_notes.append("Tín dụng mạnh (>=12%)")
+        elif credit_growth_yoy >= 8: fundamental_score += 10; fund_notes.append("Tín dụng khá")
+        if roe >= 18: fundamental_score += 17; fund_notes.append("ROE xuất sắc (>=18%)")
+        elif roe >= 14: fundamental_score += 10; fund_notes.append("ROE tốt (>=14%)")
+    elif sector == "CHUNG_KHOAN":
+        if profit_growth_yoy >= 20: fundamental_score += 20; fund_notes.append("LN tăng trưởng mạnh (>=20%)")
+        elif profit_growth_yoy >= 10: fundamental_score += 10; fund_notes.append("LN hồi phục tốt")
+        if roe >= 15: fundamental_score += 15; fund_notes.append("ROE ngành CK cao (>=15%)")
+        elif roe >= 10: fundamental_score += 8; fund_notes.append("ROE ổn định")
+    elif sector == "BAT_DONG_SAN":
+        if profit_growth_yoy >= 10: fundamental_score += 15; fund_notes.append("LN duy trì tăng trưởng")
+        if roe >= 12: fundamental_score += 20; fund_notes.append("ROE BĐS đạt chuẩn (>=12%)")
+        elif roe > 0: fundamental_score += 10; fund_notes.append("Có lãi dương")
+    elif sector == "CONG_NGHE_BAN_LE":
+        if profit_growth_yoy >= 20: fundamental_score += 18; fund_notes.append("Tăng trưởng lõi mạnh (>=20%)")
+        elif profit_growth_yoy >= 10: fundamental_score += 10; fund_notes.append("Tăng trưởng ổn định")
+        if roe >= 18: fundamental_score += 17; fund_notes.append("ROE xuất sắc")
+        elif roe >= 12: fundamental_score += 10; fund_notes.append("ROE tốt")
+    elif sector == "DIEN_NUOC_HA_TANG":
+        if dividend_yield >= 6.0: fundamental_score += 20; fund_notes.append(f"Cổ tức hấp dẫn ({dividend_yield}%)")
+        elif dividend_yield > 0: fundamental_score += 10; fund_notes.append(f"Có cổ tức ({dividend_yield}%)")
+        if roe >= 10: fundamental_score += 15; fund_notes.append("ROE ổn định phòng thủ")
+        else: fundamental_score += 8
+    elif sector == "NGUYEN_VAT_LIEU_CHU_KY":
+        if profit_growth_yoy >= 15: fundamental_score += 18; fund_notes.append("Hưởng lợi chu kỳ")
+        elif profit_growth_yoy >= 0: fundamental_score += 10; fund_notes.append("Duy trì nhịp cơ bản")
+        else: fundamental_score -= 15; fund_notes.append("⚠️ LNST tăng trưởng âm (suy thoái chu kỳ)")
+        if roe >= 12: fundamental_score += 17; fund_notes.append("ROE chu kỳ tốt")
+        else: fundamental_score += 8
+    else:
+        if profit_growth_yoy >= 10: fundamental_score += 15; fund_notes.append("LN tăng trưởng tốt")
+        elif profit_growth_yoy >= 0: fundamental_score += 8; fund_notes.append("LN ổn định")
+        else: fundamental_score -= 10; fund_notes.append("⚠️ LNST tăng trưởng âm")
+        if roe >= 14: fundamental_score += 20; fund_notes.append("ROE sản xuất cao (>=14%)")
+        elif roe >= 10: fundamental_score += 10; fund_notes.append("ROE khá")
+        
+    if roa >= 5.0: fundamental_score += 5; fund_notes.append(f"ROA cao ({roa}%)")
+    elif roa >= 2.5: fundamental_score += 3; fund_notes.append(f"ROA tốt ({roa}%)")
 
-    tech_score_raw = 50
-    technical_status, pattern, volume_analysis = "Tích lũy sideway", "Tích lũy", ""
+    if sector not in ["NGAN_HANG", "CHUNG_KHOAN"]:
+        if cfo_latest > 0 and (net_profit_ttm <= 0 or cfo_latest >= net_profit_ttm * 0.8): fundamental_score += 5; fund_notes.append("CFO mạnh mẽ")
+        elif cfo_latest < 0: fundamental_score -= 5; fund_notes.append("⚠️ CFO âm")
+        if 0 < debt_to_equity <= 1.0: fundamental_score += 5; fund_notes.append(f"D/E an toàn ({debt_to_equity})")
+        elif debt_to_equity > 2.5: fundamental_score -= 5; fund_notes.append(f"⚠️ D/E cao ({debt_to_equity})")
+    else:
+        fundamental_score += 5
+        fund_notes.append("Ngân hàng tối ưu vốn")
+
+    fundamental_score = int(np.clip(fundamental_score, 0, 50))
+
+    valuation_score = 0
+    if sector == "BAT_DONG_SAN":
+        if (0 < pb < 1.5) or (0 < ps < 2.0): valuation_score = 30
+        elif (0 < pb < 2.2) or (0 < ps < 3.5): valuation_score = 18
+        else: valuation_score = 8
+    elif sector == "NGUYEN_VAT_LIEU_CHU_KY":
+        if (0 < ps < 1.2) or (0 < pe < 12): valuation_score = 30
+        elif (0 < ps < 2.0) or (0 < pe < 18): valuation_score = 18
+        else: valuation_score = 8
+    elif sector == "CONG_NGHE_BAN_LE":
+        if 0 < pe < 18 or (profit_growth_yoy > 20 and pe < 25): valuation_score = 30
+        elif 0 < pe < 25: valuation_score = 18
+        else: valuation_score = 8
+    elif sector in ["NGAN_HANG", "CHUNG_KHOAN"]:
+        if 0 < pb < 1.3 or (roe >= 16 and pb < 1.8): valuation_score = 30
+        elif 0 < pb < 2.0: valuation_score = 18
+        else: valuation_score = 8
+    else:
+        if 0 < pe < 15 or dividend_yield >= 5.0: valuation_score = 30
+        elif 0 < pe < 20 or dividend_yield >= 3.0: valuation_score = 18
+        else: valuation_score = 8
+    valuation_score = int(np.clip(valuation_score, 0, 30))
+
+    technical_score_raw = 50
+    technical_status = "Tích lũy sideway"
+    pattern = "Tích lũy"
+    volume_analysis = "Chưa phân tích volume"
+
     if ProfessionalTechnicalAnalyzer:
         hist_data = history_col.find_one({"symbol": symbol})
         if hist_data and hist_data.get("history_d1"):
             try:
                 analyzer = ProfessionalTechnicalAnalyzer(hist_data["history_d1"]) 
                 ptkt_res = analyzer.analyze()
-                tech_score_raw = ptkt_res.get("technical_score", 50)
-                technical_status = ptkt_res.get("technical_status", "")
-                pattern = ptkt_res.get("pattern", "")
+                technical_score_raw = ptkt_res.get("technical_score", 50)
+                technical_status = ptkt_res.get("technical_status", "Tích lũy sideway")
+                pattern = ptkt_res.get("pattern", "Tích lũy")
                 volume_analysis = ptkt_res.get("volume_analysis", "")
-            except Exception as e: print(f"⚠️ Lỗi PTKT {symbol}: {e}")
+            except Exception as e:
+                print(f"⚠️ Lỗi PTKT {symbol}: {e}")
 
-    tech_score = int(np.clip(int(round((tech_score_raw / 100.0) * 20)), 0, 20))
-    total_score = fund_score + val_score + tech_score
+    technical_score = int(round((technical_score_raw / 100.0) * 20))
+    technical_score = int(np.clip(technical_score, 0, 20))
+
+    total_score = fundamental_score + valuation_score + technical_score
+
+    potential_zone = "THEO DÕI THÊM"
+    if total_score >= 75: potential_zone = "VÙNG TÍCH SẢN TỐI ƯU (A+)"
+    elif total_score >= 60: potential_zone = "VÙNG MUA AN TOÀN (B)"
+
     fv = compute_fair_value_zone(symbol, nd, sector_median, config, group_label)
-    final_dec, final_color, final_reason = compute_final_decision(
-        fund_score=fund_score, tech_score=tech_score, val_score=val_score, total_score=total_score,
-        verdict=fv["verdict"], cfo=nd["cfo_latest"], npat=nd["net_profit_ttm"], roe=nd["roe"], debt_to_equity=nd["debt_to_equity"],
-        discount_to_fair_pct=fv["discount_to_fair_pct"], close_price=nd["close_price"], fair_high=fv["fair_high"], fair_low=fv["fair_low"]
+
+    final_decision, final_color, final_reason = compute_final_decision(
+        fund_score=fundamental_score, tech_score=technical_score, val_score=valuation_score, total_score=total_score,
+        verdict=fv["verdict"], cfo=cfo_latest, npat=net_profit_ttm, roe=roe, debt_to_equity=debt_to_equity,
+        discount_to_fair_pct=fv["discount_to_fair_pct"], close_price=close_price, fair_high=fv["fair_high"], fair_low=fv["fair_low"]
     )
+
     return {
-        "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": nd["close_price"], "pe": nd["pe"], "pb": nd["pb"], "roe": nd["roe"],
-        "fundamental_score": fund_score, "valuation_score": val_score, "technical_score": tech_score, "total_score": total_score,
-        "pattern": pattern, "technical_status": technical_status, "volume_analysis": volume_analysis,
-        "fair_value_high": fv["fair_high"], "fair_value_low": fv["fair_low"], "margin_of_safety_pct": fv["mos_pct"],
-        "fair_value_rationale": fv["rationale"], "discount_to_fair_pct": fv["discount_to_fair_pct"], "valuation_verdict": fv["verdict"],
-        "final_decision": final_dec, "final_decision_color": final_color, "final_decision_reason": final_reason
+        "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
+        "roe": roe, "roa": roa, "eps": round(nd["eps"], 0), "bvps": round(nd["bvps"], 0), "dividend_yield": dividend_yield, "profit_growth_yoy": profit_growth_yoy,
+        "cfo_latest": cfo_latest, "debt_to_equity": debt_to_equity, "gross_margin": nd["gross_margin"],
+        "fundamental_score": fundamental_score, "valuation_score": valuation_score, "technical_score": technical_score, "total_score": total_score,
+        "potential_zone": potential_zone, "pattern": pattern, "technical_status": technical_status, "volume_analysis": volume_analysis,
+        "fundamental_notes": " | ".join(fund_notes), "fair_value_high": fv["fair_high"], "fair_value_low": fv["fair_low"], "graham_number": fv["graham"],
+        "margin_of_safety_pct": fv["mos_pct"], "fair_value_methods": fv["methods"], "fair_value_rationale": fv["rationale"],
+        "discount_to_fair_pct": fv["discount_to_fair_pct"], "valuation_verdict": fv["verdict"], "final_decision": final_decision,
+        "final_decision_color": final_color, "final_decision_reason": final_reason,
     }
 
 def aggregate_candles(data, interval):
@@ -371,7 +456,7 @@ def aggregate_candles(data, interval):
             groups[key]['high'] = max(groups[key]['high'], bar['high']); groups[key]['low'] = min(groups[key]['low'], bar['low']); groups[key]['close'] = bar['close']; groups[key]['volume'] += bar['volume']
     return sorted(list(groups.values()), key=lambda x: x['time'])
 
-# ===================== CORE CRAWL LOGIC (GIỮ NGUYÊN) =====================
+# ===================== CORE CRAWL LOGIC =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
     global is_crawling, LAST_ALERT_BATCH, LAST_TELEGRAM_TIME
     if is_crawling: return
@@ -390,7 +475,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
             for sym in chunk:
                 doc = collection.find_one({"symbol": sym})
                 if doc and doc.get("chot_so_today") == trading_date: continue
-
                 data = _fetch_one(sym)
                 if data:
                     hist_data, _ = get_github_file_data(f"history/{sym}.json")
@@ -401,13 +485,11 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         elif len(bars) == 1: prev_close = bars[0]["close"]
                         valid_vols = [b.get("volume", 0) for b in bars[-20:] if b.get("volume", 0) > 0]
                         if valid_vols: avg_volume_20 = sum(valid_vols) / len(valid_vols)
-
                     amplitude_percent = round((data["high"] - data["low"]) / data["open"] * 100, 2) if data["open"] > 0 else 0
                     volume_percent = round(data["volume"] / avg_volume_20 * 100, 2) if avg_volume_20 > 0 else 0
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0
                     all_crawled_data[sym] = {"close": data["close"], "pct_change": pct_change}
                     real_time_str = _now_str()
-
                     collection.update_one({"symbol": sym}, {"$set": {
                         "close": data["close"], "prev_close": prev_close, "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
                         "amplitude_percent": amplitude_percent, "volume_percent": volume_percent, "avg_volume_20": round(avg_volume_20, 2),
@@ -415,10 +497,8 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     }}, upsert=True)
                     LAST_CRAWL_TIME[sym] = time.time()
                     print(f"  ✅ [OK] {sym}: Giá {data['close']:,} | KL: {data['volume']:,} | Vol%: {volume_percent}% (Lúc: {real_time_str})", flush=True)
-                    
                     if prev_close > 0 and abs(pct_change) >= 3.0 and volume_percent >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": volume_percent, "price": data["close"], "volume": data["volume"], "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG", "flow": "BÁN RÒNG" if pct_change < 0 else "MUA VÀO"})
-
                     if _is_after_15h() and hist_data is not None:
                         d1_bars = hist_data.get("history_d1", [])
                         d1_bar = {"time": trading_date, "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data["volume"]}
@@ -465,7 +545,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         is_crawling = False
         print("[CRAWL] 🏁 Đã kết thúc đợt cào.\n", flush=True)
 
-# ===================== LUỒNG FULL DATA (NẾN & BCTC) =====================
+# ===================== LUỒNG FULL DATA =====================
 def full_data_crawler_worker():
     print("⏰ [FULL-DATA] Đã bật luồng cào dữ liệu tĩnh vào MongoDB (16h00).", flush=True)
     while True:
@@ -476,13 +556,11 @@ def full_data_crawler_worker():
                 target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
                 end_date = datetime.now().strftime("%Y-%m-%d")
                 start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-                
                 for i, symbol in enumerate(target_symbols):
                     new_bctc = _fetch_bctc_ssi(symbol)
                     if new_bctc:
                         new_bctc['symbol'] = symbol; new_bctc['updated_at'] = _now_str()
                         bctc_col.update_one({"symbol": symbol}, {"$set": new_bctc}, upsert=True)
-                    
                     df = _fetch_history_ssi(symbol, start_date, end_date)
                     if df is not None and not df.empty:
                         new_bars = []
@@ -492,7 +570,6 @@ def full_data_crawler_worker():
                         for bar in new_bars:
                             history_col.update_one({"symbol": symbol}, {"$pull": {"history_d1": {"time": bar["time"]}}})
                         history_col.update_one({"symbol": symbol}, {"$push": {"history_d1": {"$each": new_bars, "$slice": -2500}}}, upsert=True)
-                        
                         doc_hist = history_col.find_one({"symbol": symbol})
                         if doc_hist and doc_hist.get("history_d1"):
                             d1_data = sorted(doc_hist["history_d1"], key=lambda x: x["time"])
@@ -505,7 +582,7 @@ def full_data_crawler_worker():
             print(f"❌ [FULL-DATA] Lỗi: {e}", flush=True)
             time.sleep(60)
 
-# ===================== LUỒNG SCREENER (16H30) =====================
+# ===================== LUỒNG SCREENER =====================
 def screener_worker():
     print("⏰ [SCREENER] Đã bật luồng chấm điểm Quant (16h30).", flush=True)
     while True:
@@ -519,10 +596,8 @@ def screener_worker():
                     bctc = bctc_col.find_one({"symbol": sym})
                     doc["bctc_history"] = [] 
                     stock_db[sym] = doc
-
                 normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
                 sector_medians = compute_sector_medians(normalized_db)
-
                 results = []
                 for symbol, nd in normalized_db.items():
                     sector = get_sector(symbol)
@@ -531,7 +606,6 @@ def screener_worker():
                     median, _ = get_median_for_symbol(symbol, sector_medians)
                     res = evaluate_stock_from_db(symbol, nd, median, group_label, config)
                     if res: results.append(res)
-
                 if results:
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
                     screener_col.delete_many({}) 
@@ -545,7 +619,7 @@ def screener_worker():
             print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
             time.sleep(60)
 
-# ===================== BACKGROUND WORKER (TỐI ƯU NGHỈ ĐÊM) =====================
+# ===================== BACKGROUND WORKER =====================
 def auto_crawler_worker():
     print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu Real-time (tự ngủ sau 15h)!", flush=True)
     while True:
@@ -554,11 +628,9 @@ def auto_crawler_worker():
             today_str = vn_now.strftime("%Y-%m-%d")
             current_hour = vn_now.hour
             collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
-
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             total_symbols = len(all_symbols)
             crawled_count = collection.count_documents({"chot_so_today": today_str})
-
             if current_hour >= 15 and crawled_count >= total_symbols:
                 tomorrow = vn_now + timedelta(days=1)
                 wake_up_time = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
@@ -567,7 +639,6 @@ def auto_crawler_worker():
                     print(f"🌙 [AUTO] Đã chốt sổ xong {crawled_count}/{total_symbols} mã. Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
                     time.sleep(min(sleep_seconds, 3600)) 
                     continue
-
             if not is_crawling:
                 symbols_to_crawl = []
                 for sym in all_symbols:
@@ -643,7 +714,6 @@ def api_sync():
             doc = collection.find_one({"symbol": sym})
             if doc and "close" in doc: updated_data[sym] = doc["close"]
         return jsonify({"status": "success", "updated_at": _now_str() + " (Đang cào ngầm)", "updated_data": updated_data})
-
     threading.Thread(target=_execute_crawl, args=(symbols, False, True)).start()
     return jsonify({"status": "success", "updated_at": _now_str() + " (Bắt đầu cào)", "updated_data": {}})
 
