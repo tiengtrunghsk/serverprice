@@ -1016,8 +1016,15 @@ def crawl_full_bctc():
 @app.get("/api/force-screener")
 def force_screener():
     global is_screener_running
-    if is_screener_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
+    if is_screener_running: 
+        print("[SCREENER] ⚠️ Đang có tiến trình chấm điểm chạy, bỏ qua lệnh mới.", flush=True)
+        return jsonify({"status": "error", "message": "Đang chạy"}), 400
+        
     is_screener_running = True
+    
+    # Thêm log bắt đầu
+    print(f"\n[SCREENER] 🚀 Bắt đầu chấm điểm lại toàn bộ...", flush=True)
+    
     def _run():
         global is_screener_running
         try:
@@ -1026,24 +1033,43 @@ def force_screener():
                 bctc = bctc_col.find_one({"symbol": doc["symbol"]}, {"_id": 0})
                 doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                 stock_db[doc["symbol"]] = doc
+            
+            print(f"[SCREENER] 📊 Đã tải dữ liệu của {len(stock_db)} mã từ Database.", flush=True)
+            
             norm_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
             medians = compute_sector_medians(norm_db)
             results = []
+            
+            # Thêm log tiến trình
+            count = 0
             for sym, nd in norm_db.items():
                 grp = get_sub_sector(sym)
                 cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(sym))
                 med, _ = get_median_for_symbol(sym, medians)
                 res = evaluate_stock_from_db(sym, nd, med, grp, cfg)
-                if res: results.append(res)
+                if res: 
+                    results.append(res)
+                count += 1
+                # Cứ 20 mã thì in log 1 lần để không làm rác log
+                if count % 20 == 0:
+                    print(f"[SCREENER] ⏳ Đã xử lý {count}/{len(norm_db)} mã...", flush=True)
+            
             if results:
                 results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
                 screener_col.delete_many({}) 
                 screener_col.insert_many(results) 
+                print(f"[SCREENER] 💾 Đã lưu {len(results)} mã vào MongoDB.", flush=True)
+                
                 commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Force Screener {_now_str()}")
-        finally: is_screener_running = False
+                print(f"[SCREENER] ✅ Đã đẩy file JSON lên Github thành công!", flush=True)
+        except Exception as e:
+            print(f"[SCREENER] ❌ Lỗi trong quá trình chấm điểm: {e}", flush=True)
+        finally: 
+            is_screener_running = False
+            print(f"[SCREENER] 🏁 Đã kết thúc tiến trình chấm điểm.\n", flush=True)
+            
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
-@app.get("/api/reset-today")
 def reset_today():
     """Xóa cờ chốt sổ của ngày hôm nay để hệ thống cào lại"""
     today_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d")
