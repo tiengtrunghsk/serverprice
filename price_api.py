@@ -102,6 +102,7 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 is_crawling = False
 is_full_data_running = False
 is_screener_running = False
+LAST_TELEGRAM_TIME = 0  # Biến toàn cục lưu thời gian gửi Telegram gần nhất
 
 def get_current_fhsc_key():
     setting = settings_col.find_one({"_id": "fhsc_key"})
@@ -248,9 +249,9 @@ def _fetch_bctc_ssi(symbol: str):
         return reports if reports else None
     except Exception: return None
 
-# ===================== CORE LOGIC CÀO =====================
+# ===================== CORE LOGIC CÀO & CẢNH BÁO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
-    global is_crawling
+    global is_crawling, LAST_TELEGRAM_TIME
     if is_crawling: return
     is_crawling = True
     try:
@@ -277,12 +278,23 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     vol_pct = round(data["volume"] / avg_vol_20 * 100, 2) if avg_vol_20 > 0 else 0
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0
                     
+                    # Xác định màu sắc & mũi tên
+                    arrow, color = "—", "slate"
+                    if pct_change > 0: arrow, color = "▲", "emerald"
+                    elif pct_change < 0: arrow, color = "▼", "rose"
+
+                    # LƯU ĐẦY ĐỦ VÀO DB
                     collection.update_one({"symbol": sym}, {"$set": {
-                        "close": data["close"], "prev_close": prev_close, "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
+                        "close": data["close"], "prev_close": prev_close, 
+                        "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
                         "volume_percent": vol_pct, "avg_volume_20": round(avg_vol_20, 2),
+                        "price_change_percent": pct_change,
+                        "price_change_available": prev_close > 0,
+                        "price_arrow": arrow, "price_color": color,
                         "trading_date": trading_date, "updated_at": _now_str(), "is_locked": _is_after_15h(), "is_incomplete": False
                     }}, upsert=True)
                     
+                    # Thu thập mã đột biến
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
@@ -308,10 +320,21 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             collection.update_one({"symbol": path.split("/")[1].replace(".json", "")}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
                 time.sleep(2)
 
+        # XỬ LÝ CẢNH BÁO TELEGRAM (GIỚI HẠN 2 TIẾNG)
         if alert_batch:
-            msg = [f"🚨 <b>CẢNH BÁO DÒNG TIỀN ({len(alert_batch)} MÃ)</b>"]
-            for item in alert_batch: msg.append(f"• <b>{item['sym']}</b>: {item['pct_change']:+.2f}% {item['trend']} | Vol: {item['volume_percent']:.0f}%")
-            send_telegram("\n".join(msg))
+            now_ts = time.time()
+            if (now_ts - LAST_TELEGRAM_TIME) >= 7200:
+                alert_batch.sort(key=lambda x: x["volume_percent"], reverse=True)
+                msg_lines = [f"🚨 <b>CẢNH BÁO DÒNG TIỀN ĐỘT BIẾN</b>"]
+                msg_lines.append(f"⏰ Lúc: {_now_str()}")
+                for item in alert_batch:
+                    msg_lines.append(f"• <b>{item['sym']}</b>: {item['pct_change']:+.2f}% {item['trend']} | Vol: {item['volume_percent']:.0f}%")
+                
+                send_telegram("\n".join(msg_lines))
+                print(f"[TELEGRAM] 🚀 Đã gửi cảnh báo {len(alert_batch)} mã.", flush=True)
+                LAST_TELEGRAM_TIME = now_ts
+            else:
+                print(f"[TELEGRAM] ⏳ Có {len(alert_batch)} mã đột biến nhưng chưa đủ 2 tiếng, bỏ qua gửi tin.", flush=True)
     finally:
         is_crawling = False
 
@@ -716,43 +739,83 @@ def api_set_fhsc_key():
 
 @app.get("/api/data")
 def api_get_data():
-    try: return jsonify({"status": "success", "data": {doc["symbol"]: doc for doc in collection.find({}, {"_id": 0})}})
-    except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
+    try:
+        cursor = collection.find({}, {"_id": 0})
+        data = {}
+        for doc in cursor:
+            sym = doc.get("symbol")
+            if sym:
+                # Nếu DB thiếu thông tin, tự động tính lại
+                if "price_change_percent" not in doc or doc["price_change_percent"] == 0:
+                    close_price = doc.get("close", 0)
+                    prev_close = doc.get("prev_close", 0)
+                    pct = 0.0
+                    avail = False
+                    arrow, color = "—", "slate"
+                    if close_price > 0 and prev_close > 0:
+                        raw_pct = ((close_price - prev_close) / prev_close) * 100
+                        if -30.0 <= raw_pct <= 30.0:
+                            pct = round(raw_pct, 2)
+                            avail = True
+                            if pct > 0: arrow, color = "▲", "emerald"
+                            elif pct < 0: arrow, color = "▼", "rose"
+                    doc["price_change_percent"] = pct
+                    doc["price_change_available"] = avail
+                    doc["price_arrow"] = arrow
+                    doc["price_color"] = color
+                
+                # Gán mặc định volume_percent nếu chưa có
+                doc["volume_percent"] = doc.get("volume_percent", 0.0)
+                data[sym] = doc
+        return jsonify({"status": "success", "count": len(data), "data": data})
+    except Exception as e: 
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.get("/api/sync")
 def api_sync():
-    """
-    API xử lý cập nhật giá.
-    - Cập nhật tất cả: truyền toàn bộ danh sách mã (cách nhau bởi dấu phẩy).
-    - Cập nhật 1 mã: chỉ truyền 1 mã.
-    """
     raw = request.args.get("symbols", "").strip()
-    if not raw: 
-        return jsonify({"status": "error", "message": "Thiếu danh sách mã"}), 400
-        
+    if not raw: abort(400)
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
     
-    # TRƯỜNG HỢP 1: Nếu hệ thống đang tự động cào ngầm (is_crawling = True)
-    # Thì không kích hoạt cào mới, chỉ trả về kết quả mới nhất đang có trong DB
-    if is_crawling:
+    # NẾU ĐÃ QUÁ 15H HOẶC ĐANG CÀO NGẦM -> LẤY TỪ DB
+    if is_crawling or _is_after_15h():
         updated_data = {}
         for sym in symbols:
             doc = collection.find_one({"symbol": sym})
             if doc and "close" in doc: 
-                updated_data[sym] = doc["close"]
+                close_price = doc.get("close", 0)
+                prev_close = doc.get("prev_close", 0)
+                pct = 0.0
+                avail = False
+                arrow, color = "—", "slate"
+                if close_price > 0 and prev_close > 0:
+                    raw_pct = ((close_price - prev_close) / prev_close) * 100
+                    if -30.0 <= raw_pct <= 30.0:
+                        pct = round(raw_pct, 2)
+                        avail = True
+                        if pct > 0: arrow, color = "▲", "emerald"
+                        elif pct < 0: arrow, color = "▼", "rose"
+
+                updated_data[sym] = {
+                    "close": close_price, "close_price": close_price,
+                    "prev_close": prev_close, "price_change_percent": pct,
+                    "price_change_available": avail, "price_arrow": arrow,
+                    "price_color": color, "updated_at": doc.get("updated_at", _now_str())
+                }
         return jsonify({
             "status": "success", 
-            "updated_at": _now_str() + " (Đang cào ngầm)", 
+            "updated_at": _now_str() + " (Lấy từ DB)", 
             "updated_data": updated_data
         })
-        
-    # TRƯỜNG HỢP 2: Hệ thống đang rảnh, kích hoạt luồng cào tay cho các mã này
+
+    # TRONG GIỜ GIAO DỊCH VÀ RẢNH -> KÍCH HOẠT CÀO MỚI
     threading.Thread(target=_execute_crawl, args=(symbols, False, True)).start()
-    
     return jsonify({
         "status": "success", 
         "updated_at": _now_str() + " (Bắt đầu cào)", 
         "updated_data": {}
     })
+
 @app.get("/api/screener")
 def api_get_screener():
     try: return jsonify({"status": "success", "data": list(screener_col.find({}, {"_id": 0}))})
