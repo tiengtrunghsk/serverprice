@@ -127,30 +127,43 @@ def _is_after_15h() -> bool:
 
 # ===================== FETCH DATA TỪ VNSTOCK 6 =====================
 def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
-    """Lấy dữ liệu OHLCV từ Vnstock thế hệ 6 (chỉ định rõ nguồn)"""
+    """
+    Lấy dữ liệu OHLCV từ Vnstock thế hệ 6.
+    Đã sửa lỗi: Bỏ chỉ định 'vci', thêm cơ chế fallback sang 'kbs' và 'ssi'.
+    """
     def _do():
-        try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            
-            market = Market()
-            # SỬA LỖI: Chỉ định rõ nguồn 'vci' hoặc 'kbs'
-            df = market.equity(symbol).ohlcv(start=past_7d, end=today, source="vci")
-            
-            if df is None or df.empty:
-                return None
-            
-            latest = df.iloc[-1]
-            return {
-                "close": float(latest['close']),
-                "open": float(latest['open']),
-                "high": float(latest['high']),
-                "low": float(latest['low']),
-                "volume": int(latest['volume'])
-            }
-        except Exception as e:
-            print(f"[VNSTOCK] {symbol}: Lỗi - {e}", flush=True)
-            return None
+        today = datetime.now().strftime("%Y-%m-%d")
+        past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        
+        market = Market()
+        
+        # Danh sách nguồn ưu tiên thử (Mặc định -> KBS -> SSI)
+        # Nguồn mặc định của vnstock 6 thường là KBS, rất ổn định trên server
+        sources_to_try = [None, "kbs", "ssi"] 
+        
+        for src in sources_to_try:
+            try:
+                if src:
+                    df = market.equity(symbol).ohlcv(start=past_7d, end=today, source=src)
+                else:
+                    # Không truyền source, để thư viện tự chọn nguồn mặc định
+                    df = market.equity(symbol).ohlcv(start=past_7d, end=today)
+                
+                if df is not None and not df.empty:
+                    latest = df.iloc[-1]
+                    return {
+                        "close": float(latest['close']),
+                        "open": float(latest['open']),
+                        "high": float(latest['high']),
+                        "low": float(latest['low']),
+                        "volume": int(latest['volume'])
+                    }
+            except Exception as e:
+                # In lỗi ra để debug nhưng không dừng vòng lặp, thử nguồn tiếp theo
+                print(f"[VNSTOCK] {symbol} - Nguồn '{src or 'default'}': {str(e)[:100]}", flush=True)
+                continue
+                
+        return None
 
     for attempt in range(retries):
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
@@ -158,10 +171,12 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
             try:
                 data = fut.result(timeout=15) 
                 if data and data["close"] > 0 and data["open"] > 0:
+                    # Chuẩn hóa dữ liệu giá (nếu giá > 1000 thì chia 1000)
                     if data["close"] >= 1000:
                         for k in ["close", "open", "high", "low"]:
                             if data[k] > 0: data[k] = data[k] / 1000.0
                     
+                    # Chuẩn hóa khối lượng
                     if 0 < data["volume"] < 100000:
                         data["volume"] = data["volume"] * VOLUME_MULTIPLIER
                     
@@ -174,7 +189,7 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
                 pass
             
             if attempt < retries - 1:
-                time.sleep(1)
+                time.sleep(1.5) # Tăng thời gian chờ giữa các lần thử
                 
     print(f"[FETCH] ❌ {symbol}: Lỗi kết nối sau {retries} lần thử", flush=True)
     return None
