@@ -25,6 +25,7 @@ if not MONGO_URI:
 
 SSI_CONSUMER_ID = os.environ.get("SSI_CONSUMER_ID", "").strip()
 SSI_CONSUMER_SECRET = os.environ.get("SSI_CONSUMER_SECRET", "").strip()
+SSI_PRIVATE_KEY = os.environ.get("SSI_PRIVATE_KEY", "").strip()
 
 if not SSI_CONSUMER_ID or not SSI_CONSUMER_SECRET:
     print("❌ LỖI: Thiếu SSI_CONSUMER_ID hoặc SSI_CONSUMER_SECRET!", flush=True)
@@ -51,12 +52,12 @@ VOLUME_MULTIPLIER = 10
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
-# Khởi tạo SSI Config
+# Khởi tạo SSI Config (Đã thêm Private Key)
 ssi_config = Config(
     client_id=SSI_CONSUMER_ID,
     api_key=SSI_CONSUMER_ID,
     api_secret=SSI_CONSUMER_SECRET,
-    private_key="",  # Không cần cho market data
+    private_key=SSI_PRIVATE_KEY,
 )
 
 # ===================== TELEGRAM HELPER =====================
@@ -124,14 +125,13 @@ LAST_CRAWL_START_TIME = 0
 LAST_CRAWL_TIME = {}
 LAST_ALERT_BATCH = []
 LAST_GITHUB_WRITE_TIME = 0
-LAST_TELEGRAM_TIME = 0 # Biến chống spam Telegram
+LAST_TELEGRAM_TIME = 0 
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
 
 def _get_current_update_time() -> str:
-    """Lấy thời gian cào. Nếu sau 15h thì ghim cứng 15:00:00 để không bị nhảy giờ"""
     vn_now = datetime.utcnow() + timedelta(hours=7)
     if vn_now.hour >= 15:
         return vn_now.replace(hour=15, minute=0, second=0).strftime("%d/%m/%Y %H:%M:%S")
@@ -286,7 +286,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     global is_crawling, LAST_ALERT_BATCH, LAST_TELEGRAM_TIME, LAST_CRAWL_START_TIME
     
     if is_crawling:
-        # Chống kẹt: Nếu tiến trình trước chạy quá 5 phút, reset
         if time.time() - LAST_CRAWL_START_TIME > 300:
             print("[CRAWL] ⚠️ Phát hiện kẹt tiến trình, tự động Reset!", flush=True)
             is_crawling = False
@@ -316,7 +315,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 if "close" in doc: updated_data[sym] = doc["close"]
                 continue
 
-            # Nghỉ 0.5s mỗi 10 mã để xả RAM
             if i > 0 and i % 10 == 0:
                 time.sleep(0.5)
 
@@ -525,7 +523,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         collection.update_one({"symbol": sym}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
                         success_symbols.append(sym)
                 
-                # === LOGIC GỬI TELEGRAM (CÁCH NHAU 4 TIẾNG) ===
                 current_time = time.time()
                 if (current_time - LAST_TELEGRAM_TIME > 14400) or is_manual:
                     error_docs = collection.find({"is_incomplete": True}, {"symbol": 1})
@@ -561,7 +558,6 @@ def auto_crawler_worker():
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
             
-            # Chỉ cào trong giờ giao dịch
             is_market_open = (9 <= vn_now.hour < 15) or (vn_now.hour == 15 and vn_now.minute == 0)
             if not is_market_open:
                 time.sleep(60)
@@ -580,7 +576,6 @@ def auto_crawler_worker():
                 time.sleep(30)
                 continue
 
-            # Chia thành các nhóm nhỏ (mỗi nhóm 5 mã)
             CHUNK_SIZE = 5
             chunks = [symbols_to_crawl[i:i + CHUNK_SIZE] for i in range(0, len(symbols_to_crawl), CHUNK_SIZE)]
             
@@ -590,7 +585,7 @@ def auto_crawler_worker():
                     continue
 
                 threading.Thread(target=_execute_crawl, args=(chunk, False, False), daemon=True).start()
-                time.sleep(3) # Nghỉ 3s trước khi cào nhóm tiếp theo
+                time.sleep(3)
 
             if vn_now.hour >= 15:
                 time.sleep(60)
