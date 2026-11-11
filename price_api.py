@@ -97,6 +97,8 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 is_crawling = False
+is_full_data_running = False
+is_screener_running = False
 LAST_CRAWL_TIME = {}
 LAST_ALERT_BATCH = []
 LAST_TELEGRAM_TIME = 0
@@ -730,6 +732,112 @@ def force_fix_data():
     threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
     return jsonify({"status": "success", "message": f"Đang ép cào lại toàn bộ {len(all_symbols)} mã."})
 
+@app.get("/api/force-full-data")
+def force_full_data():
+    """Ép Server cào ngay BCTC và Nến 30 ngày (dành cho việc test)"""
+    global is_full_data_running
+    if is_full_data_running:
+        return jsonify({"status": "error", "message": "Tiến trình cào dữ liệu tĩnh đang chạy, vui lòng đợi!"})
+    
+    # Đánh dấu trạng thái để tránh bấm 2 lần
+    is_full_data_running = True
+    
+    def _run_force():
+        global is_full_data_running
+        try:
+            print("\n[MANUAL] 🚀 Ép cào BCTC & Nến 30 ngày cho toàn bộ danh sách...", flush=True)
+            target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            
+            for i, symbol in enumerate(target_symbols):
+                print(f"  [{i+1}/{len(target_symbols)}] Xử lý tĩnh: {symbol}...", flush=True)
+                
+                # 1. Cào BCTC
+                new_bctc = _fetch_bctc_ssi(symbol)
+                if new_bctc:
+                    new_bctc['symbol'] = symbol
+                    new_bctc['updated_at'] = _now_str()
+                    bctc_col.update_one({"symbol": symbol}, {"$set": new_bctc}, upsert=True)
+                    print(f"    ✅ [BCTC] {symbol} thành công.", flush=True)
+                
+                # 2. Cào Nến 30 ngày
+                df = _fetch_history_ssi(symbol, start_date, end_date)
+                if df is not None and not df.empty:
+                    new_bars = []
+                    for _, row in df.iterrows():
+                        time_str = row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time'])[:10]
+                        new_bars.append({"time": time_str, "open": float(row['open']), "high": float(row['high']), "low": float(row['low']), "close": float(row['close']), "volume": int(row['volume'])})
+                    
+                    for bar in new_bars:
+                        history_col.update_one({"symbol": symbol}, {"$pull": {"history_d1": {"time": bar["time"]}}})
+                    history_col.update_one({"symbol": symbol}, {"$push": {"history_d1": {"$each": new_bars, "$slice": -2500}}}, upsert=True)
+                    
+                    doc_hist = history_col.find_one({"symbol": symbol})
+                    if doc_hist and doc_hist.get("history_d1"):
+                        d1_data = sorted(doc_hist["history_d1"], key=lambda x: x["time"])
+                        history_col.update_one({"symbol": symbol}, {"$set": {"history_w1": aggregate_candles(d1_data, 'W1'), "history_mn": aggregate_candles(d1_data, 'MN')}})
+                    print(f"    ✅ [NẾN] {symbol} thành công.", flush=True)
+                
+                time.sleep(1.5) # Nghỉ 1.5s tránh SSI block
+                
+            print("[MANUAL] 🏁 Đã cào xong toàn bộ BCTC & Nến.", flush=True)
+        except Exception as e:
+            print(f"❌ [MANUAL] Lỗi: {e}", flush=True)
+        finally:
+            is_full_data_running = False
+
+    threading.Thread(target=_run_force, daemon=True).start()
+    return jsonify({"status": "success", "message": f"Đã kích hoạt cào BCTC & Nến cho {len(collection.find())} mã. Xem log Render để theo dõi!"})
+
+
+@app.get("/api/force-screener")
+def force_screener():
+    """Ép Server chấm điểm lại Screener ngay lập tức (dành cho việc test)"""
+    global is_screener_running
+    if is_screener_running:
+        return jsonify({"status": "error", "message": "Tiến trình chấm điểm đang chạy, vui lòng đợi!"})
+    
+    is_screener_running = True
+    
+    def _run_screener():
+        global is_screener_running
+        try:
+            print("\n[MANUAL] 🚀 Ép chấm điểm lại Screener...", flush=True)
+            stock_db = {}
+            for doc in collection.find({}):
+                sym = doc["symbol"]
+                bctc = bctc_col.find_one({"symbol": sym})
+                doc["bctc_history"] = [] 
+                stock_db[sym] = doc
+                
+            normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
+            sector_medians = compute_sector_medians(normalized_db)
+            
+            results = []
+            for symbol, nd in normalized_db.items():
+                sector = get_sector(symbol)
+                group_label = get_sub_sector(symbol)
+                config = SUB_SECTOR_CONFIG.get(group_label) or SUB_SECTOR_CONFIG.get(sector)
+                median, _ = get_median_for_symbol(symbol, sector_medians)
+                res = evaluate_stock_from_db(symbol, nd, median, group_label, config)
+                if res: results.append(res)
+                
+            if results:
+                results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
+                screener_col.delete_many({}) 
+                screener_col.insert_many(results) 
+                print(f"[MANUAL] ✅ Đã lưu {len(results)} mã vào MongoDB.", flush=True)
+                
+                commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Force Update Screener {_now_str()}")
+                print(f"[MANUAL] ✅ Đã đẩy file JSON lên Github.", flush=True)
+        except Exception as e:
+            print(f"❌ [MANUAL] Lỗi: {e}", flush=True)
+        finally:
+            is_screener_running = False
+
+    threading.Thread(target=_run_screener, daemon=True).start()
+    return jsonify({"status": "success", "message": "Đã kích hoạt chấm điểm lại Screener. Xem log Render để theo dõi!"})
 @app.get("/api/retry-now")
 def retry_now():
     if is_crawling: return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
