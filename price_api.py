@@ -320,7 +320,7 @@ def _fetch_bctc_ssi(symbol: str):
                 # Gọi từng báo cáo riêng biệt
                 df = report_func(
                     period="quarter",
-                    source="fhsc"
+                    source="vci"
                 )
 
                 elapsed = round(time.time() - report_started, 2)
