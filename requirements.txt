@@ -1,8 +1,6 @@
-flask>=3.0
-flask-cors>=4.0
-lotusmarket[fetchers]
-gunicorn
-httpx
+--extra-index-url https://vnstocks.com/api/packages
+vnstock
 pymongo
 requests
-vnstock
+flask
+flask-cors
