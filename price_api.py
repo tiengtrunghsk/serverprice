@@ -175,6 +175,7 @@ def get_historical_return_rate_with_details(symbol):
 
 # ===================== CÀO GIÁ =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
+    print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True) # <-- Thêm log để biết nó đang chạy
     def _do():
         try:
             today = datetime.now().strftime("%Y-%m-%d")
@@ -184,11 +185,19 @@ def _fetch_one(symbol: str) -> Optional[dict]:
                 latest = df.iloc[-1]
                 return {"close": float(latest["close"]), "open": float(latest["open"]), "high": float(latest["high"]), "low": float(latest["low"]), "volume": int(latest["volume"])}
             return None
-        except Exception: return None
+        except Exception as e:
+            print(f"    ❌ [FETCH ERROR] Lỗi gọi Vnstock cho {symbol}: {e}", flush=True) # <-- Bắt lỗi
+            return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        try: data = ex.submit(_do).result(timeout=15)
-        except Exception: return None
+        try: 
+            data = ex.submit(_do).result(timeout=15)
+        except concurrent.futures.TimeoutError:
+            print(f"    ❌ [FETCH TIMEOUT] Quá 15s không lấy được giá {symbol}", flush=True) # <-- Bắt lỗi timeout
+            return None
+        except Exception as e:
+            print(f"    ❌ [FETCH THREAD ERROR] {symbol}: {e}", flush=True)
+            return None
 
     if not data or data["close"] <= 0 or data["open"] <= 0: return None
     if data["close"] >= 1000:
