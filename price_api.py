@@ -756,40 +756,54 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         print("[CRAWL] 🏁 Đã kết thúc đợt cào.\n", flush=True)
 
 # ===================== LUỒNG FULL DATA =====================
+# ===================== LUỒNG FULL DATA (HÀNG NGÀY) =====================
 def full_data_crawler_worker():
-    print("⏰ [FULL-DATA] Đã bật luồng cào dữ liệu tĩnh vào MongoDB (16h00).", flush=True)
+    print("⏰ [FULL-DATA] Đã bật luồng cào dữ liệu tĩnh (16h00).", flush=True)
+    print("📌 Lịch trình: Cào Nến hàng ngày. Cào BCTC vào các ngày 5 và 20 hàng tháng.", flush=True)
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
             if vn_now.hour == 16 and vn_now.minute == 0:
-                print("\n[FULL-DATA] 🚀 Bắt đầu cập nhật Nến & BCTC...", flush=True)
+                # Kiểm tra xem hôm nay có phải ngày cào BCTC không
+                is_bctc_day = vn_now.day in [5, 20] 
+                
+                if is_bctc_day:
+                    print("\n[FULL-DATA] 🚀 Bắt đầu cập nhật Nến & BCTC (Ngày cào BCTC)...", flush=True)
+                else:
+                    print("\n[FULL-DATA] 🚀 Bắt đầu cập nhật Nến 30 ngày (Không cào BCTC)...", flush=True)
+                    
                 target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
                 end_date = datetime.now().strftime("%Y-%m-%d")
                 start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+                
                 for i, symbol in enumerate(target_symbols):
-                    new_bctc = _fetch_bctc_ssi(symbol)
-                    if new_bctc:
-                        new_bctc["symbol"] = symbol
-                        new_bctc["updated_at"] = _now_str()
-                        try:
-                            logger.info(
-                                "[MONGO BCTC WRITE] %s | keys=%s | rows=%s",
-                                symbol,
-                                list(new_bctc.keys()),
-                                {k: len(v) for k, v in new_bctc.items() if isinstance(v, list)}
-                            )
-                            mongo_result = bctc_col.update_one(
-                                {"symbol": symbol}, {"$set": new_bctc}, upsert=True
-                            )
-                            logger.info(
-                                "[MONGO BCTC SUCCESS] %s | matched=%s | modified=%s | upserted_id=%s",
-                                symbol, mongo_result.matched_count,
-                                mongo_result.modified_count, mongo_result.upserted_id
-                            )
-                        except PyMongoError as e:
-                            log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
-                        except Exception as e:
-                            log_exception(f"[MONGO BCTC SERIALIZATION ERROR] Dữ liệu BCTC {symbol} không ghi được", e)
+                    # 1. Cào BCTC (Chỉ chạy nếu đúng ngày 5 hoặc 20)
+                    if is_bctc_day:
+                        new_bctc = _fetch_bctc_ssi(symbol)
+                        if new_bctc:
+                            new_bctc["symbol"] = symbol
+                            new_bctc["updated_at"] = _now_str()
+                            try:
+                                logger.info(
+                                    "[MONGO BCTC WRITE] %s | keys=%s | rows=%s",
+                                    symbol,
+                                    list(new_bctc.keys()),
+                                    {k: len(v) for k, v in new_bctc.items() if isinstance(v, list)}
+                                )
+                                mongo_result = bctc_col.update_one(
+                                    {"symbol": symbol}, {"$set": new_bctc}, upsert=True
+                                )
+                                logger.info(
+                                    "[MONGO BCTC SUCCESS] %s | matched=%s | modified=%s | upserted_id=%s",
+                                    symbol, mongo_result.matched_count,
+                                    mongo_result.modified_count, mongo_result.upserted_id
+                                )
+                            except PyMongoError as e:
+                                log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
+                            except Exception as e:
+                                log_exception(f"[MONGO BCTC SERIALIZATION ERROR] Dữ liệu BCTC {symbol} không ghi được", e)
+                    
+                    # 2. Cào Nến 30 ngày (Chạy hàng ngày)
                     df = _fetch_history_ssi(symbol, start_date, end_date)
                     if df is not None and not df.empty:
                         new_bars = []
@@ -803,14 +817,16 @@ def full_data_crawler_worker():
                         if doc_hist and doc_hist.get("history_d1"):
                             d1_data = sorted(doc_hist["history_d1"], key=lambda x: x["time"])
                             history_col.update_one({"symbol": symbol}, {"$set": {"history_w1": aggregate_candles(d1_data, 'W1'), "history_mn": aggregate_candles(d1_data, 'MN')}})
-                    time.sleep(1.5)
-                print(f"[FULL-DATA] ✅ Đã cập nhật xong Nến & BCTC.", flush=True)
+                    
+                    # Nghỉ 3 giây nếu cào BCTC (tránh Rate Limit), 1.5 giây nếu chỉ cào nến
+                    time.sleep(3.0 if is_bctc_day else 1.5)
+                    
+                print(f"[FULL-DATA] ✅ Đã cập nhật xong dữ liệu tĩnh.", flush=True)
                 time.sleep(120) 
             time.sleep(30)
         except Exception as e:
             log_exception("[FULL-DATA] Worker gặp lỗi", e)
             time.sleep(60)
-
 # ===================== LUỒNG SCREENER =====================
 def screener_worker():
     print("⏰ [SCREENER] Đã bật luồng chấm điểm Quant (16h30).", flush=True)
