@@ -1028,10 +1028,17 @@ def force_fix_data():
 
 @app.get("/api/force-full-data")
 def force_full_data():
-    """Ép Server cào ngay BCTC và Nến 30 ngày (dành cho việc test)"""
+    """
+    Ép Server cào ngay dữ liệu tĩnh.
+    Mặc định CHỈ cào Nến 30 ngày (nhanh).
+    Thêm ?bctc=true để ép cào cả BCTC (lâu hơn).
+    """
     global is_full_data_running
     if is_full_data_running:
         return jsonify({"status": "error", "message": "Tiến trình cào dữ liệu tĩnh đang chạy, vui lòng đợi!"})
+    
+    # Đọc tham số bctc từ URL (mặc định là false)
+    force_bctc = request.args.get("bctc", "false").lower() == "true"
     
     # Đánh dấu trạng thái để tránh bấm 2 lần
     is_full_data_running = True
@@ -1039,7 +1046,9 @@ def force_full_data():
     def _run_force():
         global is_full_data_running
         try:
-            print("\n[MANUAL] 🚀 Ép cào BCTC & Nến 30 ngày cho toàn bộ danh sách...", flush=True)
+            mode_str = "Nến & BCTC" if force_bctc else "chỉ Nến"
+            print(f"\n[MANUAL] 🚀 Ép cào {mode_str} 30 ngày cho toàn bộ danh sách...", flush=True)
+            
             target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             end_date = datetime.now().strftime("%Y-%m-%d")
             start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
@@ -1047,31 +1056,34 @@ def force_full_data():
             for i, symbol in enumerate(target_symbols):
                 print(f"  [{i+1}/{len(target_symbols)}] Xử lý tĩnh: {symbol}...", flush=True)
                 
-                # 1. Cào BCTC
-                new_bctc = _fetch_bctc_ssi(symbol)
-                if new_bctc:
-                    new_bctc["symbol"] = symbol
-                    new_bctc["updated_at"] = _now_str()
-                    try:
-                        logger.info(
-                            "[MONGO BCTC WRITE] %s | keys=%s | rows=%s",
-                            symbol,
-                            list(new_bctc.keys()),
-                            {k: len(v) for k, v in new_bctc.items() if isinstance(v, list)}
-                        )
-                        mongo_result = bctc_col.update_one(
-                            {"symbol": symbol}, {"$set": new_bctc}, upsert=True
-                        )
-                        logger.info(
-                            "[MONGO BCTC SUCCESS] %s | matched=%s | modified=%s | upserted_id=%s",
-                            symbol, mongo_result.matched_count,
-                            mongo_result.modified_count, mongo_result.upserted_id
-                        )
-                        print(f"    ✅ [BCTC] {symbol} thành công.", flush=True)
-                    except PyMongoError as e:
-                        log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
+                # 1. Cào BCTC (Chỉ chạy nếu có tham số ?bctc=true)
+                if force_bctc:
+                    new_bctc = _fetch_bctc_ssi(symbol)
+                    if new_bctc:
+                        new_bctc["symbol"] = symbol
+                        new_bctc["updated_at"] = _now_str()
+                        try:
+                            logger.info(
+                                "[MONGO BCTC WRITE] %s | keys=%s | rows=%s",
+                                symbol,
+                                list(new_bctc.keys()),
+                                {k: len(v) for k, v in new_bctc.items() if isinstance(v, list)}
+                            )
+                            mongo_result = bctc_col.update_one(
+                                {"symbol": symbol}, {"$set": new_bctc}, upsert=True
+                            )
+                            logger.info(
+                                "[MONGO BCTC SUCCESS] %s | matched=%s | modified=%s | upserted_id=%s",
+                                symbol, mongo_result.matched_count,
+                                mongo_result.modified_count, mongo_result.upserted_id
+                            )
+                            print(f"    ✅ [BCTC] {symbol} thành công.", flush=True)
+                        except PyMongoError as e:
+                            log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
+                        except Exception as e:
+                            log_exception(f"[MONGO BCTC SERIALIZATION ERROR] Dữ liệu BCTC {symbol} không ghi được", e)
                 
-                # 2. Cào Nến 30 ngày
+                # 2. Cào Nến 30 ngày (Luôn chạy)
                 df = _fetch_history_ssi(symbol, start_date, end_date)
                 if df is not None and not df.empty:
                     new_bars = []
@@ -1089,17 +1101,19 @@ def force_full_data():
                         history_col.update_one({"symbol": symbol}, {"$set": {"history_w1": aggregate_candles(d1_data, 'W1'), "history_mn": aggregate_candles(d1_data, 'MN')}})
                     print(f"    ✅ [NẾN] {symbol} thành công.", flush=True)
                 
-                time.sleep(1.5) # Nghỉ 1.5s tránh SSI block
+                # Nghỉ 3 giây nếu cào BCTC (tránh FHSC rate limit), 1 giây nếu chỉ cào nến
+                time.sleep(3.0 if force_bctc else 1.0) 
                 
-            print("[MANUAL] 🏁 Đã cào xong toàn bộ BCTC & Nến.", flush=True)
+            print(f"[MANUAL] 🏁 Đã cào xong toàn bộ {mode_str}.", flush=True)
         except Exception as e:
             log_exception("[MANUAL FULL-DATA] Tiến trình thủ công gặp lỗi", e)
         finally:
             is_full_data_running = False
 
     threading.Thread(target=_run_force, daemon=True).start()
-    return jsonify({"status": "success", "message": f"Đã kích hoạt cào BCTC & Nến cho {collection.count_documents({})} mã. Xem log Render để theo dõi!"})
-
+    
+    msg = "cào Nến và BCTC" if force_bctc else "chỉ cào Nến"
+    return jsonify({"status": "success", "message": f"Đã kích hoạt {msg} cho {collection.count_documents({})} mã. Xem log Render để theo dõi!"})
 
 @app.get("/api/force-screener")
 def force_screener():
