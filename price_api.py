@@ -15,13 +15,31 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
 # ===================== VNSTOCK SDK =====================
-from vnstock import Trading
+import vnstock
+from vnstock import Market
 
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 if not MONGO_URI:
     print("❌ LỖI: Thiếu MONGO_URI!", flush=True)
     sys.exit(1)
+
+# Đăng nhập Vnstock bằng API Key (nếu có)
+VNSTOCK_API_KEY = os.environ.get("VNSTOCK_API_KEY", "").strip()
+if VNSTOCK_API_KEY:
+    try:
+        vnstock.login(VNSTOCK_API_KEY)
+        print("✅ Đã đăng nhập Vnstock bằng API Key.", flush=True)
+        # In ra thông tin hạn mức để kiểm tra
+        try:
+            print(vnstock.status(), flush=True)
+            print(vnstock.usage(), flush=True)
+        except:
+            pass
+    except Exception as e:
+        print(f"⚠️ Lỗi đăng nhập Vnstock: {e}. Sẽ chạy ở cấp Khách.", flush=True)
+else:
+    print("⚠️ Không có VNSTOCK_API_KEY. Chạy ở cấp Khách (20 req/phút).", flush=True)
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
@@ -31,14 +49,11 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 SYMBOLS_JSON_FILE = "vn100_symbols.json"
 SCREENER_JSON_FILE = "screener_results.json"
 
-# TELEGRAM CONFIG
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 COOLDOWN_SECONDS = 300
-
-# ===================== VOLUME MULTIPLIER =====================
 VOLUME_MULTIPLIER = 10
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
@@ -65,7 +80,6 @@ try:
     settings_col = db['settings']
     print("✅ Kết nối MongoDB thành công!", flush=True)
     
-    # TỰ ĐỘNG ĐỒNG BỘ DANH SÁCH MÃ
     if os.path.exists(SYMBOLS_JSON_FILE):
         try:
             with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
@@ -133,58 +147,56 @@ def _is_after_15h() -> bool:
     vn_time = datetime.utcnow() + timedelta(hours=7)
     return vn_time.hour >= 15
 
-# ===================== FETCH DATA TỪ VNSTOCK =====================
-def _fetch_bulk_prices(symbols: list) -> dict:
-    """Lấy giá realtime của toàn bộ mã trong 1 request duy nhất bằng Vnstock"""
+# ===================== FETCH DATA TỪ VNSTOCK 5 =====================
+def _fetch_bulk_prices(symbols: list, retries: int = 3) -> dict:
+    """Lấy giá realtime của toàn bộ mã trong 1 request duy nhất bằng Vnstock 5.x"""
     result = {}
-    try:
-        # Sử dụng nguồn KBS hoặc VCI để lấy bảng giá realtime
-        # Vnstock hỗ trợ lấy nhiều mã cùng lúc qua price_board
-        trading = Trading(source="KBS", symbol="VCI") 
-        
-        # Lấy bảng giá cho tất cả các mã
-        board = trading.price_board(symbols_list=symbols)
-        
-        if board is None or board.empty:
-            print("[VNSTOCK] Bảng giá trả về rỗng.", flush=True)
-            return result
+    for attempt in range(retries):
+        try:
+            market = Market()
+            board = market.quote(symbols)
+            
+            if board is None or board.empty:
+                if attempt < retries - 1:
+                    time.sleep(2)
+                    continue
+                return result
 
-        # Duyệt qua từng dòng trong DataFrame
-        for _, row in board.iterrows():
-            sym = row.get('symbol')
-            if not sym or sym not in symbols:
-                continue
+            for _, row in board.iterrows():
+                sym = row.get('symbol')
+                if not sym or sym not in symbols:
+                    continue
+                    
+                close = float(row.get('close_price', 0) or 0)
+                open_p = float(row.get('open_price', 0) or 0)
+                high = float(row.get('high_price', 0) or 0)
+                low = float(row.get('low_price', 0) or 0)
+                vol = int(row.get('volume_accumulated', 0) or 0)
                 
-            # Vnstock trả về giá đã nhân 1000 (ví dụ 25.5 là 25,500 VND)
-            close = float(row.get('close_price', 0) or 0)
-            open_p = float(row.get('open_price', 0) or 0)
-            high = float(row.get('high_price', 0) or 0)
-            low = float(row.get('low_price', 0) or 0)
-            vol = int(row.get('volume_accumulated', 0) or 0)
-            
-            if close <= 0 or open_p <= 0:
-                continue
+                if close <= 0 or open_p <= 0:
+                    continue
 
-            # Chuẩn hóa giá (nếu Vnstock trả về giá gốc, không chia 1000)
-            if close >= 1000:
-                close /= 1000.0
-                open_p /= 1000.0
-                high /= 1000.0
-                low /= 1000.0
-            
-            # Chuẩn hóa volume
-            if 0 < vol < 100000:
-                vol = vol * VOLUME_MULTIPLIER
+                if close >= 1000:
+                    close /= 1000.0
+                    open_p /= 1000.0
+                    high /= 1000.0
+                    low /= 1000.0
+                
+                if 0 < vol < 100000:
+                    vol = vol * VOLUME_MULTIPLIER
 
-            result[sym] = {
-                "close": round(close, 2),
-                "open": round(open_p, 2),
-                "high": round(high, 2),
-                "low": round(low, 2),
-                "volume": int(vol)
-            }
-    except Exception as e:
-        print(f"[VNSTOCK] Lỗi fetch bulk: {e}", flush=True)
+                result[sym] = {
+                    "close": round(close, 2),
+                    "open": round(open_p, 2),
+                    "high": round(high, 2),
+                    "low": round(low, 2),
+                    "volume": int(vol)
+                }
+            return result
+        except Exception as e:
+            print(f"[VNSTOCK] Lỗi fetch bulk (Lần {attempt+1}/{retries}): {e}", flush=True)
+            if attempt < retries - 1:
+                time.sleep(3)
     
     return result
 
@@ -282,7 +294,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         mode_str = "CÀO BÙ" if is_retry else ("CÀO TAY" if is_manual else "CÀO TỰ ĐỘNG")
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu lấy BULK giá cho {len(symbols)} mã...", flush=True)
         
-        # Lấy toàn bộ dữ liệu trong 1 request
         bulk_data = _fetch_bulk_prices(set(symbols))
         
         for i, sym in enumerate(symbols):
@@ -458,7 +469,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 LAST_ALERT_BATCH.clear()
                 LAST_ALERT_BATCH.extend(current_symbols_sorted)
 
-        # GHI SCREENER JSON VÀ HISTORY (BULK COMMIT)
         if pending_history_files or need_update_screener:
             print(f"[GITHUB] 📦 Đang gom file để đẩy lên Github...", flush=True)
             
@@ -550,11 +560,10 @@ def auto_crawler_worker():
                 time.sleep(30)
                 continue
 
-            # Với Bulk API, không cần chia nhóm, cào 1 lần là xong toàn bộ
             if not is_crawling:
                 threading.Thread(target=_execute_crawl, args=(symbols_to_crawl, False, False), daemon=True).start()
             
-            time.sleep(5) # 5 giây cập nhật 1 lần
+            time.sleep(5)
 
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
