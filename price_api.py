@@ -14,8 +14,8 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-# ===================== VNSTOCK SDK =====================
-from vnstock.api.quote import Quote
+# ===================== VNSTOCK SDK (Thế hệ 5) =====================
+from vnstock import Market
 
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
@@ -124,24 +124,20 @@ def _is_after_15h() -> bool:
     vn_time = datetime.utcnow() + timedelta(hours=7)
     return vn_time.hour >= 15
 
-# ===================== FETCH DATA TỪ VNSTOCK (NHƯ CRAWLER) =====================
+# ===================== FETCH DATA TỪ VNSTOCK THẾ HỆ 5 =====================
 def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
-    """Lấy dữ liệu OHLCV từ Vnstock (TCBS hoặc VCI) giống file crawler"""
+    """Lấy dữ liệu OHLCV từ Vnstock thế hệ 5"""
     def _do():
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
             
-            # Ưu tiên dùng TCBS như trong file crawler của bạn
-            quote = Quote(source='TCBS', symbol=symbol)
-            df = quote.history(start=past_7d, end=today)
+            # Sử dụng cú pháp mới của Vnstock 5
+            market = Market()
+            df = market.equity(symbol).ohlcv(start=past_7d, end=today)
             
             if df is None or df.empty:
-                # Fallback sang VCI nếu TCBS lỗi
-                quote = Quote(source='VCI', symbol=symbol)
-                df = quote.history(start=past_7d, end=today)
-                if df is None or df.empty:
-                    return None
+                return None
             
             latest = df.iloc[-1]
             return {
@@ -151,7 +147,8 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
                 "low": float(latest['low']),
                 "volume": int(latest['volume'])
             }
-        except Exception:
+        except Exception as e:
+            print(f"[VNSTOCK] {symbol}: Lỗi - {e}", flush=True)
             return None
 
     for attempt in range(retries):
@@ -270,7 +267,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         all_crawled_data = {}
         
         pending_history_files = {}
-        need_update_screener = False
         
         mode_str = "CÀO BÙ" if is_retry else ("CÀO TAY" if is_manual else "CÀO TỰ ĐỘNG")
         print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào SONG SONG {len(symbols)} mã qua Vnstock...", flush=True)
@@ -440,7 +436,6 @@ def auto_crawler_worker():
                 time.sleep(30)
                 continue
 
-            # Chia thành các nhóm nhỏ (mỗi nhóm 5 mã) để tránh bị chặn
             CHUNK_SIZE = 5
             chunks = [symbols_to_crawl[i:i + CHUNK_SIZE] for i in range(0, len(symbols_to_crawl), CHUNK_SIZE)]
             
@@ -533,7 +528,7 @@ def api_sync():
             
     if not can_crawl:
         updated_data = {}
-        for sym in symbols:
+        for sym in symbols:  # <-- SỬA LỖI CÚ PHÁP TẠI ĐÂY
             doc = collection.find_one({"symbol": sym})
             if doc and "close" in doc: updated_data[sym] = doc["close"]
         return jsonify({"status": "success", "updated_at": _now_str() + " (Cache 5 phút)", "updated_data": updated_data})
