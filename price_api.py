@@ -938,20 +938,64 @@ def force_bctc():
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
+    
+    # Ưu tiên nhận danh sách mã cụ thể từ Frontend gửi lên
+    symbols_str = request.args.get("symbols", "").upper().strip()
     start_idx, limit_idx = int(request.args.get("start", 0)), int(request.args.get("limit", 15))
     specific = request.args.get("symbol", "").upper().strip()
+
     def _run():
         global is_full_data_running
         try:
-            target = [specific] if specific else [doc["symbol"] for doc in collection.find({}, {"symbol": 1})][start_idx:start_idx+limit_idx]
+            if symbols_str:
+                target = [s.strip() for s in symbols_str.split(",") if s.strip()]
+            elif specific:
+                target = [specific]
+            else:
+                target = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})][start_idx:start_idx+limit_idx]
+                
             for sym in target:
                 res = _fetch_bctc_ssi(sym)
-                if res: bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
+                if res: 
+                    bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
                 time.sleep(3.0)
-        finally: is_full_data_running = False
+        finally: 
+            is_full_data_running = False
+            
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"status": "success", "message": "Đang cào BCTC..."})
-
+    return jsonify({"status": "success", "message": f"Đang cào BCTC cho {len(symbols_str.split(',')) if symbols_str else limit_idx} mã..."})
+@app.get("/api/bctc-status")
+def api_bctc_status():
+    """Trả về danh sách tất cả các mã kèm trạng thái BCTC (ngày cào, kỳ báo cáo)"""
+    try:
+        # Lấy tất cả các mã từ bảng stocks
+        all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1, "_id": 0})]
+        
+        result = []
+        for sym in all_symbols:
+            bctc_doc = bctc_col.find_one({"symbol": sym}, {"_id": 0, "symbol": 1, "updated_at": 1, "latest_period": 1})
+            
+            if bctc_doc and bctc_doc.get("updated_at"):
+                result.append({
+                    "symbol": sym,
+                    "has_bctc": True,
+                    "updated_at": bctc_doc.get("updated_at", "Chưa rõ"),
+                    "latest_period": bctc_doc.get("latest_period", "Chưa rõ")
+                })
+            else:
+                result.append({
+                    "symbol": sym,
+                    "has_bctc": False,
+                    "updated_at": "Chưa cào",
+                    "latest_period": "Chưa có"
+                })
+                
+        # Sắp xếp theo tên mã A-Z
+        result = sorted(result, key=lambda x: x["symbol"])
+        return jsonify({"status": "success", "data": result})
+    except Exception as e:
+        log_exception("[API BCTC STATUS]", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
 @app.get("/api/crawl-full-bctc")
 def crawl_full_bctc():
     global is_full_data_running
