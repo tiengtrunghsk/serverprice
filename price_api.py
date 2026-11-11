@@ -14,8 +14,6 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-from lotusmarket import fetchers
-
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 if not MONGO_URI:
@@ -104,17 +102,17 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 is_crawling = False
 crawl_lock = threading.Lock()
+LAST_CRAWL_START_TIME = 0
 LAST_CRAWL_TIME = {}
 LAST_ALERT_BATCH = []
 LAST_GITHUB_WRITE_TIME = 0
-LAST_TELEGRAM_TIME = 0 # Biến chống spam Telegram
+LAST_TELEGRAM_TIME = 0
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
 
 def _get_current_update_time() -> str:
-    """Lấy thời gian cào. Nếu sau 15h thì ghim cứng 15:00:00 để không bị nhảy giờ"""
     vn_now = datetime.utcnow() + timedelta(hours=7)
     if vn_now.hour >= 15:
         return vn_now.replace(hour=15, minute=0, second=0).strftime("%d/%m/%Y %H:%M:%S")
@@ -132,55 +130,62 @@ def _is_after_15h() -> bool:
     vn_time = datetime.utcnow() + timedelta(hours=7)
     return vn_time.hour >= 15
 
-def _fetch_one(symbol: str) -> Optional[dict]:
-    def _do():
-        try:
-            stock = fetchers.vps(symbol)
-            if not stock: return None
-            return {
-                "close": getattr(stock, "close", 0) or 0,
-                "open": getattr(stock, "open", 0) or 0,
-                "high": getattr(stock, "high", 0) or 0,
-                "low": getattr(stock, "low", 0) or 0,
-                "volume": getattr(stock, "volume", 0) or getattr(stock, "nmVolume", 0) or getattr(stock, "vol", 0)
+# ===================== FETCH DATA TỪ VPS API =====================
+def _fetch_bulk_prices(symbols: list) -> dict:
+    """Lấy giá realtime của toàn bộ mã trong 1 request duy nhất"""
+    result = {}
+    try:
+        # API bảng giá của VPS
+        url = "https://bgapidatafeed.vps.com.vn/getliststockdata"
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            print(f"[VPS] Lỗi HTTP {res.status_code}", flush=True)
+            return result
+            
+        data_list = res.json()
+        if not isinstance(data_list, list):
+            return result
+
+        for item in data_list:
+            sym = item.get("sym")
+            if sym not in symbols:
+                continue
+                
+            close = float(item.get("lastPrice", 0) or 0)
+            open_p = float(item.get("openPrice", 0) or 0)
+            high = float(item.get("highPrice", 0) or 0)
+            low = float(item.get("lowPrice", 0) or 0)
+            vol = int(item.get("lot", 0) or 0) * 10 # VPS trả về lot (1 lot = 10 cp)
+            
+            if close <= 0 or open_p <= 0:
+                continue
+
+            # Chuẩn hóa giá
+            if close >= 1000:
+                close /= 1000.0
+                open_p /= 1000.0
+                high /= 1000.0
+                low /= 1000.0
+            
+            # Chuẩn hóa volume
+            if 0 < vol < 100000:
+                vol = vol * VOLUME_MULTIPLIER
+
+            result[sym] = {
+                "close": round(close, 2),
+                "open": round(open_p, 2),
+                "high": round(high, 2),
+                "low": round(low, 2),
+                "volume": int(vol)
             }
-        except Exception:
-            return None
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(_do)
-        try:
-            data = fut.result(timeout=15) 
-        except concurrent.futures.TimeoutError:
-            print(f"[FETCH] ⏰ {symbol}: Quá thời gian chờ, bỏ qua!", flush=True)
-            return None
-        except Exception as e:
-            print(f"[FETCH] ❌ {symbol}: Lỗi kết nối, bỏ qua!", flush=True)
-            return None
-
-    if not data or data["close"] <= 0 or data["open"] <= 0 or data["high"] <= 0 or data["low"] <= 0:
-        return None
+    except Exception as e:
+        print(f"[VPS] Lỗi fetch bulk: {e}", flush=True)
     
-    if data["close"] >= 1000:
-        for k in ["close", "open", "high", "low"]:
-            if data[k] > 0: 
-                data[k] = data[k] / 1000.0
-            
-    if 0 < data["volume"] < 100000:
-        data["volume"] = data["volume"] * VOLUME_MULTIPLIER
-            
-    return {
-        "close": round(data["close"], 2), 
-        "open": round(data["open"], 2),
-        "high": round(data["high"], 2), 
-        "low": round(data["low"], 2), 
-        "volume": int(data["volume"])
-    }
+    return result
 
 def can_update_github_today() -> bool:
     global LAST_GITHUB_WRITE_TIME
-    if time.time() - LAST_GITHUB_WRITE_TIME < 5: 
-        return False
+    if time.time() - LAST_GITHUB_WRITE_TIME < 5: return False
     LAST_GITHUB_WRITE_TIME = time.time()
     return True
 
@@ -201,10 +206,8 @@ def get_github_file_data(file_path):
         return None, None
 
 def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, max_retries: int = 5):
-    if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): 
+    if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]) or not files_to_update: 
         return False
-    if not files_to_update:
-        return True
 
     headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
     base_url = f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}"
@@ -215,80 +218,52 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
             
             ref_res = requests.get(f"{base_url}/git/ref/heads/{GITHUB_BRANCH}", headers=headers, timeout=10)
             if ref_res.status_code != 200:
-                print(f"[GITHUB] ❌ Lỗi lấy ref: {ref_res.status_code}", flush=True)
-                time.sleep(2)
-                continue
+                time.sleep(2); continue
             base_commit_sha = ref_res.json()["object"]["sha"]
 
             tree_items = []
-            blob_failed = False
             for path, content_dict in files_to_update.items():
                 content_str = json.dumps(content_dict, ensure_ascii=False, indent=4)
                 b64_content = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
-                
-                blob_payload = {"content": b64_content, "encoding": "base64"}
-                blob_res = requests.post(f"{base_url}/git/blobs", headers=headers, json=blob_payload, timeout=10)
-                if blob_res.status_code != 201:
-                    print(f"[GITHUB] ❌ Lỗi tạo blob cho {path}: {blob_res.status_code}", flush=True)
-                    blob_failed = True
-                    break
-                    
-                tree_items.append({
-                    "path": path,
-                    "mode": "100644",
-                    "type": "blob",
-                    "sha": blob_res.json()["sha"]
-                })
+                blob_res = requests.post(f"{base_url}/git/blobs", headers=headers, json={"content": b64_content, "encoding": "base64"}, timeout=10)
+                if blob_res.status_code != 201: break
+                tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_res.json()["sha"]})
             
-            if blob_failed:
-                time.sleep(2)
-                continue
-
-            tree_payload = {
-                "base_tree": base_commit_sha,
-                "tree": tree_items
-            }
-            tree_res = requests.post(f"{base_url}/git/trees", headers=headers, json=tree_payload, timeout=15)
-            if tree_res.status_code != 201:
-                print(f"[GITHUB] ❌ Lỗi tạo tree: {tree_res.status_code}", flush=True)
-                time.sleep(2)
-                continue
+            tree_res = requests.post(f"{base_url}/git/trees", headers=headers, json={"base_tree": base_commit_sha, "tree": tree_items}, timeout=15)
+            if tree_res.status_code != 201: time.sleep(2); continue
             new_tree_sha = tree_res.json()["sha"]
 
-            commit_payload = {
-                "message": commit_message,
-                "tree": new_tree_sha,
-                "parents": [base_commit_sha]
-            }
-            commit_res = requests.post(f"{base_url}/git/commits", headers=headers, json=commit_payload, timeout=10)
-            if commit_res.status_code != 201:
-                print(f"[GITHUB] ❌ Lỗi tạo commit: {commit_res.status_code}", flush=True)
-                time.sleep(2)
-                continue
+            commit_res = requests.post(f"{base_url}/git/commits", headers=headers, json={"message": commit_message, "tree": new_tree_sha, "parents": [base_commit_sha]}, timeout=10)
+            if commit_res.status_code != 201: time.sleep(2); continue
             new_commit_sha = commit_res.json()["sha"]
 
-            update_ref_payload = {"sha": new_commit_sha, "force": True}
-            update_res = requests.patch(f"{base_url}/git/refs/heads/{GITHUB_BRANCH}", headers=headers, json=update_ref_payload, timeout=10)
+            update_res = requests.patch(f"{base_url}/git/refs/heads/{GITHUB_BRANCH}", headers=headers, json={"sha": new_commit_sha, "force": True}, timeout=10)
             
             if update_res.status_code == 200:
                 print(f"[GITHUB] ✅ Đã gom {len(files_to_update)} file vào 1 commit thành công!", flush=True)
                 return True
             else:
-                print(f"[GITHUB] ❌ Lỗi cập nhật nhánh (Mã {update_res.status_code})", flush=True)
                 time.sleep(3)
-
-        except Exception as e:
-            print(f"[GITHUB] ❌ Lỗi ngoại lệ: {e}", flush=True)
+        except Exception:
             time.sleep(3)
 
     print(f"[GITHUB] 🛑 Đã thử {max_retries} lần nhưng thất bại.", flush=True)
     return False
 
-# ===================== CORE CRAWL LOGIC =====================
+# ===================== CORE CRAWL LOGIC (BULK) =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
-    global is_crawling, LAST_ALERT_BATCH, LAST_TELEGRAM_TIME
-    if is_crawling: return
+    global is_crawling, LAST_ALERT_BATCH, LAST_TELEGRAM_TIME, LAST_CRAWL_START_TIME
+    
+    if is_crawling:
+        if time.time() - LAST_CRAWL_START_TIME > 300:
+            print("[CRAWL] ⚠️ Phát hiện kẹt tiến trình, tự động Reset!", flush=True)
+            is_crawling = False
+        else:
+            return
+        
     is_crawling = True
+    LAST_CRAWL_START_TIME = time.time()
+    
     try:
         now_str = _now_str()
         trading_date = _get_trading_date_str()
@@ -300,21 +275,19 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         need_update_screener = False
         
         mode_str = "CÀO BÙ" if is_retry else ("CÀO TAY" if is_manual else "CÀO TỰ ĐỘNG")
-        print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào {len(symbols)} mã (Ngày: {trading_date})...", flush=True)
+        print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu lấy BULK giá cho {len(symbols)} mã...", flush=True)
+        
+        # Lấy toàn bộ dữ liệu trong 1 request
+        bulk_data = _fetch_bulk_prices(set(symbols))
         
         for i, sym in enumerate(symbols):
             doc = collection.find_one({"symbol": sym})
             
             if doc and doc.get("chot_so_today") == trading_date:
-                print(f"[CRAWL] 🔒 {sym}: Đã chốt sổ ngày {trading_date}. Bỏ qua.", flush=True)
                 if "close" in doc: updated_data[sym] = doc["close"]
                 continue
 
-            # Nghỉ 0.5s mỗi 10 mã để xả RAM, tránh bị Render kill
-            if i > 0 and i % 10 == 0:
-                time.sleep(0.5)
-
-            data = _fetch_one(sym)
+            data = bulk_data.get(sym)
             
             if data:
                 hist_data, _ = get_github_file_data(f"history/{sym}.json")
@@ -454,7 +427,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     {"$set": {"is_incomplete": True, "last_error_at": now_str}},
                     upsert=True
                 )
-                print(f"[CRAWL] ⚠️ {sym}: Lỗi API. Đã đánh dấu để cào bù.", flush=True)
+                print(f"[CRAWL] ⚠️ {sym}: Không có dữ liệu từ API bulk.", flush=True)
 
         if len(symbols) >= 5:
             settings_col.update_one({"_id": "global_last_update"}, {"$set": {"time": now_str}}, upsert=True)
@@ -507,7 +480,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         
                         if updated_count > 0:
                             pending_history_files[SCREENER_JSON_FILE] = current_json
-                            print(f"[GITHUB] 📝 Đã chuẩn bị cập nhật {updated_count} mã vào {SCREENER_JSON_FILE}", flush=True)
                 except Exception as e:
                     print(f"[GITHUB] ⚠️ Lỗi khi đọc {SCREENER_JSON_FILE}: {e}", flush=True)
 
@@ -520,9 +492,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         collection.update_one({"symbol": sym}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
                         success_symbols.append(sym)
                 
-                # === LOGIC GỬI TELEGRAM (CÁCH NHAU 4 TIẾNG) ===
                 current_time = time.time()
-                # 14.400 giây = 4 tiếng
                 if (current_time - LAST_TELEGRAM_TIME > 14400) or is_manual:
                     error_docs = collection.find({"is_incomplete": True}, {"symbol": 1})
                     error_symbols = [d["symbol"] for d in error_docs]
@@ -542,68 +512,48 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         
                     send_telegram(msg)
                     LAST_TELEGRAM_TIME = current_time
-                    print(f"[TELEGRAM] Đã gửi báo cáo (Giãn cách 4h).", flush=True)
-                else:
-                    print(f"[TELEGRAM] Bỏ qua gửi tin nhắn (Chưa đủ 4 tiếng).", flush=True)
-
-            else:
-                print("[GITHUB] ❌ Bulk commit thất bại, sẽ thử lại sau.", flush=True)
 
     finally:
         is_crawling = False
 
-# ===================== BACKGROUND WORKER =====================
+# ===================== BACKGROUND WORKER (ROLLING CRAWL) =====================
 def auto_crawler_worker():
-    print("⏰ [AUTO] Đã bật luồng tự động cập nhật giá (15 phút/lần).", flush=True)
+    print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu (Rolling Crawl) - Cập nhật liên tục!", flush=True)
+    
+    time.sleep(5)
+    
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
-            is_after_15h = vn_now.hour >= 15
-
-            collection.update_many(
-                {"chot_so_today": {"$ne": today_str}},
-                {"$unset": {"chot_so_today": "", "is_locked": ""}}
-            )
+            
+            is_market_open = (9 <= vn_now.hour < 15) or (vn_now.hour == 15 and vn_now.minute == 0)
+            if not is_market_open:
+                time.sleep(60)
+                continue
 
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             
-            incomplete_symbols = []
-            unchot_symbols = []
-            
+            symbols_to_crawl = []
             for sym in all_symbols:
-                doc = collection.find_one({"symbol": sym})
-                if not doc: 
-                    incomplete_symbols.append(sym)
-                    continue
-                if doc.get("is_incomplete"):
-                    incomplete_symbols.append(sym)
-                    continue
-                if doc.get("trading_date") == today_str and doc.get("chot_so_today") != today_str:
-                    if is_after_15h:
-                        unchot_symbols.append(sym)
+                doc = collection.find_one({"symbol": sym}, {"chot_so_today": 1})
+                if doc and doc.get("chot_so_today") == today_str:
+                    continue 
+                symbols_to_crawl.append(sym)
             
-            if incomplete_symbols:
-                print(f"[AUTO] 🔄 Phát hiện {len(incomplete_symbols)} mã lỗi. Cào bù...", flush=True)
-                _execute_crawl(incomplete_symbols, is_retry=True, is_manual=False)
+            if not symbols_to_crawl:
+                time.sleep(30)
+                continue
 
-            if is_after_15h and unchot_symbols:
-                print(f"[AUTO] 📤 Phát hiện {len(unchot_symbols)} mã chưa chốt. Xử lý...", flush=True)
-                _execute_crawl(unchot_symbols, is_manual=False)
+            # Với Bulk API, không cần chia nhóm, cào 1 lần là xong toàn bộ
+            if not is_crawling:
+                threading.Thread(target=_execute_crawl, args=(symbols_to_crawl, False, False), daemon=True).start()
             
-            if not is_after_15h:
-                symbols_to_crawl = []
-                for sym in all_symbols:
-                    doc = collection.find_one({"symbol": sym})
-                    if not doc or doc.get("trading_date") != today_str:
-                        symbols_to_crawl.append(sym)
-                if symbols_to_crawl:
-                    _execute_crawl(symbols_to_crawl, is_manual=False)
+            time.sleep(5) # 5 giây cập nhật 1 lần (có thể giảm xuống 2-3s nếu muốn nhanh hơn)
 
-            time.sleep(900)
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
-            time.sleep(60)
+            time.sleep(10)
 
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
 
@@ -700,7 +650,7 @@ def reset_today():
         {"chot_so_today": today_str},
         {"$unset": {"chot_so_today": "", "is_locked": ""}}
     )
-    return jsonify({"status": "success", "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã trong ngày hôm nay. Bạn có thể test lại!"})
+    return jsonify({"status": "success", "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã trong ngày hôm nay."})
 
 @app.get("/api/force-fix")
 def force_fix_data():
@@ -711,7 +661,6 @@ def force_fix_data():
 
 @app.get("/api/retry-now")
 def retry_now():
-    """Ép chạy cào bù ngay lập tức các mã bị lỗi"""
     if is_crawling:
         return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
         
