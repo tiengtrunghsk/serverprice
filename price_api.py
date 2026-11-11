@@ -241,7 +241,6 @@ def _fetch_one(symbol: str) -> Optional[dict]:
         "volume": int(data["volume"])
     }
 
-
 # ===================== VNSTOCK TĨNH =====================
 def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
     logger.info("[HISTORY FETCH] %s | %s -> %s", symbol, start_date, end_date)
@@ -259,12 +258,10 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
         log_exception(f"[HISTORY ERROR] Không lấy được lịch sử giá {symbol}", e)
     return None
 
-
-
 def _fetch_bctc_ssi(symbol: str):
     """
     Lấy BCTC theo API Vnstock 6 (Nguồn FHSC).
-    Tối ưu: Thêm delay, cơ chế retry khi bị RateLimit (429) và xử lý từng báo cáo độc lập.
+    Tối ưu: Thêm delay, retry khi bị RateLimit (429), giới hạn 8 quý (2 năm).
     """
     symbol = str(symbol).upper().strip()
     started = time.time()
@@ -277,36 +274,32 @@ def _fetch_bctc_ssi(symbol: str):
         logger.info("[BCTC INIT SUCCESS] %s", symbol)
 
         reports = {}
-        # Danh sách 3 báo cáo tài chính chính
         report_names = ("balance_sheet", "income_statement", "cash_flow")
 
-        def fetch_with_retry(func, period=None, source="fhsc", max_retries=3):
-            """Hàm phụ trợ: Gọi API, nếu gặp lỗi 429 thì chờ và thử lại"""
+        def fetch_with_retry(func, period=None, source="fhsc", max_retries=3, limit=None):
             for attempt in range(max_retries):
                 try:
-                    if period:
-                        return func(period=period, source=source)
-                    else:
-                        return func(source=source)
+                    kwargs = {"source": source}
+                    if period: kwargs["period"] = period
+                    if limit: kwargs["limit"] = limit
+                    return func(**kwargs)
                 except Exception as e:
                     err_str = str(e).lower()
-                    # Bắt lỗi RateLimit (429) hoặc các lỗi liên quan đến giới hạn tần suất
                     if "429" in err_str or "rate limit" in err_str or "vượt giới hạn" in err_str:
-                        wait_time = (attempt + 1) * 10  # Chờ 10s, 20s, 30s
+                        wait_time = (attempt + 1) * 10
                         logger.warning(
                             "[BCTC RATE LIMIT] %s | Bị giới hạn, đợi %ss rồi thử lại (Lần %s/%s)...",
                             symbol, wait_time, attempt + 1, max_retries
                         )
                         time.sleep(wait_time)
                     else:
-                        # Nếu là lỗi khác (không phải 429) thì ném ra ngoài luôn
                         raise e
             return None
 
-        # 1. Cào 3 báo cáo chính
+        # 1. Cào 3 báo cáo chính (Lấy 8 quý ~ 2 năm)
         for report_name in report_names:
             report_started = time.time()
-            logger.info("[BCTC REQUEST] %s | %s | period=quarter | source=fhsc", symbol, report_name)
+            logger.info("[BCTC REQUEST] %s | %s | period=quarter | source=fhsc | limit=8", symbol, report_name)
 
             try:
                 report_func = getattr(equity, report_name, None)
@@ -314,17 +307,13 @@ def _fetch_bctc_ssi(symbol: str):
                     logger.error("[BCTC UNSUPPORTED] %s | Không tìm thấy equity.%s()", symbol, report_name)
                     continue
 
-                # Gọi hàm với cơ chế retry
-                df = fetch_with_retry(report_func, period="quarter")
-                
-                # Nghỉ 1.5s giữa các báo cáo để tránh dồn dập
+                df = fetch_with_retry(report_func, period="quarter", limit=8)
                 time.sleep(1.5) 
 
                 if df is None or getattr(df, 'empty', True):
                     logger.warning("[BCTC EMPTY] %s | %s trả về rỗng", symbol, report_name)
                     continue
 
-                # Làm sạch dữ liệu
                 clean_df = df.astype(object).where(pd.notna(df), None)
                 records = json.loads(json.dumps(clean_df.to_dict(orient="records"), ensure_ascii=False, default=str))
                 
@@ -335,10 +324,10 @@ def _fetch_bctc_ssi(symbol: str):
                 log_exception(f"[BCTC REPORT ERROR] {symbol} | {report_name}", e)
                 continue
 
-        # 2. Cào riêng bảng Chỉ số tài chính (ratio)
+        # 2. Cào riêng bảng Chỉ số tài chính (ratio) - Dùng period="quarterly"
         try:
             logger.info("[BCTC REQUEST] %s | ratio | source=fhsc", symbol)
-            df_ratio = fetch_with_retry(equity.ratio)
+            df_ratio = fetch_with_retry(equity.ratio, period="quarterly", limit=8)
             
             if df_ratio is not None and not getattr(df_ratio, 'empty', True):
                 clean_df = df_ratio.astype(object).where(pd.notna(df_ratio), None)
@@ -364,6 +353,7 @@ def _fetch_bctc_ssi(symbol: str):
         return None
     finally:
         logger.info("[BCTC END] %s", symbol)
+
 # ===================== GITHUB BULK UPLOAD =====================
 def get_github_file_data(file_path):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
@@ -755,91 +745,73 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         is_crawling = False
         print("[CRAWL] 🏁 Đã kết thúc đợt cào.\n", flush=True)
 
-# ===================== LUỒNG FULL DATA =====================
-# ===================== LUỒNG FULL DATA (HÀNG NGÀY) =====================
+# ===================== LUỒNG FULL DATA (CHỈ CÀO BCTC 0H-6H SÁNG) =====================
 def full_data_crawler_worker():
-    print("⏰ [FULL-DATA] Đã bật luồng cào dữ liệu tĩnh (16h00).", flush=True)
-    print("📌 Lịch trình: Cào Nến hàng ngày. Cào BCTC vào các ngày 5 và 20 hàng tháng.", flush=True)
+    print("⏰ [FULL-DATA] Đã bật luồng kiểm tra BCTC tự động.", flush=True)
+    print("📌 Lịch trình: Quét và cào bù BCTC (nếu quá 30 ngày) trong khung 0h - 6h sáng.", flush=True)
+    
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
-            if vn_now.hour == 16 and vn_now.minute == 0:
-                # Kiểm tra xem hôm nay có phải ngày cào BCTC không
-                is_bctc_day = vn_now.day in [5, 20] 
-                
-                if is_bctc_day:
-                    print("\n[FULL-DATA] 🚀 Bắt đầu cập nhật Nến & BCTC (Ngày cào BCTC)...", flush=True)
-                else:
-                    print("\n[FULL-DATA] 🚀 Bắt đầu cập nhật Nến 30 ngày (Không cào BCTC)...", flush=True)
+            
+            # Chỉ chạy vào phút thứ 0 của mỗi tiếng trong khung 0h - 6h sáng
+            is_bctc_time = (0 <= vn_now.hour < 6 and vn_now.minute == 0 and vn_now.second < 10)
+
+            if is_bctc_time:
+                print(f"\n[FULL-DATA] 🌙 Khung giờ {vn_now.hour}h sáng: Bắt đầu kiểm tra BCTC...", flush=True)
                     
                 target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-                end_date = datetime.now().strftime("%Y-%m-%d")
-                start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
-                
+                thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+                updated_count = 0
+
                 for i, symbol in enumerate(target_symbols):
-                    # 1. Cào BCTC (Chỉ chạy nếu đúng ngày 5 hoặc 20)
-                    if is_bctc_day:
+                    bctc_doc = bctc_col.find_one({"symbol": symbol}, {"updated_at": 1})
+                    need_bctc = False
+                    
+                    if not bctc_doc or "updated_at" not in bctc_doc:
+                        need_bctc = True
+                    else:
+                        try:
+                            last_updated = datetime.strptime(bctc_doc["updated_at"], "%d/%m/%Y %H:%M:%S")
+                            if last_updated < thirty_days_ago:
+                                need_bctc = True
+                        except Exception:
+                            need_bctc = True
+
+                    if need_bctc:
+                        print(f"  [{i+1}/{len(target_symbols)}] 📊 Cào BCTC cho {symbol} (Quá hạn hoặc chưa có)...", flush=True)
                         new_bctc = _fetch_bctc_ssi(symbol)
                         if new_bctc:
                             new_bctc["symbol"] = symbol
                             new_bctc["updated_at"] = _now_str()
                             try:
-                                logger.info(
-                                    "[MONGO BCTC WRITE] %s | keys=%s | rows=%s",
-                                    symbol,
-                                    list(new_bctc.keys()),
-                                    {k: len(v) for k, v in new_bctc.items() if isinstance(v, list)}
-                                )
-                                mongo_result = bctc_col.update_one(
-                                    {"symbol": symbol}, {"$set": new_bctc}, upsert=True
-                                )
-                                logger.info(
-                                    "[MONGO BCTC SUCCESS] %s | matched=%s | modified=%s | upserted_id=%s",
-                                    symbol, mongo_result.matched_count,
-                                    mongo_result.modified_count, mongo_result.upserted_id
-                                )
-                            except PyMongoError as e:
-                                log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
+                                bctc_col.update_one({"symbol": symbol}, {"$set": new_bctc}, upsert=True)
+                                updated_count += 1
                             except Exception as e:
-                                log_exception(f"[MONGO BCTC SERIALIZATION ERROR] Dữ liệu BCTC {symbol} không ghi được", e)
+                                log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
+                        time.sleep(3.0)
                     
-                    # 2. Cào Nến 30 ngày (Chạy hàng ngày)
-                    df = _fetch_history_ssi(symbol, start_date, end_date)
-                    if df is not None and not df.empty:
-                        new_bars = []
-                        for _, row in df.iterrows():
-                            time_str = row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time'])[:10]
-                            new_bars.append({"time": time_str, "open": float(row['open']), "high": float(row['high']), "low": float(row['low']), "close": float(row['close']), "volume": int(row['volume'])})
-                        for bar in new_bars:
-                            history_col.update_one({"symbol": symbol}, {"$pull": {"history_d1": {"time": bar["time"]}}})
-                        history_col.update_one({"symbol": symbol}, {"$push": {"history_d1": {"$each": new_bars, "$slice": -2500}}}, upsert=True)
-                        doc_hist = history_col.find_one({"symbol": symbol})
-                        if doc_hist and doc_hist.get("history_d1"):
-                            d1_data = sorted(doc_hist["history_d1"], key=lambda x: x["time"])
-                            history_col.update_one({"symbol": symbol}, {"$set": {"history_w1": aggregate_candles(d1_data, 'W1'), "history_mn": aggregate_candles(d1_data, 'MN')}})
-                    
-                    # Nghỉ 3 giây nếu cào BCTC (tránh Rate Limit), 1.5 giây nếu chỉ cào nến
-                    time.sleep(3.0 if is_bctc_day else 1.5)
-                    
-                print(f"[FULL-DATA] ✅ Đã cập nhật xong dữ liệu tĩnh.", flush=True)
-                time.sleep(120) 
-            time.sleep(30)
+                print(f"[FULL-DATA] ✅ Đã hoàn tất đợt kiểm tra. Cập nhật thành công {updated_count} mã.", flush=True)
+                time.sleep(3600) 
+            else:
+                time.sleep(30)
+                
         except Exception as e:
             log_exception("[FULL-DATA] Worker gặp lỗi", e)
             time.sleep(60)
+
 # ===================== LUỒNG SCREENER =====================
 def screener_worker():
     print("⏰ [SCREENER] Đã bật luồng chấm điểm Quant (16h30).", flush=True)
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
-            if vn_now.hour == 16 and vn_now.minute == 30:
+            if vn_now.hour == 16 and vn_now.minute == 30 and vn_now.second < 10:
                 print("\n[SCREENER] 🚀 Bắt đầu phân tích và chấm điểm...", flush=True)
                 stock_db = {}
                 for doc in collection.find({}):
                     sym = doc["symbol"]
                     bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
-                    # Cấp dữ liệu kết quả kinh doanh cho bộ chuẩn hóa hiện tại.
                     doc["bctc_history"] = (
                         bctc.get("income_statement", []) if bctc else []
                     )
@@ -935,7 +907,6 @@ def api_get_screener():
 
 @app.get("/api/bctc")
 def api_get_bctc():
-    """Kiểm tra trực tiếp dữ liệu BCTC đã lưu trong MongoDB."""
     symbol = request.args.get("symbol", "").upper().strip()
     if not symbol:
         return jsonify({"status": "error", "message": "Thiếu mã cổ phiếu"}), 400
@@ -1026,64 +997,155 @@ def force_fix_data():
     threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
     return jsonify({"status": "success", "message": f"Đang ép cào lại toàn bộ {len(all_symbols)} mã."})
 
-@app.get("/api/force-full-data")
-def force_full_data():
-    """
-    Ép Server cào ngay dữ liệu tĩnh.
-    Mặc định CHỈ cào Nến 30 ngày (nhanh).
-    Thêm ?bctc=true để ép cào cả BCTC (lâu hơn).
-    """
+# ===================== CÁC API CÀO BCTC =====================
+@app.get("/api/force-bctc")
+def force_bctc():
     global is_full_data_running
     if is_full_data_running:
-        return jsonify({"status": "error", "message": "Tiến trình cào dữ liệu tĩnh đang chạy, vui lòng đợi!"})
+        return jsonify({"status": "error", "message": "Có tiến trình cào dữ liệu đang chạy, vui lòng đợi!"})
     
-    # Đọc tham số bctc từ URL (mặc định là false)
-    force_bctc = request.args.get("bctc", "false").lower() == "true"
-    
-    # Đánh dấu trạng thái để tránh bấm 2 lần
     is_full_data_running = True
+    start_idx = int(request.args.get("start", 0))
+    limit_idx = int(request.args.get("limit", 15)) 
+    specific_symbol = request.args.get("symbol", "").upper().strip()
     
-    def _run_force():
+    def _run_bctc_only():
         global is_full_data_running
         try:
-            mode_str = "Nến & BCTC" if force_bctc else "chỉ Nến"
-            print(f"\n[MANUAL] 🚀 Ép cào {mode_str} 30 ngày cho toàn bộ danh sách...", flush=True)
+            if specific_symbol:
+                print(f"\n[MANUAL-BCTC] 🚀 Ép cào BCTC cho 1 mã duy nhất: {specific_symbol}...", flush=True)
+                target_symbols = [specific_symbol]
+            else:
+                print(f"\n[MANUAL-BCTC] 🚀 Ép cào BCTC (Từ mã {start_idx} đến {start_idx + limit_idx})...", flush=True)
+                all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+                target_symbols = all_symbols[start_idx : start_idx + limit_idx]
             
+            updated_count = 0
+            for i, symbol in enumerate(target_symbols):
+                print(f"  [{i+1}/{len(target_symbols)}] 📊 Xử lý BCTC: {symbol}...", flush=True)
+                new_bctc = _fetch_bctc_ssi(symbol)
+                if new_bctc:
+                    new_bctc["symbol"] = symbol
+                    new_bctc["updated_at"] = _now_str()
+                    try:
+                        bctc_col.update_one({"symbol": symbol}, {"$set": new_bctc}, upsert=True)
+                        print(f"    ✅ [BCTC] {symbol} thành công.", flush=True)
+                        updated_count += 1
+                    except Exception as e:
+                        log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
+                time.sleep(3.0) 
+            print(f"[MANUAL-BCTC] 🏁 Đã cào xong BCTC. Thành công {updated_count}/{len(target_symbols)} mã.", flush=True)
+        except Exception as e:
+            log_exception("[MANUAL-BCTC] Tiến trình gặp lỗi", e)
+        finally:
+            is_full_data_running = False
+
+    threading.Thread(target=_run_bctc_only, daemon=True).start()
+    msg = f"cho mã {specific_symbol}" if specific_symbol else f"cho {limit_idx} mã (từ vị trí {start_idx})"
+    return jsonify({"status": "success", "message": f"Đã kích hoạt cào BCTC {msg}."})
+
+
+@app.get("/api/crawl-full-bctc")
+def crawl_full_bctc():
+    global is_full_data_running
+    if is_full_data_running:
+        return jsonify({"status": "error", "message": "Có tiến trình cào dữ liệu đang chạy, vui lòng đợi!"})
+    
+    is_full_data_running = True
+    
+    def _run_full_bctc():
+        global is_full_data_running
+        try:
+            print("\n[MANUAL-FULL-BCTC] 🚀 Ép cào TOÀN BỘ BCTC cho tất cả các mã...", flush=True)
+            target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+            updated_count = 0
+            
+            for i, symbol in enumerate(target_symbols):
+                print(f"  [{i+1}/{len(target_symbols)}] 📊 Xử lý BCTC: {symbol}...", flush=True)
+                new_bctc = _fetch_bctc_ssi(symbol)
+                if new_bctc:
+                    new_bctc["symbol"] = symbol
+                    new_bctc["updated_at"] = _now_str()
+                    try:
+                        bctc_col.update_one({"symbol": symbol}, {"$set": new_bctc}, upsert=True)
+                        print(f"    ✅ [BCTC] {symbol} thành công.", flush=True)
+                        updated_count += 1
+                    except Exception as e:
+                        log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
+                time.sleep(3.0) 
+                
+            print(f"[MANUAL-FULL-BCTC] 🏁 Đã cào xong toàn bộ BCTC. Thành công {updated_count}/{len(target_symbols)} mã.", flush=True)
+        except Exception as e:
+            log_exception("[MANUAL-FULL-BCTC] Tiến trình gặp lỗi", e)
+        finally:
+            is_full_data_running = False
+
+    threading.Thread(target=_run_full_bctc, daemon=True).start()
+    return jsonify({"status": "success", "message": f"Đã kích hoạt cào FULL BCTC cho toàn bộ mã. Hãy xem log Render!"})
+
+
+# ===================== CÁC API CÀO NẾN GIÁ =====================
+@app.get("/api/force-history")
+def force_history():
+    global is_full_data_running
+    if is_full_data_running:
+        return jsonify({"status": "error", "message": "Có tiến trình cào dữ liệu đang chạy, vui lòng đợi!"})
+    
+    is_full_data_running = True
+    
+    def _run_history_only():
+        global is_full_data_running
+        try:
+            print("\n[MANUAL-HISTORY] 🚀 Ép cào Nến 30 ngày cho toàn bộ danh sách...", flush=True)
             target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             end_date = datetime.now().strftime("%Y-%m-%d")
             start_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
             
             for i, symbol in enumerate(target_symbols):
-                print(f"  [{i+1}/{len(target_symbols)}] Xử lý tĩnh: {symbol}...", flush=True)
-                
-                # 1. Cào BCTC (Chỉ chạy nếu có tham số ?bctc=true)
-                if force_bctc:
-                    new_bctc = _fetch_bctc_ssi(symbol)
-                    if new_bctc:
-                        new_bctc["symbol"] = symbol
-                        new_bctc["updated_at"] = _now_str()
-                        try:
-                            logger.info(
-                                "[MONGO BCTC WRITE] %s | keys=%s | rows=%s",
-                                symbol,
-                                list(new_bctc.keys()),
-                                {k: len(v) for k, v in new_bctc.items() if isinstance(v, list)}
-                            )
-                            mongo_result = bctc_col.update_one(
-                                {"symbol": symbol}, {"$set": new_bctc}, upsert=True
-                            )
-                            logger.info(
-                                "[MONGO BCTC SUCCESS] %s | matched=%s | modified=%s | upserted_id=%s",
-                                symbol, mongo_result.matched_count,
-                                mongo_result.modified_count, mongo_result.upserted_id
-                            )
-                            print(f"    ✅ [BCTC] {symbol} thành công.", flush=True)
-                        except PyMongoError as e:
-                            log_exception(f"[MONGO BCTC ERROR] Không lưu được BCTC {symbol}", e)
-                        except Exception as e:
-                            log_exception(f"[MONGO BCTC SERIALIZATION ERROR] Dữ liệu BCTC {symbol} không ghi được", e)
-                
-                # 2. Cào Nến 30 ngày (Luôn chạy)
+                print(f"  [{i+1}/{len(target_symbols)}] 📈 Cào Nến: {symbol}...", flush=True)
+                df = _fetch_history_ssi(symbol, start_date, end_date)
+                if df is not None and not df.empty:
+                    new_bars = []
+                    for _, row in df.iterrows():
+                        time_str = row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time'])[:10]
+                        new_bars.append({"time": time_str, "open": float(row['open']), "high": float(row['high']), "low": float(row['low']), "close": float(row['close']), "volume": int(row['volume'])})
+                    for bar in new_bars:
+                        history_col.update_one({"symbol": symbol}, {"$pull": {"history_d1": {"time": bar["time"]}}})
+                    history_col.update_one({"symbol": symbol}, {"$push": {"history_d1": {"$each": new_bars, "$slice": -2500}}}, upsert=True)
+                    doc_hist = history_col.find_one({"symbol": symbol})
+                    if doc_hist and doc_hist.get("history_d1"):
+                        d1_data = sorted(doc_hist["history_d1"], key=lambda x: x["time"])
+                        history_col.update_one({"symbol": symbol}, {"$set": {"history_w1": aggregate_candles(d1_data, 'W1'), "history_mn": aggregate_candles(d1_data, 'MN')}})
+                    print(f"    ✅ [NẾN] {symbol} thành công.", flush=True)
+                time.sleep(1.0)
+            print("[MANUAL-HISTORY] 🏁 Đã cào xong toàn bộ Nến 30 ngày.", flush=True)
+        except Exception as e:
+            log_exception("[MANUAL-HISTORY] Tiến trình gặp lỗi", e)
+        finally:
+            is_full_data_running = False
+
+    threading.Thread(target=_run_history_only, daemon=True).start()
+    return jsonify({"status": "success", "message": f"Đã kích hoạt cào Nến 30 ngày cho toàn bộ mã. Xem log Render!"})
+
+
+@app.get("/api/crawl-full-history")
+def crawl_full_history():
+    global is_full_data_running
+    if is_full_data_running:
+        return jsonify({"status": "error", "message": "Có tiến trình cào dữ liệu đang chạy, vui lòng đợi!"})
+    
+    is_full_data_running = True
+    
+    def _run_history():
+        global is_full_data_running
+        try:
+            print("\n[MANUAL-FULL-HISTORY] 🚀 Ép cào TOÀN BỘ 10 NĂM lịch sử giá...", flush=True)
+            target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d")
+            
+            for i, symbol in enumerate(target_symbols):
+                print(f"  [{i+1}/{len(target_symbols)}] 📈 Cào 10 năm nến: {symbol}...", flush=True)
                 df = _fetch_history_ssi(symbol, start_date, end_date)
                 if df is not None and not df.empty:
                     new_bars = []
@@ -1091,33 +1153,35 @@ def force_full_data():
                         time_str = row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time'])[:10]
                         new_bars.append({"time": time_str, "open": float(row['open']), "high": float(row['high']), "low": float(row['low']), "close": float(row['close']), "volume": int(row['volume'])})
                     
-                    for bar in new_bars:
-                        history_col.update_one({"symbol": symbol}, {"$pull": {"history_d1": {"time": bar["time"]}}})
-                    history_col.update_one({"symbol": symbol}, {"$push": {"history_d1": {"$each": new_bars, "$slice": -2500}}}, upsert=True)
-                    
                     doc_hist = history_col.find_one({"symbol": symbol})
-                    if doc_hist and doc_hist.get("history_d1"):
-                        d1_data = sorted(doc_hist["history_d1"], key=lambda x: x["time"])
-                        history_col.update_one({"symbol": symbol}, {"$set": {"history_w1": aggregate_candles(d1_data, 'W1'), "history_mn": aggregate_candles(d1_data, 'MN')}})
-                    print(f"    ✅ [NẾN] {symbol} thành công.", flush=True)
+                    if doc_hist:
+                        history_col.update_one({"symbol": symbol}, {"$set": {
+                            "history_d1": new_bars,
+                            "history_w1": aggregate_candles(new_bars, 'W1'),
+                            "history_mn": aggregate_candles(new_bars, 'MN')
+                        }})
+                    else:
+                        history_col.insert_one({
+                            "symbol": symbol, "history_d1": new_bars,
+                            "history_w1": aggregate_candles(new_bars, 'W1'),
+                            "history_mn": aggregate_candles(new_bars, 'MN')
+                        })
+                    print(f"    ✅ [NẾN 10 NĂM] {symbol} thành công ({len(new_bars)} phiên).", flush=True)
+                else:
+                    print(f"    ❌ [NẾN 10 NĂM] {symbol} thất bại.", flush=True)
+                time.sleep(1.5)
                 
-                # Nghỉ 3 giây nếu cào BCTC (tránh FHSC rate limit), 1 giây nếu chỉ cào nến
-                time.sleep(3.0 if force_bctc else 1.0) 
-                
-            print(f"[MANUAL] 🏁 Đã cào xong toàn bộ {mode_str}.", flush=True)
+            print("[MANUAL-FULL-HISTORY] 🏁 Đã cào xong toàn bộ lịch sử 10 năm.", flush=True)
         except Exception as e:
-            log_exception("[MANUAL FULL-DATA] Tiến trình thủ công gặp lỗi", e)
+            log_exception("[MANUAL-FULL-HISTORY] Tiến trình gặp lỗi", e)
         finally:
             is_full_data_running = False
 
-    threading.Thread(target=_run_force, daemon=True).start()
-    
-    msg = "cào Nến và BCTC" if force_bctc else "chỉ cào Nến"
-    return jsonify({"status": "success", "message": f"Đã kích hoạt {msg} cho {collection.count_documents({})} mã. Xem log Render để theo dõi!"})
+    threading.Thread(target=_run_history, daemon=True).start()
+    return jsonify({"status": "success", "message": "Đã kích hoạt cào FULL 10 NĂM lịch sử cho toàn bộ mã. Hãy xem Log trên Render!"})
 
 @app.get("/api/force-screener")
 def force_screener():
-    """Ép Server chấm điểm lại Screener ngay lập tức (dành cho việc test)"""
     global is_screener_running
     if is_screener_running:
         return jsonify({"status": "error", "message": "Tiến trình chấm điểm đang chạy, vui lòng đợi!"})
@@ -1168,70 +1232,7 @@ def force_screener():
 
     threading.Thread(target=_run_screener, daemon=True).start()
     return jsonify({"status": "success", "message": "Đã kích hoạt chấm điểm lại Screener. Xem log Render để theo dõi!"})
-@app.get("/api/crawl-full-history")
-def crawl_full_history():
-    """Ép Server cào TOÀN BỘ 10 NĂM lịch sử nến cho tất cả các mã (Dùng khi mới setup DB)"""
-    global is_full_data_running
-    if is_full_data_running:
-        return jsonify({"status": "error", "message": "Tiến trình cào dữ liệu tĩnh đang chạy, vui lòng đợi!"})
-    
-    is_full_data_running = True
-    
-    def _run_history():
-        global is_full_data_running
-        try:
-            print("\n[MANUAL] 🚀 Ép cào TOÀN BỘ 10 NĂM lịch sử giá...", flush=True)
-            target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-            end_date = datetime.now().strftime("%Y-%m-%d")
-            # Lùi lại 10 năm (3650 ngày)
-            start_date = (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d")
-            
-            for i, symbol in enumerate(target_symbols):
-                print(f"  [{i+1}/{len(target_symbols)}] Cào 10 năm nến: {symbol}...", flush=True)
-                
-                df = _fetch_history_ssi(symbol, start_date, end_date)
-                if df is not None and not df.empty:
-                    new_bars = []
-                    for _, row in df.iterrows():
-                        time_str = row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time'])[:10]
-                        new_bars.append({
-                            "time": time_str, 
-                            "open": float(row['open']), 
-                            "high": float(row['high']), 
-                            "low": float(row['low']), 
-                            "close": float(row['close']), 
-                            "volume": int(row['volume'])
-                        })
-                    
-                    # Ghi đè toàn bộ mảng history_d1 bằng dữ liệu 10 năm mới cào
-                    doc_hist = history_col.find_one({"symbol": symbol})
-                    if doc_hist:
-                        history_col.update_one({"symbol": symbol}, {"$set": {
-                            "history_d1": new_bars,
-                            "history_w1": aggregate_candles(new_bars, 'W1'),
-                            "history_mn": aggregate_candles(new_bars, 'MN')
-                        }})
-                    else:
-                        history_col.insert_one({
-                            "symbol": symbol,
-                            "history_d1": new_bars,
-                            "history_w1": aggregate_candles(new_bars, 'W1'),
-                            "history_mn": aggregate_candles(new_bars, 'MN')
-                        })
-                    print(f"    ✅ [NẾN 10 NĂM] {symbol} thành công ({len(new_bars)} phiên).", flush=True)
-                else:
-                    print(f"    ❌ [NẾN 10 NĂM] {symbol} thất bại.", flush=True)
-                
-                time.sleep(1.5) # Nghỉ 1.5s tránh SSI block
-                
-            print("[MANUAL] 🏁 Đã cào xong toàn bộ lịch sử 10 năm cho tất cả các mã.", flush=True)
-        except Exception as e:
-            log_exception("[MANUAL HISTORY] Tiến trình lịch sử 10 năm gặp lỗi", e)
-        finally:
-            is_full_data_running = False
 
-    threading.Thread(target=_run_history, daemon=True).start()
-    return jsonify({"status": "success", "message": "Đã kích hoạt cào 10 năm lịch sử cho toàn bộ mã. Hãy xem Log trên Render!"})
 @app.get("/api/retry-now")
 def retry_now():
     if is_crawling: return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
