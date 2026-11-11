@@ -52,7 +52,7 @@ VOLUME_MULTIPLIER = 10
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
-# Khởi tạo SSI Config (Đã thêm Private Key)
+# Khởi tạo SSI Config
 ssi_config = Config(
     client_id=SSI_CONSUMER_ID,
     api_key=SSI_CONSUMER_ID,
@@ -149,6 +149,7 @@ def _is_after_15h() -> bool:
     vn_time = datetime.utcnow() + timedelta(hours=7)
     return vn_time.hour >= 15
 
+# ===================== FETCH DATA TỪ SSI =====================
 def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
     """Lấy dữ liệu OHLCV từ SSI FastConnect Data API"""
     import random
@@ -158,33 +159,35 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
             with Auth(ssi_config) as auth:
                 auth.authenticate()
                 with Data(auth) as data:
-                    today = datetime.now().strftime("%Y-%m-%d")
-                    past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+                    # SỬA ĐỔI: Dùng định dạng ngày YYYY/MM/DD theo đúng tài liệu SSI
+                    today = datetime.now().strftime("%Y/%m/%d")
+                    past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y/%m/%d")
                     
-                    response = data.market_data.get_daily_ohlc(
+                    # SỬA ĐỔI: Dùng đúng tên hàm get_ohlc_1day_historical
+                    response = data.market_data.get_ohlc_1day_historical(
                         symbol=symbol,
                         from_date=past_7d,
-                        to_date=today,
-                        page_index=1,
-                        page_size=10
+                        to_date=today
                     )
                     
-                    if response is None or response.get("status") != "Success":
+                    if not response:
                         return None
                     
-                    data_list = response.get("data", [])
+                    data_list = response if isinstance(response, list) else response.get("data", [])
                     if not data_list:
                         return None
                     
                     latest = data_list[-1]
+                    # SSI SDK trả về key viết thường (open, high, low, close, volume)
                     return {
-                        "close": float(latest.get("Close", 0)),
-                        "open": float(latest.get("Open", 0)),
-                        "high": float(latest.get("High", 0)),
-                        "low": float(latest.get("Low", 0)),
-                        "volume": int(float(latest.get("Volume", 0)))
+                        "close": float(latest.get("close", 0)),
+                        "open": float(latest.get("open", 0)),
+                        "high": float(latest.get("high", 0)),
+                        "low": float(latest.get("low", 0)),
+                        "volume": int(float(latest.get("volume", 0)))
                     }
-        except Exception:
+        except Exception as e:
+            print(f"[SSI] {symbol}: Lỗi chi tiết - {e}", flush=True)
             return None
 
     for attempt in range(retries):
