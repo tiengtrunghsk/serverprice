@@ -159,11 +159,10 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
             with Auth(ssi_config) as auth:
                 auth.authenticate()
                 with Data(auth) as data:
-                    # SỬA ĐỔI: Dùng định dạng ngày YYYY/MM/DD theo đúng tài liệu SSI
+                    # Định dạng ngày YYYY/MM/DD theo đúng tài liệu SSI
                     today = datetime.now().strftime("%Y/%m/%d")
                     past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y/%m/%d")
                     
-                    # SỬA ĐỔI: Dùng đúng tên hàm get_ohlc_1day_historical
                     response = data.market_data.get_ohlc_1day_historical(
                         symbol=symbol,
                         from_date=past_7d,
@@ -178,13 +177,15 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
                         return None
                     
                     latest = data_list[-1]
-                    # SSI SDK trả về key viết thường (open, high, low, close, volume)
+                    
+                    # SỬA LỖI: Dùng getattr để lấy dữ liệu từ object OHLCData
+                    # Hỗ trợ cả trường hợp key viết hoa và viết thường
                     return {
-                        "close": float(latest.get("close", 0)),
-                        "open": float(latest.get("open", 0)),
-                        "high": float(latest.get("high", 0)),
-                        "low": float(latest.get("low", 0)),
-                        "volume": int(float(latest.get("volume", 0)))
+                        "close": float(getattr(latest, "close", getattr(latest, "Close", 0))),
+                        "open": float(getattr(latest, "open", getattr(latest, "Open", 0))),
+                        "high": float(getattr(latest, "high", getattr(latest, "High", 0))),
+                        "low": float(getattr(latest, "low", getattr(latest, "Low", 0))),
+                        "volume": int(float(getattr(latest, "volume", getattr(latest, "Volume", 0))))
                     }
         except Exception as e:
             print(f"[SSI] {symbol}: Lỗi chi tiết - {e}", flush=True)
