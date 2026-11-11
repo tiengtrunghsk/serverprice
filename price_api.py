@@ -254,6 +254,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     global is_crawling, LAST_TELEGRAM_TIME
     if is_crawling: return
     is_crawling = True
+    print(f"\n[CRAWL] 🚀 [{'CÀO BÙ' if is_retry else ('CÀO TAY' if is_manual else 'REAL-TIME')}] Bắt đầu xử lý {len(symbols)} mã...", flush=True)
     try:
         trading_date = _get_trading_date_str()
         alert_batch, pending_history_files = [], {}
