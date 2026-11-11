@@ -14,6 +14,9 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
+# ===================== VNSTOCK SDK =====================
+from vnstock import Trading
+
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 if not MONGO_URI:
@@ -106,7 +109,7 @@ LAST_CRAWL_START_TIME = 0
 LAST_CRAWL_TIME = {}
 LAST_ALERT_BATCH = []
 LAST_GITHUB_WRITE_TIME = 0
-LAST_TELEGRAM_TIME = 0
+LAST_TELEGRAM_TIME = 0 
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
@@ -130,37 +133,39 @@ def _is_after_15h() -> bool:
     vn_time = datetime.utcnow() + timedelta(hours=7)
     return vn_time.hour >= 15
 
-# ===================== FETCH DATA TỪ VPS API =====================
+# ===================== FETCH DATA TỪ VNSTOCK =====================
 def _fetch_bulk_prices(symbols: list) -> dict:
-    """Lấy giá realtime của toàn bộ mã trong 1 request duy nhất"""
+    """Lấy giá realtime của toàn bộ mã trong 1 request duy nhất bằng Vnstock"""
     result = {}
     try:
-        # API bảng giá của VPS
-        url = "https://bgapidatafeed.vps.com.vn/getliststockdata"
-        res = requests.get(url, timeout=10)
-        if res.status_code != 200:
-            print(f"[VPS] Lỗi HTTP {res.status_code}", flush=True)
-            return result
-            
-        data_list = res.json()
-        if not isinstance(data_list, list):
+        # Sử dụng nguồn KBS hoặc VCI để lấy bảng giá realtime
+        # Vnstock hỗ trợ lấy nhiều mã cùng lúc qua price_board
+        trading = Trading(source="KBS", symbol="VCI") 
+        
+        # Lấy bảng giá cho tất cả các mã
+        board = trading.price_board(symbols_list=symbols)
+        
+        if board is None or board.empty:
+            print("[VNSTOCK] Bảng giá trả về rỗng.", flush=True)
             return result
 
-        for item in data_list:
-            sym = item.get("sym")
-            if sym not in symbols:
+        # Duyệt qua từng dòng trong DataFrame
+        for _, row in board.iterrows():
+            sym = row.get('symbol')
+            if not sym or sym not in symbols:
                 continue
                 
-            close = float(item.get("lastPrice", 0) or 0)
-            open_p = float(item.get("openPrice", 0) or 0)
-            high = float(item.get("highPrice", 0) or 0)
-            low = float(item.get("lowPrice", 0) or 0)
-            vol = int(item.get("lot", 0) or 0) * 10 # VPS trả về lot (1 lot = 10 cp)
+            # Vnstock trả về giá đã nhân 1000 (ví dụ 25.5 là 25,500 VND)
+            close = float(row.get('close_price', 0) or 0)
+            open_p = float(row.get('open_price', 0) or 0)
+            high = float(row.get('high_price', 0) or 0)
+            low = float(row.get('low_price', 0) or 0)
+            vol = int(row.get('volume_accumulated', 0) or 0)
             
             if close <= 0 or open_p <= 0:
                 continue
 
-            # Chuẩn hóa giá
+            # Chuẩn hóa giá (nếu Vnstock trả về giá gốc, không chia 1000)
             if close >= 1000:
                 close /= 1000.0
                 open_p /= 1000.0
@@ -179,7 +184,7 @@ def _fetch_bulk_prices(symbols: list) -> dict:
                 "volume": int(vol)
             }
     except Exception as e:
-        print(f"[VPS] Lỗi fetch bulk: {e}", flush=True)
+        print(f"[VNSTOCK] Lỗi fetch bulk: {e}", flush=True)
     
     return result
 
@@ -549,7 +554,7 @@ def auto_crawler_worker():
             if not is_crawling:
                 threading.Thread(target=_execute_crawl, args=(symbols_to_crawl, False, False), daemon=True).start()
             
-            time.sleep(5) # 5 giây cập nhật 1 lần (có thể giảm xuống 2-3s nếu muốn nhanh hơn)
+            time.sleep(5) # 5 giây cập nhật 1 lần
 
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
