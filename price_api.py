@@ -414,7 +414,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     finally:
         is_crawling = False
 
-# ===================== BACKGROUND WORKER =====================
+# ===================== BACKGROUND WORKER (ĐÃ TỐI ƯU) =====================
 def auto_crawler_worker():
     print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu (Rolling Crawl) - Cập nhật liên tục!", flush=True)
     
@@ -425,6 +425,7 @@ def auto_crawler_worker():
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
             
+            # Chỉ chạy trong giờ giao dịch
             is_market_open = (9 <= vn_now.hour < 15) or (vn_now.hour == 15 and vn_now.minute == 0)
             if not is_market_open:
                 time.sleep(60)
@@ -440,6 +441,7 @@ def auto_crawler_worker():
                 symbols_to_crawl.append(sym)
             
             if not symbols_to_crawl:
+                print("💤 [AUTO] Đã cào xong toàn bộ danh sách. Nghỉ ngơi 30s...", flush=True)
                 time.sleep(30)
                 continue
 
@@ -447,13 +449,22 @@ def auto_crawler_worker():
             chunks = [symbols_to_crawl[i:i + CHUNK_SIZE] for i in range(0, len(symbols_to_crawl), CHUNK_SIZE)]
             
             for chunk in chunks:
-                if is_crawling:
+                # Nếu có tiến trình cào đang chạy, đợi nó xong
+                while is_crawling:
                     time.sleep(2)
-                    continue
 
-                threading.Thread(target=_execute_crawl, args=(chunk, False, False), daemon=True).start()
-                time.sleep(3)
+                # Tạo một luồng riêng cho chunk này
+                t = threading.Thread(target=_execute_crawl, args=(chunk, False, False), daemon=True)
+                t.start()
+                
+                # QUAN TRỌNG: Đợi luồng này chạy xong hẳn mới chạy chunk tiếp theo
+                while t.is_alive():
+                    time.sleep(1)
+                
+                # Nghỉ 2 giây giữa các lần cào chunk để tránh bị SSI block IP
+                time.sleep(2)
 
+            # Sau khi cào xong toàn bộ danh sách, nghỉ 60s trước khi bắt đầu vòng lặp mới
             if vn_now.hour >= 15:
                 time.sleep(60)
 
