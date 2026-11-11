@@ -103,13 +103,8 @@ LAST_TELEGRAM_TIME = 0
 
 # ===================== HELPERS =====================
 def _now_str() -> str:
+    """Trả về giờ hiện tại thực tế (VN)"""
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
-
-def _get_current_update_time() -> str:
-    vn_now = datetime.utcnow() + timedelta(hours=7)
-    if vn_now.hour >= 15:
-        return vn_now.replace(hour=15, minute=0, second=0).strftime("%d/%m/%Y %H:%M:%S")
-    return vn_now.strftime("%d/%m/%Y %H:%M:%S")
 
 def _get_trading_date_str() -> str:
     vn_now = datetime.utcnow() + timedelta(hours=7)
@@ -206,7 +201,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     if is_crawling: return
     is_crawling = True
     try:
-        now_str = _now_str()
         trading_date = _get_trading_date_str()
         mode_str = "CÀO BÙ" if is_retry else ("CÀO TAY" if is_manual else "REAL-TIME")
         
@@ -217,6 +211,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         pending_history_files = {}
         need_update_screener = False
 
+        # Chia lô 5 mã
         for chunk_idx in range(0, len(symbols), 5):
             chunk = symbols[chunk_idx:chunk_idx+5]
             for sym in chunk:
@@ -255,9 +250,10 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
 
                     all_crawled_data[sym] = {"close": data["close"], "pct_change": pct_change}
 
-                    real_time_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
-                    update_time = _get_current_update_time()
+                    # Lấy giờ thực tế hiện tại
+                    real_time_str = _now_str()
 
+                    # Cập nhật Database (updated_at chính là giờ thực tế)
                     collection.update_one(
                         {"symbol": sym},
                         {"$set": {
@@ -266,14 +262,14 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             "amplitude_percent": amplitude_percent, "volume_percent": volume_percent,
                             "avg_volume_20": round(avg_volume_20, 2),
                             "trading_date": trading_date, 
-                            "updated_at": update_time,
-                            "crawled_at": real_time_str,
+                            "updated_at": real_time_str, # <-- Ghi giờ thực tế vào đây luôn
                             "is_locked": _is_after_15h(), "is_incomplete": False
                         }}, upsert=True
                     )
                     LAST_CRAWL_TIME[sym] = time.time()
                     
-                    print(f"  ✅ [OK] {sym}: {data['close']:,} (Cào lúc: {real_time_str})", flush=True)
+                    # LOG CHI TIẾT
+                    print(f"  ✅ [OK] {sym}: Giá {data['close']:,} | KL: {data['volume']:,} | Vol%: {volume_percent}% (Lúc: {real_time_str})", flush=True)
                     
                     if prev_close > 0 and abs(pct_change) >= 3.0 and volume_percent >= 120.0:
                         alert_batch.append({
@@ -295,10 +291,11 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         need_update_screener = True
                 else:
                     print(f"  ❌ [LỖI] {sym}: Không lấy được dữ liệu.", flush=True)
-                    collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": now_str}}, upsert=True)
+                    collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": _now_str()}}, upsert=True)
 
-            time.sleep(1)
+            time.sleep(1) # Nghỉ 1 giây sau mỗi lô 5 mã
 
+        # ĐẨY GITHUB 1 LẦN NẾU ĐÃ QUA 15H
         if _is_after_15h() and pending_history_files:
             print(f"\n[GITHUB] 📦 Đẩy {len(pending_history_files)} file...", flush=True)
             if need_update_screener and all_crawled_data:
@@ -333,23 +330,43 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         is_crawling = False
         print("[CRAWL] 🏁 Đã kết thúc đợt cào.\n", flush=True)
 
-# ===================== BACKGROUND WORKER =====================
+# ===================== BACKGROUND WORKER (TỐI ƯU NGHỈ ĐÊM) =====================
 def auto_crawler_worker():
-    print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu Real-time!", flush=True)
+    print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu Real-time (tự ngủ sau 15h)!", flush=True)
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
+            current_hour = vn_now.hour
             
-            collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
+            # 1. QUA NGÀY MỚI: Xóa cờ chốt sổ của hôm qua
+            collection.update_many(
+                {"chot_so_today": {"$ne": today_str}}, 
+                {"$unset": {"chot_so_today": "", "is_locked": ""}}
+            )
 
+            # 2. KIỂM TRA XEM ĐÃ CÀO XONG TOÀN BỘ CHƯA (Để cho ngủ đêm)
+            all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+            total_symbols = len(all_symbols)
+            crawled_count = collection.count_documents({"chot_so_today": today_str})
+
+            # NẾU ĐÃ QUA 15H VÀ ĐÃ CÀO ĐỦ 100% MÃ -> NGỦ ĐẾN 8H55 SÁNG MAI
+            if current_hour >= 15 and crawled_count >= total_symbols:
+                tomorrow = vn_now + timedelta(days=1)
+                wake_up_time = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
+                sleep_seconds = (wake_up_time - vn_now).total_seconds()
+                
+                if sleep_seconds > 0:
+                    print(f"🌙 [AUTO] Đã chốt sổ xong {crawled_count}/{total_symbols} mã. Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
+                    time.sleep(min(sleep_seconds, 3600)) 
+                    continue
+
+            # 3. NẾU CHƯA ĐỦ MÃ (HOẶC ĐANG TRONG GIỜ GIAO DỊCH) -> TIẾP TỤC CÀO
             if not is_crawling:
-                all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
                 symbols_to_crawl = []
                 for sym in all_symbols:
-                    doc = collection.find_one({"symbol": sym}, {"trading_date": 1, "chot_so_today": 1})
-                    if doc.get("chot_so_today") == today_str: continue
-                    if doc.get("trading_date") != today_str:
+                    doc = collection.find_one({"symbol": sym}, {"chot_so_today": 1})
+                    if not doc or doc.get("chot_so_today") != today_str:
                         symbols_to_crawl.append(sym)
                 
                 if not symbols_to_crawl:
@@ -357,7 +374,8 @@ def auto_crawler_worker():
                 
                 _execute_crawl(symbols_to_crawl, is_manual=False)
 
-            time.sleep(15)
+            time.sleep(15) # Nghỉ 15s trước khi bắt đầu vòng quét tiếp theo
+            
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
