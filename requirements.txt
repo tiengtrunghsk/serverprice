@@ -5,3 +5,4 @@ gunicorn
 httpx
 pymongo
 requests
+vnstock
