@@ -258,10 +258,12 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
     return None
 
 
+
 def _fetch_bctc_ssi(symbol: str):
     """
     Lấy BCTC theo API Vnstock 6.
-    Mỗi báo cáo được gọi độc lập để lỗi một báo cáo không làm mất báo cáo còn lại.
+    Mỗi báo cáo được gọi độc lập để lỗi một báo cáo
+    không làm mất dữ liệu của các báo cáo còn lại.
     """
     symbol = str(symbol).upper().strip()
     started = time.time()
@@ -272,110 +274,160 @@ def _fetch_bctc_ssi(symbol: str):
     try:
         try:
             import vnstock
-            logger.info("[BCTC VERSION] vnstock=%s", getattr(vnstock, "__version__", "không xác định"))
+            logger.info(
+                "[BCTC VERSION] vnstock=%s",
+                getattr(vnstock, "__version__", "không xác định")
+            )
         except Exception as e:
-            logger.warning("[BCTC VERSION] Không đọc được phiên bản vnstock: %s", e)
+            logger.warning(
+                "[BCTC VERSION] Không đọc được phiên bản vnstock: %s", e
+            )
 
-        logger.info("[BCTC INIT] Khởi tạo Fundamental().equity(%s)", symbol)
+        logger.info(
+            "[BCTC INIT] Khởi tạo Fundamental().equity(%s)", symbol
+        )
+
         equity = Fundamental().equity(symbol)
         logger.info("[BCTC INIT SUCCESS] %s", symbol)
 
         reports = {}
-        report_names = ("balance_sheet", "income_statement", "cash_flow")
+
+        report_names = (
+            "balance_sheet",
+            "income_statement",
+            "cash_flow"
+        )
 
         for report_name in report_names:
             report_started = time.time()
-            logger.info("[BCTC REQUEST] %s | %s | period=quarter | source=fhsc",
-                        symbol, report_name)
+
+            logger.info(
+                "[BCTC REQUEST] %s | %s | period=quarter | source=fhsc",
+                symbol, report_name
+            )
 
             try:
                 report_func = getattr(equity, report_name, None)
+
                 if not callable(report_func):
                     logger.error(
-                        "[BCTC UNSUPPORTED] %s | Không tìm thấy phương thức equity.%s()",
+                        "[BCTC UNSUPPORTED] %s | "
+                        "Không tìm thấy equity.%s()",
                         symbol, report_name
                     )
                     continue
 
-                df = report_func(period="quarter", source="fhsc")
+                # Gọi từng báo cáo riêng biệt
+                df = report_func(
+                    period="quarter",
+                    source="fhsc"
+                )
+
                 elapsed = round(time.time() - report_started, 2)
 
                 if df is None:
-                    logger.warning("[BCTC EMPTY] %s | %s trả về None | %.2fs",
-                                   symbol, report_name, elapsed)
+                    logger.warning(
+                        "[BCTC EMPTY] %s | %s trả về None | %.2fs",
+                        symbol, report_name, elapsed
+                    )
                     continue
 
                 if not isinstance(df, pd.DataFrame):
                     logger.warning(
-                        "[BCTC TYPE] %s | %s trả về kiểu %s, không phải DataFrame",
+                        "[BCTC TYPE] %s | %s trả về kiểu %s",
                         symbol, report_name, type(df).__name__
                     )
                     continue
 
                 if df.empty:
-                    logger.warning("[BCTC EMPTY] %s | %s DataFrame rỗng | %.2fs",
-                                   symbol, report_name, elapsed)
+                    logger.warning(
+                        "[BCTC EMPTY] %s | %s DataFrame rỗng | %.2fs",
+                        symbol, report_name, elapsed
+                    )
                     continue
 
-                # Chuyển NaN/NaT thành None trước khi chuyển sang MongoDB.
-                clean_df = df.astype(object).where(pd.notna(df), None)
+                # Làm sạch NaN / NaT
+                clean_df = df.astype(object).where(
+                    pd.notna(df), None
+                )
+
                 records = clean_df.to_dict(orient="records")
-                # Chuẩn hóa Timestamp/numpy types để dữ liệu có thể JSON serialize.
-                records = json.loads(json.dumps(records, ensure_ascii=False, default=str))
+
+                # Chuẩn hóa Timestamp và numpy types
+                records = json.loads(
+                    json.dumps(
+                        records,
+                        ensure_ascii=False,
+                        default=str
+                    )
+                )
+
                 reports[report_name] = records
 
                 logger.info(
-                    "[BCTC SUCCESS] %s | %s | rows=%s | columns=%s | elapsed=%ss",
-                    symbol, report_name, len(records), list(df.columns), elapsed
+                    "[BCTC SUCCESS] %s | %s | rows=%s | "
+                    "columns=%s | elapsed=%ss",
+                    symbol,
+                    report_name,
+                    len(records),
+                    list(df.columns),
+                    elapsed
                 )
+
                 if records:
-                    logger.info("[BCTC SAMPLE] %s | %s | %s",
-                                symbol, report_name,
-                                json.dumps(records[0], ensure_ascii=False, default=str)[:1200])
+                    logger.info(
+                        "[BCTC SAMPLE] %s | %s | %s",
+                        symbol,
+                        report_name,
+                        json.dumps(
+                            records[0],
+                            ensure_ascii=False,
+                            default=str
+                        )[:1200]
+                    )
 
             except Exception as e:
                 log_exception(
-                    f"[BCTC REPORT ERROR] {symbol} | {report_name} | source=fhsc",
+                    f"[BCTC REPORT ERROR] {symbol} | "
+                    f"{report_name} | source=fhsc",
                     e
                 )
                 continue
 
-        # Vnstock 6 có thể không cung cấp ratio() tùy phiên bản/source.
-        # Giữ thử nghiệm tương thích để log rõ nếu phương thức không tồn tại.
-        ratio_method = getattr(equity, "ratio", None)
-        if callable(ratio_method):
-            logger.info("[BCTC REQUEST] %s | ratios | thử gọi equity.ratio()", symbol)
-            try:
-                ratio_df = ratio_method()
-                if ratio_df is not None and isinstance(ratio_df, pd.DataFrame) and not ratio_df.empty:
-                    clean_ratio = ratio_df.astype(object).where(pd.notna(ratio_df), None)
-                    ratio_records = clean_ratio.to_dict(orient="records")
-                    reports["ratios"] = json.loads(
-                        json.dumps(ratio_records, ensure_ascii=False, default=str)
-                    )
-                    logger.info("[BCTC SUCCESS] %s | ratios | rows=%s | columns=%s",
-                                symbol, len(ratio_records), list(ratio_df.columns))
-                else:
-                    logger.warning("[BCTC EMPTY] %s | ratios không có dữ liệu.", symbol)
-            except Exception as e:
-                log_exception(f"[BCTC RATIO ERROR] {symbol} | equity.ratio()", e)
-        else:
-            logger.warning("[BCTC UNSUPPORTED] %s | phiên bản Vnstock này không có equity.ratio().", symbol)
+        # Không gọi equity.ratio() vì Vnstock 6 yêu cầu
+        # nguồn riêng cho dữ liệu tỷ số tài chính.
+        # Ba báo cáo BCTC chính vẫn được xử lý độc lập.
 
         elapsed_total = round(time.time() - started, 2)
-        summary = {name: len(rows) for name, rows in reports.items()}
+
+        summary = {
+            name: len(rows)
+            for name, rows in reports.items()
+        }
+
         if reports:
-            logger.info("[BCTC COMPLETE] %s | reports=%s | elapsed=%ss",
-                        symbol, summary, elapsed_total)
+            logger.info(
+                "[BCTC COMPLETE] %s | reports=%s | elapsed=%ss",
+                symbol, summary, elapsed_total
+            )
             return reports
 
-        logger.error("[BCTC FAILED] %s | Không lấy được báo cáo nào | elapsed=%ss",
-                     symbol, elapsed_total)
+        logger.error(
+            "[BCTC FAILED] %s | Không lấy được báo cáo nào | "
+            "elapsed=%ss",
+            symbol, elapsed_total
+        )
+
         return None
 
     except Exception as e:
-        log_exception(f"[BCTC FATAL ERROR] {symbol} | Lỗi khởi tạo/xử lý BCTC", e)
+        log_exception(
+            f"[BCTC FATAL ERROR] {symbol} | "
+            "Lỗi khởi tạo/xử lý BCTC",
+            e
+        )
         return None
+
     finally:
         logger.info("[BCTC END] %s", symbol)
 
