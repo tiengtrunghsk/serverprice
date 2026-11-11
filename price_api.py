@@ -72,6 +72,7 @@ AI_MODEL_NAME = "qwen3.7-max"
 AI_TEMPERATURE = 0.15
 
 # ===================== DATABASE =====================
+logger.info("Đang kết nối MongoDB...")
 try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000, socketTimeoutMS=20000, appname="price_api")
     mongo_client.admin.command("ping")
@@ -127,6 +128,50 @@ def send_telegram(message: str):
     try: requests.post(url, json=payload, timeout=10)
     except Exception as e: log_exception("[TELEGRAM]", e)
 
+# ===================== HÀM TÍNH CAGR & GIÁ TRUNG BÌNH QUÝ (5 NĂM) =====================
+def get_historical_return_rate_with_details(symbol):
+    try:
+        hist_data = history_col.find_one({"symbol": symbol})
+        if not hist_data or not hist_data.get("history_d1"):
+            return None
+            
+        history_bars = hist_data["history_d1"]
+        if len(history_bars) < 30:
+            return None
+            
+        df = pd.DataFrame(history_bars)
+        df['date'] = pd.to_datetime(df['time'])
+        df = df.sort_values('date')
+        
+        max_date = df['date'].max()
+        cutoff_date = max_date - pd.DateOffset(years=5)
+        df_5years = df.loc[df['date'] >= cutoff_date].copy()
+        
+        if len(df_5years) < 30: return None
+            
+        df_5years['year_quarter'] = df_5years['date'].dt.to_period('Q')
+        df_quarterly = df_5years.groupby('year_quarter').agg({'close': 'mean', 'date': 'first'}).reset_index()
+        
+        if len(df_quarterly) < 2: return None
+            
+        start_row, end_row = df_quarterly.iloc[0], df_quarterly.iloc[-1]
+        days = (end_row['date'] - start_row['date']).days
+        if days < 30: return None
+            
+        years = days / 365.25
+        cagr = (end_row['close'] / start_row['close']) ** (1 / years) - 1
+        cagr = max(-0.5, min(cagr, 1.0))
+        
+        return {
+            "annual_rate_percent": round(cagr * 100, 2),
+            "start_quarter": str(start_row['year_quarter']),
+            "start_price_mean": round(start_row['close'], 2),
+            "end_quarter": str(end_row['year_quarter']),
+            "end_price_mean": round(end_row['close'], 2)
+        }
+    except Exception as e:
+        return None
+
 # ===================== CÀO GIÁ =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
     def _do():
@@ -156,7 +201,7 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
         return df if df is not None and not df.empty else None
     except Exception: return None
 
-# ===================== CÀO BCTC =====================
+# ===================== CÀO BCTC (CẬP NHẬT NGÀY THÁNG) =====================
 def _fetch_bctc_ssi(symbol: str):
     symbol = str(symbol).upper().strip()
     fhsc_key = get_current_fhsc_key()
@@ -178,6 +223,7 @@ def _fetch_bctc_ssi(symbol: str):
                     else: raise e
             return None
 
+        latest_period = "Chưa xác định"
         for report_name in report_names:
             try:
                 report_func = getattr(equity, report_name, None)
@@ -186,8 +232,19 @@ def _fetch_bctc_ssi(symbol: str):
                 time.sleep(1.5) 
                 if df is not None and not df.empty:
                     clean_df = df.astype(object).where(pd.notna(df), None)
-                    reports[report_name] = json.loads(json.dumps(clean_df.to_dict(orient="records"), ensure_ascii=False, default=str))
+                    records = clean_df.to_dict(orient="records")
+                    
+                    if records and latest_period == "Chưa xác định":
+                        try:
+                            first_record = records[0]
+                            y, q = first_record.get("year"), first_record.get("quarter")
+                            if y and q: latest_period = f"Q{q}/{y}"
+                        except: pass
+                            
+                    reports[report_name] = json.loads(json.dumps(records, ensure_ascii=False, default=str))
             except Exception: pass
+            
+        if reports: reports["latest_period"] = latest_period 
         return reports if reports else None
     except Exception: return None
 
@@ -501,8 +558,11 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     tech_score = int(np.clip(int(round((tech_score_raw / 100.0) * 20)), 0, 20))
     total_score = fund_score + val_score + tech_score
     potential_zone = "VÙNG TÍCH SẢN TỐI ƯU (A+)" if total_score >= 75 else ("VÙNG MUA AN TOÀN (B)" if total_score >= 60 else "THEO DÕI THÊM")
+    
     fv = compute_fair_value_zone(symbol, nd, sector_median, config, group_label)
     decision, color, reason = compute_final_decision(fund_score, tech_score, val_score, total_score, fv["verdict"], cfo_latest, net_profit_ttm, roe, debt_to_equity, fv["discount_to_fair_pct"], close_price, fv["fair_high"], fv["fair_low"])
+
+    sim_data = get_historical_return_rate_with_details(symbol)
 
     return {
         "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
@@ -514,6 +574,12 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "margin_of_safety_pct": fv["mos_pct"], "fair_value_methods": fv["methods"], "fair_value_rationale": fv["rationale"],
         "discount_to_fair_pct": fv["discount_to_fair_pct"], "valuation_verdict": fv["verdict"], "final_decision": decision,
         "final_decision_color": color, "final_decision_reason": reason,
+        
+        "sim_annual_rate": sim_data["annual_rate_percent"] if sim_data else 15.0,
+        "sim_start_quarter": sim_data["start_quarter"] if sim_data else "",
+        "sim_start_price": sim_data["start_price_mean"] if sim_data else 0,
+        "sim_end_quarter": sim_data["end_quarter"] if sim_data else "",
+        "sim_end_price": sim_data["end_price_mean"] if sim_data else 0
     }
 
 def aggregate_candles(data, interval):
@@ -527,7 +593,7 @@ def aggregate_candles(data, interval):
             groups[key]['high'] = max(groups[key]['high'], bar['high']); groups[key]['low'] = min(groups[key]['low'], bar['low']); groups[key]['close'] = bar['close']; groups[key]['volume'] += bar['volume']
     return sorted(list(groups.values()), key=lambda x: x['time'])
 
-# ===================== AI =====================
+# ===================== AI & CẢNH BÁO BCTC CŨ =====================
 SECTOR_NAMES = {"NGAN_HANG": "Ngân hàng", "CHUNG_KHOAN": "Chứng khoán", "BAT_DONG_SAN": "Bất động sản", "CONG_NGHE_BAN_LE": "Công nghệ & Bán lẻ", "DIEN_NUOC_HA_TANG": "Điện, Nước & Hạ tầng", "NGUYEN_VAT_LIEU_CHU_KY": "Vật liệu & Chu kỳ", "SAN_XUAT_TIEU_DUNG_PHONG_THU": "Sản xuất & Tiêu dùng"}
 DECISION_TO_RECOMMENDATION = {"🎯 MUA MẠNH": ("MUA MẠNH", "Tỷ trọng 20-30%"), "✅ MUA TÍCH SẢN": ("MUA TÍCH SẢN", "Tỷ trọng 10-15%"), "⚠️ CHỜ VỀ VÙNG MUA": ("CHỜ VỀ VÙNG MUA", "Tỷ trọng 0%"), "⏳ CHỜ XÁC NHẬN KỸ THUẬT": ("CHỜ XÁC NHẬN KỸ THUẬT", "Tỷ trọng 0%"), "❌ TRÁNH": ("TRÁNH", "Tỷ trọng 0%"), "👀 THEO DÕI": ("NẮM GIỮ / THEO DÕI", "Tỷ trọng 0%")}
 
@@ -546,7 +612,7 @@ def build_verified_facts(symbol, sm, si, sector):
     ]
     return "\n".join(lines)
 
-# ===================== BACKGROUND =====================
+# ===================== BACKGROUND WORKERS =====================
 def auto_crawler_worker():
     while True:
         try:
@@ -636,6 +702,10 @@ threading.Thread(target=screener_worker, daemon=True).start()
 @app.get("/")
 def home(): return "API is running!", 200
 
+@app.get("/api/status")
+def api_status():
+    return jsonify({"status": "success", "is_crawling": is_crawling, "message": "Đang cào real-time" if is_crawling else "Sẵn sàng"})
+
 @app.post("/api/set-fhsc-key")
 def api_set_fhsc_key():
     data = request.json
@@ -662,15 +732,36 @@ def api_ai_analyze():
     try:
         sm = collection.find_one({"symbol": symbol}, {"_id": 0})
         si = screener_col.find_one({"symbol": symbol}, {"_id": 0})
+        bctc_doc = bctc_col.find_one({"symbol": symbol}, {"_id": 0})
+        
         if not sm or not si: return jsonify({"status": "error", "message": "Chưa đủ dữ liệu"}), 404
+        
+        bctc_warning = ""
+        bctc_period = "Không rõ"
+        bctc_updated_at = "Chưa cào"
+        
+        if bctc_doc:
+            bctc_updated_at = bctc_doc.get("updated_at", "Chưa cào")
+            bctc_period = bctc_doc.get("latest_period", "Không rõ")
+            try:
+                last_update_date = datetime.strptime(bctc_updated_at, "%d/%m/%Y %H:%M:%S")
+                if (datetime.utcnow() - last_update_date).days > 45:
+                    bctc_warning = f"⚠️ CẢNH BÁO: BCTC đã cũ, kỳ mới nhất là {bctc_period}, cào lúc {bctc_updated_at}. Hãy cào lại BCTC!"
+            except:
+                bctc_warning = "⚠️ CẢNH BÁO: Không xác định được ngày cào BCTC."
+
         sector = si.get("sector", "SAN_XUAT_TIEU_DUNG_PHONG_THU")
         rec_text, rec_weight = DECISION_TO_RECOMMENDATION.get(si.get("final_decision"), ("THEO DÕI", "0%"))
-        prompt = f"Phân tích cổ phiếu {symbol} dựa trên dữ kiện:\n{build_verified_facts(symbol, sm, si, sector)}\nHướng dẫn: {get_sector_guidance(sector)}\nKHUYẾN NGHỊ BẮT BUỘC: '{rec_text} — {rec_weight}'.\nTrả về JSON thuần (không markdown):\n{{ \"bctc\": \"...\", \"catalyst\": \"...\", \"risks\": \"...\", \"valuation_verdict\": \"{si.get('valuation_verdict')}\", \"outlook\": \"...\", \"recommendation\": \"{rec_text} — {rec_weight}\", \"price_zone\": \"...\", \"macro_view\": \"...\" }}"
+        warning_text = f"\nLƯU Ý DỮ LIỆU: {bctc_warning}" if bctc_warning else ""
+        
+        prompt = f"Phân tích cổ phiếu {symbol} dựa trên dữ kiện:\n{build_verified_facts(symbol, sm, si, sector)}\nKỳ BCTC mới nhất: {bctc_period}\nHướng dẫn: {get_sector_guidance(sector)}\n{warning_text}\nKHUYẾN NGHỊ BẮT BUỘC: '{rec_text} — {rec_weight}'.\nTrả về JSON thuần (không markdown):\n{{ \"bctc\": \"...\", \"catalyst\": \"...\", \"risks\": \"...\", \"valuation_verdict\": \"{si.get('valuation_verdict')}\", \"outlook\": \"...\", \"recommendation\": \"{rec_text} — {rec_weight}\", \"price_zone\": \"...\", \"macro_view\": \"...\" }}"
+        
         res = requests.post(AI_API_URL, headers={"Authorization": f"Bearer {ALIBABA_API_KEY}"}, json={"model": AI_MODEL_NAME, "messages": [{"role": "user", "content": prompt}], "temperature": AI_TEMPERATURE}, timeout=60)
         if res.status_code == 200:
             content = re.sub(r"```json\s*|```\s*", "", res.json()["choices"][0]["message"]["content"].strip())
             parsed = json.loads(content)
             collection.update_one({"symbol": symbol}, {"$set": {"ai_bctc": parsed.get("bctc", ""), "ai_catalyst": parsed.get("catalyst", ""), "ai_risks": parsed.get("risks", ""), "ai_outlook": parsed.get("outlook", ""), "ai_recommendation": parsed.get("recommendation", ""), "ai_macro_view": parsed.get("macro_view", ""), "ai_updated_at": _now_str()}})
+            
             gh_data, _ = get_github_file_data(SCREENER_JSON_FILE)
             if gh_data:
                 for item in gh_data:
@@ -678,12 +769,18 @@ def api_ai_analyze():
                         item.update({"ai_bctc": parsed.get("bctc", ""), "ai_catalyst": parsed.get("catalyst", ""), "ai_risks": parsed.get("risks", ""), "ai_outlook": parsed.get("outlook", ""), "ai_recommendation": parsed.get("recommendation", ""), "ai_macro_view": parsed.get("macro_view", ""), "ai_updated_at": _now_str()})
                         break
                 commit_multiple_files_to_github({SCREENER_JSON_FILE: gh_data}, f"Update AI {symbol}")
-            return jsonify({"status": "success", "data": parsed})
+                
+            return jsonify({
+                "status": "success", 
+                "data": parsed, 
+                "bctc_period": bctc_period,
+                "bctc_updated_at": bctc_updated_at,
+                "warning": bctc_warning
+            })
         return jsonify({"status": "error", "message": "AI lỗi"}), 500
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# Các API cào thủ công
 @app.get("/api/force-history")
 def force_history():
     global is_full_data_running
