@@ -989,7 +989,31 @@ def force_screener():
         finally: is_screener_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
+@app.get("/api/reset-today")
+def reset_today():
+    """Xóa cờ chốt sổ của ngày hôm nay để hệ thống cào lại"""
+    today_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d")
+    result = collection.update_many({"chot_so_today": today_str}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
+    return jsonify({"status": "success", "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã."})
 
+@app.get("/api/force-fix")
+def force_fix_data():
+    """Ép cào lại toàn bộ 100 mã từ đầu"""
+    collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
+    all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+    threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
+    return jsonify({"status": "success", "message": f"Đang ép cào lại toàn bộ {len(all_symbols)} mã."})
+
+@app.get("/api/retry-now")
+def retry_now():
+    """Cào bù các mã bị lỗi"""
+    if is_crawling:
+        return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
+    incomplete_symbols = [doc["symbol"] for doc in collection.find({"is_incomplete": True}, {"symbol": 1})]
+    if not incomplete_symbols:
+        return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
+    threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
+    return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
