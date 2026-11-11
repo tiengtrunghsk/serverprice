@@ -14,6 +14,7 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
+# Sử dụng Vnstock thế hệ 6 cho nguồn SSI
 from vnstock import Market
 
 # ===================== CONFIG =====================
@@ -22,6 +23,7 @@ if not MONGO_URI:
     print("❌ LỖI: Thiếu MONGO_URI!", flush=True)
     sys.exit(1)
 
+# Ép nạp biến môi trường SSI
 SSI_API_KEY = os.environ.get("SSI_API_KEY", "").strip()
 SSI_API_SECRET = os.environ.get("SSI_API_SECRET", "").strip()
 if SSI_API_KEY and SSI_API_SECRET:
@@ -36,12 +38,14 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 SYMBOLS_JSON_FILE = "vn100_symbols.json"
 SCREENER_JSON_FILE = "screener_results.json"
 
+# TELEGRAM CONFIG
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 COOLDOWN_SECONDS = 300
 
+# ===================== VOLUME MULTIPLIER =====================
 VOLUME_MULTIPLIER = 10
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
@@ -58,7 +62,7 @@ def send_telegram(message: str):
     except Exception as e:
         print(f"[TELEGRAM] Lỗi gửi tin: {e}", flush=True)
 
-# ===================== DATABASE =====================
+# ===================== DATABASE & AUTO SYNC =====================
 print(f"🔌 Đang kết nối MongoDB...", flush=True)
 try:
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -134,8 +138,7 @@ def _fetch_one(symbol: str) -> Optional[dict]:
                     "volume": int(latest['volume'])
                 }
             return None
-        except Exception:
-            return None
+        except Exception: return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(_do)
@@ -207,13 +210,13 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         trading_date = _get_trading_date_str()
         mode_str = "CÀO BÙ" if is_retry else ("CÀO TAY" if is_manual else "REAL-TIME")
         
-        print(f"[CRAWL] 🚀 [{mode_str}] Xử lý {len(symbols)} mã...", flush=True)
+        print(f"\n[CRAWL] 🚀 [{mode_str}] Bắt đầu xử lý {len(symbols)} mã (Ngày: {trading_date})...", flush=True)
+        
         alert_batch = []
         all_crawled_data = {}
         pending_history_files = {}
         need_update_screener = False
 
-        # Cào ngầm chia lô 5 mã
         for chunk_idx in range(0, len(symbols), 5):
             chunk = symbols[chunk_idx:chunk_idx+5]
             for sym in chunk:
@@ -222,6 +225,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     continue
 
                 data = _fetch_one(sym)
+                
                 if data:
                     hist_data, _ = get_github_file_data(f"history/{sym}.json")
                     prev_close = 0.0
@@ -251,7 +255,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
 
                     all_crawled_data[sym] = {"close": data["close"], "pct_change": pct_change}
 
-                    # GHI NGAY VÀO DATABASE ĐỂ API TRẢ VỀ REAL-TIME
+                    real_time_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
+                    update_time = _get_current_update_time()
+
                     collection.update_one(
                         {"symbol": sym},
                         {"$set": {
@@ -259,11 +265,15 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
                             "amplitude_percent": amplitude_percent, "volume_percent": volume_percent,
                             "avg_volume_20": round(avg_volume_20, 2),
-                            "trading_date": trading_date, "updated_at": _get_current_update_time(),
+                            "trading_date": trading_date, 
+                            "updated_at": update_time,
+                            "crawled_at": real_time_str,
                             "is_locked": _is_after_15h(), "is_incomplete": False
                         }}, upsert=True
                     )
                     LAST_CRAWL_TIME[sym] = time.time()
+                    
+                    print(f"  ✅ [OK] {sym}: {data['close']:,} (Cào lúc: {real_time_str})", flush=True)
                     
                     if prev_close > 0 and abs(pct_change) >= 3.0 and volume_percent >= 120.0:
                         alert_batch.append({
@@ -273,7 +283,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             "flow": "BÁN RÒNG" if pct_change < 0 else "MUA VÀO"
                         })
 
-                    # Chuẩn bị data Github (nếu sau 15h)
                     if _is_after_15h() and hist_data is not None:
                         d1_bars = hist_data.get("history_d1", [])
                         d1_bar = {"time": trading_date, "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data["volume"]}
@@ -285,14 +294,13 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         pending_history_files[f"history/{sym}.json"] = hist_data
                         need_update_screener = True
                 else:
+                    print(f"  ❌ [LỖI] {sym}: Không lấy được dữ liệu.", flush=True)
                     collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": now_str}}, upsert=True)
 
-            # Nghỉ 1 giây sau mỗi lô 5 mã để nhả tải
             time.sleep(1)
 
-        # ĐẨY GITHUB 1 LẦN (Nếu sau 15h)
         if _is_after_15h() and pending_history_files:
-            print(f"[GITHUB] 📦 Đẩy {len(pending_history_files)} file...", flush=True)
+            print(f"\n[GITHUB] 📦 Đẩy {len(pending_history_files)} file...", flush=True)
             if need_update_screener and all_crawled_data:
                 try:
                     res = requests.get(f"https://api.github.com/repos/{GITHUB_USERNAME}/{GITHUB_REPO}/contents/{SCREENER_JSON_FILE}?ref={GITHUB_BRANCH}", headers={"Authorization": f"token {GITHUB_TOKEN}"}, timeout=10)
@@ -308,6 +316,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 except Exception: pass
 
             if commit_multiple_files_to_github(pending_history_files, f"Cập nhật dữ liệu {trading_date}"):
+                print(f"[GITHUB] ✅ Đẩy Github thành công!", flush=True)
                 for path in pending_history_files:
                     if path.startswith("history/"):
                         collection.update_one({"symbol": path.split("/")[1].replace(".json", "")}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
@@ -318,27 +327,24 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
             for item in alert_batch:
                 msg_lines.append(f"• <b>{item['sym']}</b>: {item['pct_change']:+.2f}% {item['trend']} | Vol: {item['volume_percent']:.0f}%")
             send_telegram("\n".join(msg_lines))
+            print(f"[TELEGRAM] 🚀 Đã gửi cảnh báo {len(alert_batch)} mã.", flush=True)
 
     finally:
         is_crawling = False
+        print("[CRAWL] 🏁 Đã kết thúc đợt cào.\n", flush=True)
 
-# ===================== BACKGROUND WORKER (REAL-TIME ROLLING) =====================
+# ===================== BACKGROUND WORKER =====================
 def auto_crawler_worker():
-    print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu Real-time (Rolling Crawl)!", flush=True)
+    print("⏰ [AUTO] Đã bật chế độ cào cuốn chiếu Real-time!", flush=True)
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
-            is_after_15h = vn_now.hour >= 15
-
-            # Reset cờ chốt sổ nếu sang ngày mới
+            
             collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
 
-            # Chỉ cào liên tục trong giờ giao dịch hoặc khi chưa chốt sổ
             if not is_crawling:
                 all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-                
-                # Ưu tiên cào các mã chưa có dữ liệu hôm nay hoặc dữ liệu cũ nhất
                 symbols_to_crawl = []
                 for sym in all_symbols:
                     doc = collection.find_one({"symbol": sym}, {"trading_date": 1, "chot_so_today": 1})
@@ -346,15 +352,12 @@ def auto_crawler_worker():
                     if doc.get("trading_date") != today_str:
                         symbols_to_crawl.append(sym)
                 
-                # Nếu đã cào hết 1 vòng, bắt đầu cào lại từ đầu (cập nhật real-time)
                 if not symbols_to_crawl:
                     symbols_to_crawl = all_symbols 
                 
                 _execute_crawl(symbols_to_crawl, is_manual=False)
 
-            # Nghỉ ngắn 15 giây trước khi bắt đầu vòng quét tiếp theo
             time.sleep(15)
-            
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
@@ -363,7 +366,8 @@ threading.Thread(target=auto_crawler_worker, daemon=True).start()
 
 # ===================== ROUTES =====================
 @app.get("/")
-def home(): return "API is running!", 200
+def home(): 
+    return "API is running!", 200
 
 @app.get("/api/status")
 def api_status():
@@ -415,7 +419,11 @@ def api_sync():
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
     
     if is_crawling:
-        return jsonify({"status": "success", "updated_at": _now_str() + " (Đang cào ngầm)", "updated_data": {}})
+        updated_data = {}
+        for sym in symbols:
+            doc = collection.find_one({"symbol": sym})
+            if doc and "close" in doc: updated_data[sym] = doc["close"]
+        return jsonify({"status": "success", "updated_at": _now_str() + " (Đang cào ngầm)", "updated_data": updated_data})
 
     threading.Thread(target=_execute_crawl, args=(symbols, False, True)).start()
     return jsonify({"status": "success", "updated_at": _now_str() + " (Bắt đầu cào)", "updated_data": {}})
@@ -436,12 +444,12 @@ def force_fix_data():
 @app.get("/api/retry-now")
 def retry_now():
     if is_crawling:
-        return jsonify({"status": "error", "message": "Đang chạy, vui lòng đợi!"})
+        return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
     incomplete_symbols = [doc["symbol"] for doc in collection.find({"is_incomplete": True}, {"symbol": 1})]
     if not incomplete_symbols:
-        return jsonify({"status": "success", "message": "Không có mã lỗi!"})
+        return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
-    return jsonify({"status": "success", "message": f"Đang cào bù {len(incomplete_symbols)} mã!"})
+    return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
