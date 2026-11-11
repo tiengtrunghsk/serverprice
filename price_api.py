@@ -14,14 +14,22 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-# ===================== VNSTOCK THẾ HỆ 6 =====================
-from vnstock import Market
-
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 if not MONGO_URI:
     print("❌ LỖI: Thiếu MONGO_URI!", flush=True)
     sys.exit(1)
+
+# Ép nạp biến môi trường của SSI vào hệ thống Python (để chắc chắn vnstock đọc được)
+SSI_API_KEY = os.environ.get("SSI_API_KEY", "").strip()
+SSI_API_SECRET = os.environ.get("SSI_API_SECRET", "").strip()
+
+if SSI_API_KEY and SSI_API_SECRET:
+    os.environ["SSI_API_KEY"] = SSI_API_KEY
+    os.environ["SSI_API_SECRET"] = SSI_API_SECRET
+    print("✅ Đã nạp cấu hình SSI API Key.", flush=True)
+else:
+    print("⚠️ CẢNH BÁO: Không tìm thấy SSI_API_KEY hoặc SSI_API_SECRET trong biến môi trường!", flush=True)
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
@@ -37,14 +45,15 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 FETCH_TIMEOUT = float(os.environ.get("FETCH_TIMEOUT", "20"))
 COOLDOWN_SECONDS = 300
 
-# ===================== VOLUME MULTIPLIER =====================
 VOLUME_MULTIPLIER = 10
-
-# Số luồng lấy dữ liệu (Tối ưu cho Vnstock)
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))
 
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+# ===================== VNSTOCK THẾ HỆ 6 =====================
+# Import sau khi đã nạp biến môi trường
+from vnstock import Market
 
 # ===================== TELEGRAM HELPER =====================
 def send_telegram(message: str):
@@ -129,7 +138,7 @@ def _is_after_15h() -> bool:
 def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
     """
     Lấy dữ liệu OHLCV từ Vnstock thế hệ 6.
-    Đã sửa lỗi: Bỏ chỉ định 'vci', thêm cơ chế fallback sang 'kbs' và 'ssi'.
+    Ép sử dụng nguồn 'ssi' duy nhất theo yêu cầu.
     """
     def _do():
         today = datetime.now().strftime("%Y-%m-%d")
@@ -137,31 +146,22 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
         
         market = Market()
         
-        # Danh sách nguồn ưu tiên thử (Mặc định -> KBS -> SSI)
-        # Nguồn mặc định của vnstock 6 thường là KBS, rất ổn định trên server
-        sources_to_try = [None, "kbs", "ssi"] 
-        
-        for src in sources_to_try:
-            try:
-                if src:
-                    df = market.equity(symbol).ohlcv(start=past_7d, end=today, source=src)
-                else:
-                    # Không truyền source, để thư viện tự chọn nguồn mặc định
-                    df = market.equity(symbol).ohlcv(start=past_7d, end=today)
-                
-                if df is not None and not df.empty:
-                    latest = df.iloc[-1]
-                    return {
-                        "close": float(latest['close']),
-                        "open": float(latest['open']),
-                        "high": float(latest['high']),
-                        "low": float(latest['low']),
-                        "volume": int(latest['volume'])
-                    }
-            except Exception as e:
-                # In lỗi ra để debug nhưng không dừng vòng lặp, thử nguồn tiếp theo
-                print(f"[VNSTOCK] {symbol} - Nguồn '{src or 'default'}': {str(e)[:100]}", flush=True)
-                continue
+        try:
+            # Ép cứng source="ssi"
+            df = market.equity(symbol).ohlcv(start=past_7d, end=today, source="ssi")
+            
+            if df is not None and not df.empty:
+                latest = df.iloc[-1]
+                return {
+                    "close": float(latest['close']),
+                    "open": float(latest['open']),
+                    "high": float(latest['high']),
+                    "low": float(latest['low']),
+                    "volume": int(latest['volume'])
+                }
+        except Exception as e:
+            print(f"[VNSTOCK-SSI] {symbol}: {str(e)[:120]}", flush=True)
+            return None
                 
         return None
 
@@ -171,7 +171,7 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
             try:
                 data = fut.result(timeout=15) 
                 if data and data["close"] > 0 and data["open"] > 0:
-                    # Chuẩn hóa dữ liệu giá (nếu giá > 1000 thì chia 1000)
+                    # Chuẩn hóa dữ liệu giá
                     if data["close"] >= 1000:
                         for k in ["close", "open", "high", "low"]:
                             if data[k] > 0: data[k] = data[k] / 1000.0
@@ -189,7 +189,7 @@ def _fetch_one(symbol: str, retries: int = 3) -> Optional[dict]:
                 pass
             
             if attempt < retries - 1:
-                time.sleep(1.5) # Tăng thời gian chờ giữa các lần thử
+                time.sleep(1.5)
                 
     print(f"[FETCH] ❌ {symbol}: Lỗi kết nối sau {retries} lần thử", flush=True)
     return None
@@ -274,10 +274,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         all_crawled_data = {}
         
         pending_history_files = {}
-        need_update_screener = False
         
         mode_str = "CÀO BÙ" if is_retry else ("CÀO TAY" if is_manual else "CÀO TỰ ĐỘNG")
-        print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào SONG SONG {len(symbols)} mã qua Vnstock...", flush=True)
+        print(f"[CRAWL] 🚀 [{mode_str}] Bắt đầu cào SONG SONG {len(symbols)} mã qua nguồn SSI...", flush=True)
 
         def _process_one(sym):
             doc = collection.find_one({"symbol": sym})
