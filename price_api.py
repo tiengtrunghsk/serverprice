@@ -838,6 +838,70 @@ def force_screener():
 
     threading.Thread(target=_run_screener, daemon=True).start()
     return jsonify({"status": "success", "message": "Đã kích hoạt chấm điểm lại Screener. Xem log Render để theo dõi!"})
+@app.get("/api/crawl-full-history")
+def crawl_full_history():
+    """Ép Server cào TOÀN BỘ 10 NĂM lịch sử nến cho tất cả các mã (Dùng khi mới setup DB)"""
+    global is_full_data_running
+    if is_full_data_running:
+        return jsonify({"status": "error", "message": "Tiến trình cào dữ liệu tĩnh đang chạy, vui lòng đợi!"})
+    
+    is_full_data_running = True
+    
+    def _run_history():
+        global is_full_data_running
+        try:
+            print("\n[MANUAL] 🚀 Ép cào TOÀN BỘ 10 NĂM lịch sử giá...", flush=True)
+            target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            # Lùi lại 10 năm (3650 ngày)
+            start_date = (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d")
+            
+            for i, symbol in enumerate(target_symbols):
+                print(f"  [{i+1}/{len(target_symbols)}] Cào 10 năm nến: {symbol}...", flush=True)
+                
+                df = _fetch_history_ssi(symbol, start_date, end_date)
+                if df is not None and not df.empty:
+                    new_bars = []
+                    for _, row in df.iterrows():
+                        time_str = row['time'].strftime('%Y-%m-%d') if hasattr(row['time'], 'strftime') else str(row['time'])[:10]
+                        new_bars.append({
+                            "time": time_str, 
+                            "open": float(row['open']), 
+                            "high": float(row['high']), 
+                            "low": float(row['low']), 
+                            "close": float(row['close']), 
+                            "volume": int(row['volume'])
+                        })
+                    
+                    # Ghi đè toàn bộ mảng history_d1 bằng dữ liệu 10 năm mới cào
+                    doc_hist = history_col.find_one({"symbol": symbol})
+                    if doc_hist:
+                        history_col.update_one({"symbol": symbol}, {"$set": {
+                            "history_d1": new_bars,
+                            "history_w1": aggregate_candles(new_bars, 'W1'),
+                            "history_mn": aggregate_candles(new_bars, 'MN')
+                        }})
+                    else:
+                        history_col.insert_one({
+                            "symbol": symbol,
+                            "history_d1": new_bars,
+                            "history_w1": aggregate_candles(new_bars, 'W1'),
+                            "history_mn": aggregate_candles(new_bars, 'MN')
+                        })
+                    print(f"    ✅ [NẾN 10 NĂM] {symbol} thành công ({len(new_bars)} phiên).", flush=True)
+                else:
+                    print(f"    ❌ [NẾN 10 NĂM] {symbol} thất bại.", flush=True)
+                
+                time.sleep(1.5) # Nghỉ 1.5s tránh SSI block
+                
+            print("[MANUAL] 🏁 Đã cào xong toàn bộ lịch sử 10 năm cho tất cả các mã.", flush=True)
+        except Exception as e:
+            print(f"❌ [MANUAL] Lỗi: {e}", flush=True)
+        finally:
+            is_full_data_running = False
+
+    threading.Thread(target=_run_history, daemon=True).start()
+    return jsonify({"status": "success", "message": "Đã kích hoạt cào 10 năm lịch sử cho toàn bộ mã. Hãy xem Log trên Render!"})
 @app.get("/api/retry-now")
 def retry_now():
     if is_crawling: return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
