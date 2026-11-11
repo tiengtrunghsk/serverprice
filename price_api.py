@@ -102,7 +102,7 @@ CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 is_crawling = False
 is_full_data_running = False
 is_screener_running = False
-LAST_TELEGRAM_TIME = 0  # Biến toàn cục lưu thời gian gửi Telegram gần nhất
+LAST_TELEGRAM_TIME = 0
 
 def get_current_fhsc_key():
     setting = settings_col.find_one({"_id": "fhsc_key"})
@@ -133,12 +133,9 @@ def send_telegram(message: str):
 def get_historical_return_rate_with_details(symbol):
     try:
         hist_data = history_col.find_one({"symbol": symbol})
-        if not hist_data or not hist_data.get("history_d1"):
-            return None
-            
+        if not hist_data or not hist_data.get("history_d1"): return None
         history_bars = hist_data["history_d1"]
-        if len(history_bars) < 30:
-            return None
+        if len(history_bars) < 30: return None
             
         df = pd.DataFrame(history_bars)
         df['date'] = pd.to_datetime(df['time'])
@@ -170,12 +167,11 @@ def get_historical_return_rate_with_details(symbol):
             "end_quarter": str(end_row['year_quarter']),
             "end_price_mean": round(end_row['close'], 2)
         }
-    except Exception as e:
-        return None
+    except Exception as e: return None
 
 # ===================== CÀO GIÁ =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
-    print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True) # <-- Thêm log để biết nó đang chạy
+    print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True)
     def _do():
         try:
             today = datetime.now().strftime("%Y-%m-%d")
@@ -186,14 +182,13 @@ def _fetch_one(symbol: str) -> Optional[dict]:
                 return {"close": float(latest["close"]), "open": float(latest["open"]), "high": float(latest["high"]), "low": float(latest["low"]), "volume": int(latest["volume"])}
             return None
         except Exception as e:
-            print(f"    ❌ [FETCH ERROR] Lỗi gọi Vnstock cho {symbol}: {e}", flush=True) # <-- Bắt lỗi
+            print(f"    ❌ [FETCH ERROR] Lỗi gọi Vnstock cho {symbol}: {e}", flush=True)
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        try: 
-            data = ex.submit(_do).result(timeout=15)
+        try: data = ex.submit(_do).result(timeout=15)
         except concurrent.futures.TimeoutError:
-            print(f"    ❌ [FETCH TIMEOUT] Quá 15s không lấy được giá {symbol}", flush=True) # <-- Bắt lỗi timeout
+            print(f"    ❌ [FETCH TIMEOUT] Quá 15s không lấy được giá {symbol}", flush=True)
             return None
         except Exception as e:
             print(f"    ❌ [FETCH THREAD ERROR] {symbol}: {e}", flush=True)
@@ -211,12 +206,16 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
         return df if df is not None and not df.empty else None
     except Exception: return None
 
-# ===================== CÀO BCTC (CẬP NHẬT NGÀY THÁNG) =====================
+# ===================== CÀO BCTC (CẬP NHẬT NGÀY THÁNG & LOG CHI TIẾT) =====================
 def _fetch_bctc_ssi(symbol: str):
     symbol = str(symbol).upper().strip()
     fhsc_key = get_current_fhsc_key()
-    if not fhsc_key: return None
+    if not fhsc_key: 
+        print(f"  ⚠️ [BCTC] Bỏ qua {symbol} - Chưa có FHSC API KEY", flush=True)
+        return None
+        
     os.environ["FHSC_API_KEY"] = fhsc_key
+    print(f"  [BCTC] 🚀 Bắt đầu lấy dữ liệu cho mã {symbol}...", flush=True)
 
     try:
         equity = Fundamental().equity(symbol)
@@ -228,9 +227,13 @@ def _fetch_bctc_ssi(symbol: str):
                 try: return func(period=period, source="fhsc", limit=limit)
                 except Exception as e:
                     err_str = str(e).lower()
-                    if any(k in err_str for k in ["429", "rate limit", "vượt giới hạn"]): time.sleep((attempt + 1) * 10)
-                    elif any(k in err_str for k in ["networkerror", "remoteprotocolerror", "connection", "kết nối", "timeout"]): time.sleep((attempt + 1) * 5)
-                    else: raise e
+                    if any(k in err_str for k in ["429", "rate limit", "vượt giới hạn"]): 
+                        time.sleep((attempt + 1) * 10)
+                    elif any(k in err_str for k in ["networkerror", "remoteprotocolerror", "connection", "kết nối", "timeout"]): 
+                        time.sleep((attempt + 1) * 5)
+                    else: 
+                        print(f"    ❌ [BCTC ERROR] {symbol} | {str(e)}", flush=True)
+                        raise e
             return None
 
         latest_period = "Chưa xác định"
@@ -238,8 +241,11 @@ def _fetch_bctc_ssi(symbol: str):
             try:
                 report_func = getattr(equity, report_name, None)
                 if not callable(report_func): continue
+                
+                print(f"    ⏳ Đang lấy {report_name}...", flush=True)
                 df = fetch_with_retry(report_func)
                 time.sleep(1.5) 
+                
                 if df is not None and not df.empty:
                     clean_df = df.astype(object).where(pd.notna(df), None)
                     records = clean_df.to_dict(orient="records")
@@ -252,11 +258,16 @@ def _fetch_bctc_ssi(symbol: str):
                         except: pass
                             
                     reports[report_name] = json.loads(json.dumps(records, ensure_ascii=False, default=str))
+                    print(f"    ✓ Đã lấy {report_name} ({len(records)} dòng)", flush=True)
             except Exception: pass
             
-        if reports: reports["latest_period"] = latest_period 
+        if reports: 
+            print(f"  ✅ [BCTC] Đã lấy xong {symbol} | Kỳ mới nhất: {latest_period}", flush=True)
+            reports["latest_period"] = latest_period 
         return reports if reports else None
-    except Exception: return None
+    except Exception as e:
+        print(f"  ❌ [BCTC] Lỗi khi cào {symbol}: {e}", flush=True)
+        return None
 
 # ===================== CORE LOGIC CÀO & CẢNH BÁO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
@@ -288,12 +299,10 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     vol_pct = round(data["volume"] / avg_vol_20 * 100, 2) if avg_vol_20 > 0 else 0
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0
                     
-                    # Xác định màu sắc & mũi tên
                     arrow, color = "—", "slate"
                     if pct_change > 0: arrow, color = "▲", "emerald"
                     elif pct_change < 0: arrow, color = "▼", "rose"
 
-                    # LƯU ĐẦY ĐỦ VÀO DB
                     collection.update_one({"symbol": sym}, {"$set": {
                         "close": data["close"], "prev_close": prev_close, 
                         "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
@@ -304,7 +313,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "trading_date": trading_date, "updated_at": _now_str(), "is_locked": _is_after_15h(), "is_incomplete": False
                     }}, upsert=True)
                     
-                    # Thu thập mã đột biến
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
@@ -330,7 +338,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             collection.update_one({"symbol": path.split("/")[1].replace(".json", "")}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
                 time.sleep(2)
 
-        # XỬ LÝ CẢNH BÁO TELEGRAM (GIỚI HẠN 2 TIẾNG)
         if alert_batch:
             now_ts = time.time()
             if (now_ts - LAST_TELEGRAM_TIME) >= 7200:
@@ -339,7 +346,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 msg_lines.append(f"⏰ Lúc: {_now_str()}")
                 for item in alert_batch:
                     msg_lines.append(f"• <b>{item['sym']}</b>: {item['pct_change']:+.2f}% {item['trend']} | Vol: {item['volume_percent']:.0f}%")
-                
                 send_telegram("\n".join(msg_lines))
                 print(f"[TELEGRAM] 🚀 Đã gửi cảnh báo {len(alert_batch)} mã.", flush=True)
                 LAST_TELEGRAM_TIME = now_ts
@@ -733,14 +739,18 @@ threading.Thread(target=screener_worker, daemon=True).start()
 
 # ===================== ROUTES =====================
 @app.get("/")
-def home(): return "API is running!", 200
+def home(): 
+    print("[API] 🏠 Gọi API trang chủ (/)", flush=True)
+    return "API is running!", 200
 
 @app.get("/api/status")
 def api_status():
+    print("[API] 📊 Gọi API /api/status", flush=True)
     return jsonify({"status": "success", "is_crawling": is_crawling, "message": "Đang cào real-time" if is_crawling else "Sẵn sàng"})
 
 @app.post("/api/set-fhsc-key")
 def api_set_fhsc_key():
+    print("[API] 🔑 Gọi API /api/set-fhsc-key", flush=True)
     data = request.json
     new_key = data.get("key", "").strip()
     if not new_key: return jsonify({"status": "error", "message": "Key không được để trống"}), 400
@@ -749,13 +759,13 @@ def api_set_fhsc_key():
 
 @app.get("/api/data")
 def api_get_data():
+    print("[API] 📈 Gọi API /api/data (Lấy toàn bộ giá)", flush=True)
     try:
         cursor = collection.find({}, {"_id": 0})
         data = {}
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
-                # Nếu DB thiếu thông tin, tự động tính lại
                 if "price_change_percent" not in doc or doc["price_change_percent"] == 0:
                     close_price = doc.get("close", 0)
                     prev_close = doc.get("prev_close", 0)
@@ -774,7 +784,6 @@ def api_get_data():
                     doc["price_arrow"] = arrow
                     doc["price_color"] = color
                 
-                # Gán mặc định volume_percent nếu chưa có
                 doc["volume_percent"] = doc.get("volume_percent", 0.0)
                 data[sym] = doc
         return jsonify({"status": "success", "count": len(data), "data": data})
@@ -784,10 +793,10 @@ def api_get_data():
 @app.get("/api/sync")
 def api_sync():
     raw = request.args.get("symbols", "").strip()
+    print(f"[API] 🔄 Gọi API /api/sync | Mã: {raw}", flush=True)
     if not raw: abort(400)
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
     
-    # NẾU ĐÃ QUÁ 15H HOẶC ĐANG CÀO NGẦM -> LẤY TỪ DB
     if is_crawling or _is_after_15h():
         updated_data = {}
         for sym in symbols:
@@ -818,7 +827,6 @@ def api_sync():
             "updated_data": updated_data
         })
 
-    # TRONG GIỜ GIAO DỊCH VÀ RẢNH -> KÍCH HOẠT CÀO MỚI
     threading.Thread(target=_execute_crawl, args=(symbols, False, True)).start()
     return jsonify({
         "status": "success", 
@@ -828,12 +836,14 @@ def api_sync():
 
 @app.get("/api/screener")
 def api_get_screener():
+    print("[API] 🏆 Gọi API /api/screener (Lấy điểm số)", flush=True)
     try: return jsonify({"status": "success", "data": list(screener_col.find({}, {"_id": 0}))})
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.get("/api/ai-analyze")
 def api_ai_analyze():
     symbol = request.args.get("symbol", "").upper().strip()
+    print(f"[API] 🤖 Gọi API /api/ai-analyze | Mã: {symbol}", flush=True)
     if not symbol: return jsonify({"status": "error", "message": "Thiếu mã"}), 400
     if not ALIBABA_API_KEY: return jsonify({"status": "error", "message": "Thiếu ALIBABA_API_KEY"}), 500
     try:
@@ -890,6 +900,7 @@ def api_ai_analyze():
 
 @app.get("/api/force-history")
 def force_history():
+    print(f"\n[API] 📥 Gọi API /api/force-history (Ép cào nến 30 ngày)", flush=True)
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
@@ -898,6 +909,7 @@ def force_history():
         try:
             target = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             end, start = datetime.now().strftime("%Y-%m-%d"), (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            print(f"[HISTORY] 🚀 Bắt đầu cào nến 30 ngày cho {len(target)} mã...", flush=True)
             for sym in target:
                 df = _fetch_history_ssi(sym, start, end)
                 if df is not None and not df.empty:
@@ -909,12 +921,14 @@ def force_history():
                         d1 = sorted(doc_hist["history_d1"], key=lambda x: x["time"])
                         history_col.update_one({"symbol": sym}, {"$set": {"history_w1": aggregate_candles(d1, 'W1'), "history_mn": aggregate_candles(d1, 'MN')}})
                 time.sleep(1.0)
+            print(f"[HISTORY] 🏁 Đã cào xong toàn bộ nến 30 ngày.", flush=True)
         finally: is_full_data_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào 30 ngày nến..."})
 
 @app.get("/api/crawl-full-history")
 def crawl_full_history():
+    print(f"\n[API] 📥 Gọi API /api/crawl-full-history (Ép cào nến 10 năm)", flush=True)
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
@@ -923,12 +937,14 @@ def crawl_full_history():
         try:
             target = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             end, start = datetime.now().strftime("%Y-%m-%d"), (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d")
+            print(f"[HISTORY] 🚀 Bắt đầu cào nến 10 năm cho {len(target)} mã...", flush=True)
             for sym in target:
                 df = _fetch_history_ssi(sym, start, end)
                 if df is not None and not df.empty:
                     bars = [{"time": r['time'].strftime('%Y-%m-%d') if hasattr(r['time'], 'strftime') else str(r['time'])[:10], "open": float(r['open']), "high": float(r['high']), "low": float(r['low']), "close": float(r['close']), "volume": int(r['volume'])} for _, r in df.iterrows()]
                     history_col.update_one({"symbol": sym}, {"$set": {"history_d1": bars, "history_w1": aggregate_candles(bars, 'W1'), "history_mn": aggregate_candles(bars, 'MN')}}, upsert=True)
                 time.sleep(1.5)
+            print(f"[HISTORY] 🏁 Đã cào xong toàn bộ nến 10 năm.", flush=True)
         finally: is_full_data_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào 10 năm nến..."})
@@ -939,10 +955,11 @@ def force_bctc():
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
     
-    # Ưu tiên nhận danh sách mã cụ thể từ Frontend gửi lên
     symbols_str = request.args.get("symbols", "").upper().strip()
     start_idx, limit_idx = int(request.args.get("start", 0)), int(request.args.get("limit", 15))
     specific = request.args.get("symbol", "").upper().strip()
+    
+    print(f"\n[API] 📥 Gọi API /api/force-bctc | Symbols: {symbols_str} | Specific: {specific}", flush=True)
 
     def _run():
         global is_full_data_running
@@ -954,50 +971,56 @@ def force_bctc():
             else:
                 target = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})][start_idx:start_idx+limit_idx]
                 
-            for sym in target:
+            print(f"[BCTC-CRAWL] 🚀 Bắt đầu cào BCTC cho {len(target)} mã...", flush=True)
+            
+            for i, sym in enumerate(target):
+                print(f"\n[BCTC-CRAWL] [{i+1}/{len(target)}] Đang xử lý {sym}...", flush=True)
                 res = _fetch_bctc_ssi(sym)
+                
                 if res: 
                     bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
+                    period = res.get("latest_period", "Không rõ")
+                    print(f"  ✅ [THÀNH CÔNG] {sym} | Kỳ BCTC: {period}", flush=True)
+                else:
+                    print(f"  ❌ [THẤT BẠI] {sym} | Không lấy được dữ liệu", flush=True)
+                    
                 time.sleep(3.0)
+                
+            print(f"\n[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ {len(target)} mã.", flush=True)
         finally: 
             is_full_data_running = False
             
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": f"Đang cào BCTC cho {len(symbols_str.split(',')) if symbols_str else limit_idx} mã..."})
+
 @app.get("/api/bctc-status")
 def api_bctc_status():
-    """Trả về danh sách tất cả các mã kèm trạng thái BCTC (ngày cào, kỳ báo cáo)"""
+    print("[API] 📋 Gọi API /api/bctc-status (Lấy danh sách BCTC)", flush=True)
     try:
-        # Lấy tất cả các mã từ bảng stocks
         all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1, "_id": 0})]
-        
         result = []
         for sym in all_symbols:
             bctc_doc = bctc_col.find_one({"symbol": sym}, {"_id": 0, "symbol": 1, "updated_at": 1, "latest_period": 1})
-            
             if bctc_doc and bctc_doc.get("updated_at"):
                 result.append({
-                    "symbol": sym,
-                    "has_bctc": True,
+                    "symbol": sym, "has_bctc": True,
                     "updated_at": bctc_doc.get("updated_at", "Chưa rõ"),
                     "latest_period": bctc_doc.get("latest_period", "Chưa rõ")
                 })
             else:
                 result.append({
-                    "symbol": sym,
-                    "has_bctc": False,
-                    "updated_at": "Chưa cào",
-                    "latest_period": "Chưa có"
+                    "symbol": sym, "has_bctc": False,
+                    "updated_at": "Chưa cào", "latest_period": "Chưa có"
                 })
-                
-        # Sắp xếp theo tên mã A-Z
         result = sorted(result, key=lambda x: x["symbol"])
         return jsonify({"status": "success", "data": result})
     except Exception as e:
         log_exception("[API BCTC STATUS]", e)
         return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.get("/api/crawl-full-bctc")
 def crawl_full_bctc():
+    print(f"\n[API] 📥 Gọi API /api/crawl-full-bctc (Ép cào toàn bộ BCTC)", flush=True)
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
@@ -1005,25 +1028,27 @@ def crawl_full_bctc():
         global is_full_data_running
         try:
             target = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-            for sym in target:
+            print(f"[BCTC-CRAWL] 🚀 Bắt đầu cào toàn bộ BCTC cho {len(target)} mã...", flush=True)
+            for i, sym in enumerate(target):
+                print(f"[BCTC-CRAWL] [{i+1}/{len(target)}] Đang xử lý {sym}...", flush=True)
                 res = _fetch_bctc_ssi(sym)
                 if res: bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
                 time.sleep(3.0)
+            print(f"[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ BCTC.", flush=True)
         finally: is_full_data_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào FULL BCTC..."})
 
 @app.get("/api/force-screener")
 def force_screener():
+    print(f"\n[API] 📥 Gọi API /api/force-screener (Ép chấm điểm lại)", flush=True)
     global is_screener_running
     if is_screener_running: 
         print("[SCREENER] ⚠️ Đang có tiến trình chấm điểm chạy, bỏ qua lệnh mới.", flush=True)
         return jsonify({"status": "error", "message": "Đang chạy"}), 400
         
     is_screener_running = True
-    
-    # Thêm log bắt đầu
-    print(f"\n[SCREENER] 🚀 Bắt đầu chấm điểm lại toàn bộ...", flush=True)
+    print(f"[SCREENER] 🚀 Bắt đầu chấm điểm lại toàn bộ...", flush=True)
     
     def _run():
         global is_screener_running
@@ -1040,17 +1065,14 @@ def force_screener():
             medians = compute_sector_medians(norm_db)
             results = []
             
-            # Thêm log tiến trình
             count = 0
             for sym, nd in norm_db.items():
                 grp = get_sub_sector(sym)
                 cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(sym))
                 med, _ = get_median_for_symbol(sym, medians)
                 res = evaluate_stock_from_db(sym, nd, med, grp, cfg)
-                if res: 
-                    results.append(res)
+                if res: results.append(res)
                 count += 1
-                # Cứ 20 mã thì in log 1 lần để không làm rác log
                 if count % 20 == 0:
                     print(f"[SCREENER] ⏳ Đã xử lý {count}/{len(norm_db)} mã...", flush=True)
             
@@ -1070,15 +1092,17 @@ def force_screener():
             
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
+
+@app.get("/api/reset-today")
 def reset_today():
-    """Xóa cờ chốt sổ của ngày hôm nay để hệ thống cào lại"""
+    print(f"\n[API] 📥 Gọi API /api/reset-today (Hủy chốt sổ)", flush=True)
     today_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d")
     result = collection.update_many({"chot_so_today": today_str}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
     return jsonify({"status": "success", "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã."})
 
 @app.get("/api/force-fix")
 def force_fix_data():
-    """Ép cào lại toàn bộ 100 mã từ đầu"""
+    print(f"\n[API] 📥 Gọi API /api/force-fix (Ép cào lại toàn bộ giá)", flush=True)
     collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
@@ -1086,7 +1110,7 @@ def force_fix_data():
 
 @app.get("/api/retry-now")
 def retry_now():
-    """Cào bù các mã bị lỗi"""
+    print(f"\n[API] 📥 Gọi API /api/retry-now (Cào bù mã lỗi)", flush=True)
     if is_crawling:
         return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
     incomplete_symbols = [doc["symbol"] for doc in collection.find({"is_incomplete": True}, {"symbol": 1})]
@@ -1094,6 +1118,7 @@ def retry_now():
         return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
