@@ -264,8 +264,7 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
 def _fetch_bctc_ssi(symbol: str):
     """
     Lấy BCTC theo API Vnstock 6 (Nguồn FHSC).
-    Mỗi báo cáo được gọi độc lập để lỗi một báo cáo
-    không làm mất dữ liệu của các báo cáo còn lại.
+    Tối ưu: Thêm delay, cơ chế retry khi bị RateLimit (429) và xử lý từng báo cáo độc lập.
     """
     symbol = str(symbol).upper().strip()
     started = time.time()
@@ -274,135 +273,95 @@ def _fetch_bctc_ssi(symbol: str):
     logger.info("[BCTC START] Mã=%s | thời điểm=%s", symbol, _now_str())
 
     try:
-        try:
-            import vnstock
-            logger.info(
-                "[BCTC VERSION] vnstock=%s",
-                getattr(vnstock, "__version__", "không xác định")
-            )
-        except Exception as e:
-            logger.warning(
-                "[BCTC VERSION] Không đọc được phiên bản vnstock: %s", e
-            )
-
-        logger.info(
-            "[BCTC INIT] Khởi tạo Fundamental().equity(%s)", symbol
-        )
-
         equity = Fundamental().equity(symbol)
         logger.info("[BCTC INIT SUCCESS] %s", symbol)
 
         reports = {}
-
         # Danh sách 3 báo cáo tài chính chính
-        report_names = (
-            "balance_sheet",
-            "income_statement",
-            "cash_flow"
-        )
+        report_names = ("balance_sheet", "income_statement", "cash_flow")
 
+        def fetch_with_retry(func, period=None, source="fhsc", max_retries=3):
+            """Hàm phụ trợ: Gọi API, nếu gặp lỗi 429 thì chờ và thử lại"""
+            for attempt in range(max_retries):
+                try:
+                    if period:
+                        return func(period=period, source=source)
+                    else:
+                        return func(source=source)
+                except Exception as e:
+                    err_str = str(e).lower()
+                    # Bắt lỗi RateLimit (429) hoặc các lỗi liên quan đến giới hạn tần suất
+                    if "429" in err_str or "rate limit" in err_str or "vượt giới hạn" in err_str:
+                        wait_time = (attempt + 1) * 10  # Chờ 10s, 20s, 30s
+                        logger.warning(
+                            "[BCTC RATE LIMIT] %s | Bị giới hạn, đợi %ss rồi thử lại (Lần %s/%s)...",
+                            symbol, wait_time, attempt + 1, max_retries
+                        )
+                        time.sleep(wait_time)
+                    else:
+                        # Nếu là lỗi khác (không phải 429) thì ném ra ngoài luôn
+                        raise e
+            return None
+
+        # 1. Cào 3 báo cáo chính
         for report_name in report_names:
             report_started = time.time()
-
-            logger.info(
-                "[BCTC REQUEST] %s | %s | period=quarter | source=fhsc",
-                symbol, report_name
-            )
+            logger.info("[BCTC REQUEST] %s | %s | period=quarter | source=fhsc", symbol, report_name)
 
             try:
                 report_func = getattr(equity, report_name, None)
-
                 if not callable(report_func):
-                    logger.error(
-                        "[BCTC UNSUPPORTED] %s | "
-                        "Không tìm thấy equity.%s()",
-                        symbol, report_name
-                    )
+                    logger.error("[BCTC UNSUPPORTED] %s | Không tìm thấy equity.%s()", symbol, report_name)
                     continue
 
-                # Gọi báo cáo với nguồn fhsc
-                df = report_func(
-                    period="quarter",
-                    source="fhsc"
-                )
+                # Gọi hàm với cơ chế retry
+                df = fetch_with_retry(report_func, period="quarter")
+                
+                # Nghỉ 1.5s giữa các báo cáo để tránh dồn dập
+                time.sleep(1.5) 
 
-                elapsed = round(time.time() - report_started, 2)
-
-                if df is None or df.empty:
-                    logger.warning(
-                        "[BCTC EMPTY] %s | %s trả về rỗng | %.2fs",
-                        symbol, report_name, elapsed
-                    )
+                if df is None or getattr(df, 'empty', True):
+                    logger.warning("[BCTC EMPTY] %s | %s trả về rỗng", symbol, report_name)
                     continue
 
-                if not isinstance(df, pd.DataFrame):
-                    logger.warning(
-                        "[BCTC TYPE] %s | %s trả về kiểu %s",
-                        symbol, report_name, type(df).__name__
-                    )
-                    continue
-
-                # Làm sạch NaN / NaT
+                # Làm sạch dữ liệu
                 clean_df = df.astype(object).where(pd.notna(df), None)
-                records = clean_df.to_dict(orient="records")
-
-                # Chuẩn hóa Timestamp và numpy types
-                records = json.loads(
-                    json.dumps(records, ensure_ascii=False, default=str)
-                )
-
+                records = json.loads(json.dumps(clean_df.to_dict(orient="records"), ensure_ascii=False, default=str))
+                
                 reports[report_name] = records
-
-                logger.info(
-                    "[BCTC SUCCESS] %s | %s | rows=%s | elapsed=%ss",
-                    symbol, report_name, len(records), elapsed
-                )
+                logger.info("[BCTC SUCCESS] %s | %s | rows=%s | %.2fs", symbol, report_name, len(records), time.time() - report_started)
 
             except Exception as e:
-                log_exception(
-                    f"[BCTC REPORT ERROR] {symbol} | {report_name} | source=fhsc",
-                    e
-                )
+                log_exception(f"[BCTC REPORT ERROR] {symbol} | {report_name}", e)
                 continue
 
-        # Xử lý riêng bảng Chỉ số tài chính (ratio) cho FHSC
+        # 2. Cào riêng bảng Chỉ số tài chính (ratio)
         try:
             logger.info("[BCTC REQUEST] %s | ratio | source=fhsc", symbol)
-            # Với FHSC, hàm ratio thường không cần tham số period
-            df_ratio = equity.ratio(source="fhsc")
+            df_ratio = fetch_with_retry(equity.ratio)
             
-            if df_ratio is not None and not df_ratio.empty:
+            if df_ratio is not None and not getattr(df_ratio, 'empty', True):
                 clean_df = df_ratio.astype(object).where(pd.notna(df_ratio), None)
-                records = clean_df.to_dict(orient="records")
-                records = json.loads(json.dumps(records, ensure_ascii=False, default=str))
+                records = json.loads(json.dumps(clean_df.to_dict(orient="records"), ensure_ascii=False, default=str))
                 reports["ratio"] = records
                 logger.info("[BCTC SUCCESS] %s | ratio | rows=%s", symbol, len(records))
         except Exception as e:
-            logger.warning("[BCTC SKIP] %s | Không lấy được bảng ratio từ FHSC: %s", symbol, e)
+            logger.warning("[BCTC SKIP] %s | Lỗi lấy bảng ratio: %s", symbol, e)
 
         elapsed_total = round(time.time() - started, 2)
-        summary = {name: len(rows) for name, rows in reports.items()}
-
         if reports:
             logger.info(
                 "[BCTC COMPLETE] %s | reports=%s | elapsed=%ss",
-                symbol, summary, elapsed_total
+                symbol, {k: len(v) for k, v in reports.items()}, elapsed_total
             )
             return reports
 
-        logger.error(
-            "[BCTC FAILED] %s | Không lấy được báo cáo nào | elapsed=%ss",
-            symbol, elapsed_total
-        )
+        logger.error("[BCTC FAILED] %s | Không lấy được báo cáo nào", symbol)
         return None
 
     except Exception as e:
-        log_exception(
-            f"[BCTC FATAL ERROR] {symbol} | Lỗi khởi tạo/xử lý BCTC",
-            e
-        )
+        log_exception(f"[BCTC FATAL ERROR] {symbol}", e)
         return None
-
     finally:
         logger.info("[BCTC END] %s", symbol)
 # ===================== GITHUB BULK UPLOAD =====================
