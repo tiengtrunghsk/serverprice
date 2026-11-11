@@ -15,7 +15,7 @@ from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
 # ===================== VNSTOCK SDK =====================
-from vnstock import Quote
+from vnstock.api.quote import Quote
 
 # ===================== CONFIG =====================
 MONGO_URI = os.environ.get("MONGO_URI", "").strip()
