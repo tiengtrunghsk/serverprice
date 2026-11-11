@@ -718,7 +718,41 @@ def api_set_fhsc_key():
 def api_get_data():
     try: return jsonify({"status": "success", "data": {doc["symbol"]: doc for doc in collection.find({}, {"_id": 0})}})
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
-
+@app.get("/api/sync")
+def api_sync():
+    """
+    API xử lý cập nhật giá.
+    - Cập nhật tất cả: truyền toàn bộ danh sách mã (cách nhau bởi dấu phẩy).
+    - Cập nhật 1 mã: chỉ truyền 1 mã.
+    """
+    raw = request.args.get("symbols", "").strip()
+    if not raw: 
+        return jsonify({"status": "error", "message": "Thiếu danh sách mã"}), 400
+        
+    symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    
+    # TRƯỜNG HỢP 1: Nếu hệ thống đang tự động cào ngầm (is_crawling = True)
+    # Thì không kích hoạt cào mới, chỉ trả về kết quả mới nhất đang có trong DB
+    if is_crawling:
+        updated_data = {}
+        for sym in symbols:
+            doc = collection.find_one({"symbol": sym})
+            if doc and "close" in doc: 
+                updated_data[sym] = doc["close"]
+        return jsonify({
+            "status": "success", 
+            "updated_at": _now_str() + " (Đang cào ngầm)", 
+            "updated_data": updated_data
+        })
+        
+    # TRƯỜNG HỢP 2: Hệ thống đang rảnh, kích hoạt luồng cào tay cho các mã này
+    threading.Thread(target=_execute_crawl, args=(symbols, False, True)).start()
+    
+    return jsonify({
+        "status": "success", 
+        "updated_at": _now_str() + " (Bắt đầu cào)", 
+        "updated_data": {}
+    })
 @app.get("/api/screener")
 def api_get_screener():
     try: return jsonify({"status": "success", "data": list(screener_col.find({}, {"_id": 0}))})
