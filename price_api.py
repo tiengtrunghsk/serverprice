@@ -59,7 +59,9 @@ MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 if not MONGO_URI:
     logger.critical("Thiếu biến môi trường MONGO_URI. Server dừng khởi động.")
     sys.exit(1)
-
+FHSC_API_KEY = os.environ.get("FHSC_API_KEY", "").strip()
+if FHSC_API_KEY:
+    os.environ["FHSC_API_KEY"] = FHSC_API_KEY
 SSI_API_KEY = os.environ.get("SSI_API_KEY", "").strip()
 SSI_API_SECRET = os.environ.get("SSI_API_SECRET", "").strip()
 if SSI_API_KEY and SSI_API_SECRET:
@@ -261,7 +263,7 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
 
 def _fetch_bctc_ssi(symbol: str):
     """
-    Lấy BCTC theo API Vnstock 6.
+    Lấy BCTC theo API Vnstock 6 (Nguồn FHSC).
     Mỗi báo cáo được gọi độc lập để lỗi một báo cáo
     không làm mất dữ liệu của các báo cáo còn lại.
     """
@@ -292,19 +294,18 @@ def _fetch_bctc_ssi(symbol: str):
 
         reports = {}
 
-        # Đã thêm "ratio" vào danh sách để lấy chỉ số tài chính
+        # Danh sách 3 báo cáo tài chính chính
         report_names = (
             "balance_sheet",
             "income_statement",
-            "cash_flow",
-            "ratio" 
+            "cash_flow"
         )
 
         for report_name in report_names:
             report_started = time.time()
 
             logger.info(
-                "[BCTC REQUEST] %s | %s | period=quarter | source=vci",
+                "[BCTC REQUEST] %s | %s | period=quarter | source=fhsc",
                 symbol, report_name
             )
 
@@ -319,17 +320,17 @@ def _fetch_bctc_ssi(symbol: str):
                     )
                     continue
 
-                # Gọi từng báo cáo riêng biệt
+                # Gọi báo cáo với nguồn fhsc
                 df = report_func(
                     period="quarter",
-                    source="vci"
+                    source="fhsc"
                 )
 
                 elapsed = round(time.time() - report_started, 2)
 
-                if df is None:
+                if df is None or df.empty:
                     logger.warning(
-                        "[BCTC EMPTY] %s | %s trả về None | %.2fs",
+                        "[BCTC EMPTY] %s | %s trả về rỗng | %.2fs",
                         symbol, report_name, elapsed
                     )
                     continue
@@ -341,67 +342,46 @@ def _fetch_bctc_ssi(symbol: str):
                     )
                     continue
 
-                if df.empty:
-                    logger.warning(
-                        "[BCTC EMPTY] %s | %s DataFrame rỗng | %.2fs",
-                        symbol, report_name, elapsed
-                    )
-                    continue
-
                 # Làm sạch NaN / NaT
-                clean_df = df.astype(object).where(
-                    pd.notna(df), None
-                )
-
+                clean_df = df.astype(object).where(pd.notna(df), None)
                 records = clean_df.to_dict(orient="records")
 
                 # Chuẩn hóa Timestamp và numpy types
                 records = json.loads(
-                    json.dumps(
-                        records,
-                        ensure_ascii=False,
-                        default=str
-                    )
+                    json.dumps(records, ensure_ascii=False, default=str)
                 )
 
                 reports[report_name] = records
 
                 logger.info(
-                    "[BCTC SUCCESS] %s | %s | rows=%s | "
-                    "columns=%s | elapsed=%ss",
-                    symbol,
-                    report_name,
-                    len(records),
-                    list(df.columns),
-                    elapsed
+                    "[BCTC SUCCESS] %s | %s | rows=%s | elapsed=%ss",
+                    symbol, report_name, len(records), elapsed
                 )
-
-                if records:
-                    logger.info(
-                        "[BCTC SAMPLE] %s | %s | %s",
-                        symbol,
-                        report_name,
-                        json.dumps(
-                            records[0],
-                            ensure_ascii=False,
-                            default=str
-                        )[:1200]
-                    )
 
             except Exception as e:
                 log_exception(
-                    f"[BCTC REPORT ERROR] {symbol} | "
-                    f"{report_name} | source=vci",
+                    f"[BCTC REPORT ERROR] {symbol} | {report_name} | source=fhsc",
                     e
                 )
                 continue
 
-        elapsed_total = round(time.time() - started, 2)
+        # Xử lý riêng bảng Chỉ số tài chính (ratio) cho FHSC
+        try:
+            logger.info("[BCTC REQUEST] %s | ratio | source=fhsc", symbol)
+            # Với FHSC, hàm ratio thường không cần tham số period
+            df_ratio = equity.ratio(source="fhsc")
+            
+            if df_ratio is not None and not df_ratio.empty:
+                clean_df = df_ratio.astype(object).where(pd.notna(df_ratio), None)
+                records = clean_df.to_dict(orient="records")
+                records = json.loads(json.dumps(records, ensure_ascii=False, default=str))
+                reports["ratio"] = records
+                logger.info("[BCTC SUCCESS] %s | ratio | rows=%s", symbol, len(records))
+        except Exception as e:
+            logger.warning("[BCTC SKIP] %s | Không lấy được bảng ratio từ FHSC: %s", symbol, e)
 
-        summary = {
-            name: len(rows)
-            for name, rows in reports.items()
-        }
+        elapsed_total = round(time.time() - started, 2)
+        summary = {name: len(rows) for name, rows in reports.items()}
 
         if reports:
             logger.info(
@@ -411,17 +391,14 @@ def _fetch_bctc_ssi(symbol: str):
             return reports
 
         logger.error(
-            "[BCTC FAILED] %s | Không lấy được báo cáo nào | "
-            "elapsed=%ss",
+            "[BCTC FAILED] %s | Không lấy được báo cáo nào | elapsed=%ss",
             symbol, elapsed_total
         )
-
         return None
 
     except Exception as e:
         log_exception(
-            f"[BCTC FATAL ERROR] {symbol} | "
-            "Lỗi khởi tạo/xử lý BCTC",
+            f"[BCTC FATAL ERROR] {symbol} | Lỗi khởi tạo/xử lý BCTC",
             e
         )
         return None
