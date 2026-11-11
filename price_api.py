@@ -292,17 +292,19 @@ def _fetch_bctc_ssi(symbol: str):
 
         reports = {}
 
+        # Đã thêm "ratio" vào danh sách để lấy chỉ số tài chính
         report_names = (
             "balance_sheet",
             "income_statement",
-            "cash_flow"
+            "cash_flow",
+            "ratio" 
         )
 
         for report_name in report_names:
             report_started = time.time()
 
             logger.info(
-                "[BCTC REQUEST] %s | %s | period=quarter | source=fhsc",
+                "[BCTC REQUEST] %s | %s | period=quarter | source=vci",
                 symbol, report_name
             )
 
@@ -389,14 +391,10 @@ def _fetch_bctc_ssi(symbol: str):
             except Exception as e:
                 log_exception(
                     f"[BCTC REPORT ERROR] {symbol} | "
-                    f"{report_name} | source=fhsc",
+                    f"{report_name} | source=vci",
                     e
                 )
                 continue
-
-        # Không gọi equity.ratio() vì Vnstock 6 yêu cầu
-        # nguồn riêng cho dữ liệu tỷ số tài chính.
-        # Ba báo cáo BCTC chính vẫn được xử lý độc lập.
 
         elapsed_total = round(time.time() - started, 2)
 
@@ -430,8 +428,6 @@ def _fetch_bctc_ssi(symbol: str):
 
     finally:
         logger.info("[BCTC END] %s", symbol)
-
-
 # ===================== GITHUB BULK UPLOAD =====================
 def get_github_file_data(file_path):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
