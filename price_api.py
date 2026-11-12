@@ -1117,6 +1117,34 @@ def screener_worker():
                     if res: 
                         res["date"] = today_str
                         results.append(res)
+                
+                # === BỔ SUNG: TÍNH LẠI FINAL_DECISION LẦN 2 (Đảm bảo tính nhất quán) ===
+                if results:
+                    print(f"[SCREENER] 🔄 Đang tính lại final_decision lần 2 để đảm bảo tính nhất quán...", flush=True)
+                    for r in results:
+                        sym = r["symbol"]
+                        nd_final = normalized_db.get(sym, {})
+                        
+                        fd_label, fd_color, fd_reason = compute_final_decision(
+                            fund_score=r.get("fundamental_score", 0),
+                            tech_score=r.get("technical_score", 0),
+                            val_score=r.get("valuation_score", 0),
+                            total_score=r.get("total_score", 0),
+                            verdict=r.get("valuation_verdict", "CHƯA TÍNH"),
+                            cfo=nd_final.get("cfo_latest", 0),
+                            npat=nd_final.get("net_profit_ttm", 0),
+                            roe=nd_final.get("roe", 0),
+                            debt_to_equity=nd_final.get("debt_to_equity", 0),
+                            discount_to_fair_pct=r.get("discount_to_fair_pct", 0),
+                            close_price=r.get("close_price", 0),
+                            fair_high=r.get("fair_value_high", 0),
+                            fair_low=r.get("fair_value_low", 0)
+                        )
+                        r["final_decision"] = fd_label
+                        r["final_decision_color"] = fd_color
+                        r["final_decision_reason"] = fd_reason
+                    print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
+                # === KẾT THÚC BỔ SUNG ===
                         
                 if results:
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
@@ -1247,10 +1275,10 @@ def screener_worker():
             print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
             time.sleep(60)
 
+
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
 threading.Thread(target=full_data_crawler_worker, daemon=True).start()
 threading.Thread(target=screener_worker, daemon=True).start()
-
 # ===================== ROUTES =====================
 @app.get("/")
 def home(): 
