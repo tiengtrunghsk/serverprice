@@ -425,7 +425,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "price_change_percent": pct_change,
                         "price_change_available": prev_close > 0,
                         "price_arrow": arrow, "price_color": color,
-                        "trading_date": real_today, # SỬA: Luôn dùng ngày hôm nay cho giá realtime
+                        "trading_date": real_today, 
                         "updated_at": _now_str(), "is_locked": is_locked, "is_incomplete": False
                     }}, upsert=True)
                     
@@ -434,26 +434,35 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
-                    if current_hour >= 15 and not is_locked:
-                        d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
-                        d1_bars = [b for b in d1_bars if b.get("time") != real_today]
+                    # 3. CHỐT SỔ SAU 15H (ĐÃ SỬA)
+                    if current_hour >= 15:
+                        # Điều kiện: Đã mở sổ HOẶC có khối lượng giao dịch -> Chốt nến
+                        has_traded_today = (not is_locked) or (data.get("volume", 0) > 0)
                         
-                        d1_bars.append({
-                            "time": real_today, 
-                            "open": data["open"], 
-                            "high": data["high"], 
-                            "low": data["low"], 
-                            "close": data["close"], 
-                            "volume": data["volume"]
-                        })
-                        d1_bars.sort(key=lambda x: x["time"])
-                        
-                        history_col.update_one({"symbol": sym}, {"$set": {"history_d1": d1_bars}}, upsert=True)
-                        collection.update_one({"symbol": sym}, {"$set": {"is_locked": True, "chot_so_today": real_today}})
-                        
-                        if hist_doc is None: hist_doc = {"symbol": sym}
-                        hist_doc["history_d1"] = d1_bars
-                        pending_history_files[f"history/{sym}.json"] = hist_doc
+                        if has_traded_today:
+                            d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
+                            d1_bars = [b for b in d1_bars if b.get("time") != real_today]
+                            
+                            d1_bars.append({
+                                "time": real_today, 
+                                "open": data["open"], 
+                                "high": data["high"], 
+                                "low": data["low"], 
+                                "close": data["close"], 
+                                "volume": data["volume"]
+                            })
+                            d1_bars.sort(key=lambda x: x["time"])
+                            
+                            history_col.update_one({"symbol": sym}, {"$set": {"history_d1": d1_bars}}, upsert=True)
+                            collection.update_one({"symbol": sym}, {"$set": {"is_locked": True, "chot_so_today": real_today}})
+                            
+                            if hist_doc is None: hist_doc = {"symbol": sym}
+                            hist_doc["history_d1"] = d1_bars
+                            pending_history_files[f"history/{sym}.json"] = hist_doc
+                        else:
+                            # Ngày nghỉ: Chỉ khóa sổ, không tạo nến ma
+                            collection.update_one({"symbol": sym}, {"$set": {"is_locked": True, "chot_so_today": real_today}})
+                            
                 else:
                     print(f"  ❌ [LỖI] {sym}: Không lấy được dữ liệu.", flush=True)
                     collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": _now_str()}}, upsert=True)
@@ -483,7 +492,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     finally:
         is_crawling = False
         stop_crawl_requested = False
-
 # ===================== GITHUB HELPER =====================
 def get_github_file_data(file_path):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
