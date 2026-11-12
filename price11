@@ -425,7 +425,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "price_change_percent": pct_change,
                         "price_change_available": prev_close > 0,
                         "price_arrow": arrow, "price_color": color,
-                        "trading_date": latest_history_date if latest_history_date else real_today, 
+                        "trading_date": real_today, 
                         "updated_at": _now_str(), "is_locked": is_locked, "is_incomplete": False
                     }}, upsert=True)
                     
@@ -434,26 +434,35 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
-                    if current_hour >= 15 and not is_locked:
-                        d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
-                        d1_bars = [b for b in d1_bars if b.get("time") != real_today]
+                    # 3. CHỐT SỔ SAU 15H (ĐÃ SỬA)
+                    if current_hour >= 15:
+                        # Điều kiện: Đã mở sổ HOẶC có khối lượng giao dịch -> Chốt nến
+                        has_traded_today = (not is_locked) or (data.get("volume", 0) > 0)
                         
-                        d1_bars.append({
-                            "time": real_today, 
-                            "open": data["open"], 
-                            "high": data["high"], 
-                            "low": data["low"], 
-                            "close": data["close"], 
-                            "volume": data["volume"]
-                        })
-                        d1_bars.sort(key=lambda x: x["time"])
-                        
-                        history_col.update_one({"symbol": sym}, {"$set": {"history_d1": d1_bars}}, upsert=True)
-                        collection.update_one({"symbol": sym}, {"$set": {"is_locked": True, "chot_so_today": real_today}})
-                        
-                        if hist_doc is None: hist_doc = {"symbol": sym}
-                        hist_doc["history_d1"] = d1_bars
-                        pending_history_files[f"history/{sym}.json"] = hist_doc
+                        if has_traded_today:
+                            d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
+                            d1_bars = [b for b in d1_bars if b.get("time") != real_today]
+                            
+                            d1_bars.append({
+                                "time": real_today, 
+                                "open": data["open"], 
+                                "high": data["high"], 
+                                "low": data["low"], 
+                                "close": data["close"], 
+                                "volume": data["volume"]
+                            })
+                            d1_bars.sort(key=lambda x: x["time"])
+                            
+                            history_col.update_one({"symbol": sym}, {"$set": {"history_d1": d1_bars}}, upsert=True)
+                            collection.update_one({"symbol": sym}, {"$set": {"is_locked": True, "chot_so_today": real_today}})
+                            
+                            if hist_doc is None: hist_doc = {"symbol": sym}
+                            hist_doc["history_d1"] = d1_bars
+                            pending_history_files[f"history/{sym}.json"] = hist_doc
+                        else:
+                            # Ngày nghỉ: Chỉ khóa sổ, không tạo nến ma
+                            collection.update_one({"symbol": sym}, {"$set": {"is_locked": True, "chot_so_today": real_today}})
+                            
                 else:
                     print(f"  ❌ [LỖI] {sym}: Không lấy được dữ liệu.", flush=True)
                     collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": _now_str()}}, upsert=True)
@@ -483,7 +492,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     finally:
         is_crawling = False
         stop_crawl_requested = False
-
 # ===================== GITHUB HELPER =====================
 def get_github_file_data(file_path):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
@@ -637,6 +645,21 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     close_price, cfo_latest, net_profit_ttm = nd["close_price"], nd["cfo_latest"], nd["net_profit_ttm"]
     debt_to_equity, profit_growth_yoy, credit_growth_yoy = nd["debt_to_equity"], nd["profit_growth_yoy"], nd["credit_growth_yoy"]
     
+    # --- BẮT ĐẦU: KIỂM TRA CHẤT LƯỢNG DỮ LIỆU (GẮN CỜ NẾU THIẾU BẤT KỲ CHỈ SỐ NÀO) ---
+    data_warnings = []
+    if close_price <= 0: 
+        data_warnings.append("Thiếu Giá")
+    if pe <= 0 and sector not in ["NGAN_HANG", "CHUNG_KHOAN"]: 
+        data_warnings.append("Thiếu P/E")
+    if pb <= 0: 
+        data_warnings.append("Thiếu P/B")
+    if roe == 0: 
+        data_warnings.append("Thiếu ROE")
+    
+    # Gắn cờ cảnh báo nếu thiếu BẤT KỲ chỉ số nào
+    is_data_incomplete = len(data_warnings) > 0
+    # --- KẾT THÚC KIỂM TRA ---
+
     fund_score = 0
     fund_notes = []
     
@@ -748,7 +771,11 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "sim_start_quarter": sim_data["start_quarter"] if sim_data else "",
         "sim_start_price": sim_data["start_price_mean"] if sim_data else 0,
         "sim_end_quarter": sim_data["end_quarter"] if sim_data else "",
-        "sim_end_price": sim_data["end_price_mean"] if sim_data else 0
+        "sim_end_price": sim_data["end_price_mean"] if sim_data else 0,
+        
+        # TRẢ VỀ 2 TRƯỜNG CẢNH BÁO DỮ LIỆU
+        "data_warnings": data_warnings,
+        "is_data_incomplete": is_data_incomplete
     }
 
 def aggregate_candles(data, interval):
@@ -912,34 +939,205 @@ def screener_worker():
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
-            if vn_now.hour == 16 and vn_now.minute == 30 and vn_now.second < 10:
+            today_str = vn_now.strftime("%Y-%m-%d")
+            current_hour = vn_now.hour
+            
+            # Kiểm tra tiến độ chốt sổ
+            all_symbols_count = collection.count_documents({})
+            crawled_count = collection.count_documents({"chot_so_today": today_str})
+            
+            # Điều kiện chạy: Đúng 16h30 (dự phòng) HOẶC vừa chốt sổ xong
+            is_1630 = (current_hour == 16 and vn_now.minute == 30 and vn_now.second < 10)
+            is_just_closed = (current_hour >= 15 and crawled_count >= all_symbols_count and all_symbols_count > 0)
+
+            if is_1630 or is_just_closed:
+                # Chống chạy lặp lại trong cùng 1 ngày
+                today_screener_check = screener_col.find_one({"date": today_str})
+                if today_screener_check:
+                    time.sleep(60)
+                    continue
+
+                print(f"\n[SCREENER] ⏰ Kích hoạt chấm điểm (Lý do: {'16h30' if is_1630 else 'Vừa chốt sổ xong'})", flush=True)
+                
+                # 1. LẤY DỮ LIỆU TỪ DATABASE
                 stock_db = {}
                 for doc in collection.find({}):
                     bctc = bctc_col.find_one({"symbol": doc["symbol"]}, {"_id": 0})
                     doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                     stock_db[doc["symbol"]] = doc
+                
+                # 2. TÍNH TOÁN ĐIỂM
                 normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
                 sector_medians = compute_sector_medians(normalized_db)
                 results = []
+                
                 for symbol, nd in normalized_db.items():
                     grp = get_sub_sector(symbol)
                     cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(symbol))
                     med, _ = get_median_for_symbol(symbol, sector_medians)
                     res = evaluate_stock_from_db(symbol, nd, med, grp, cfg)
-                    if res: results.append(res)
+                    if res: 
+                        res["date"] = today_str # Đánh dấu ngày để chống chạy lặp
+                        results.append(res)
+                        
                 if results:
+                    # 3. LƯU VÀO DATABASE VÀ GITHUB
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
                     screener_col.delete_many({}) 
                     screener_col.insert_many(results) 
                     commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Update Screener {_now_str()}")
-                time.sleep(120) 
+                    print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã.", flush=True)
+
+                    # 4. TỔNG HỢP VÀ GỬI BÁO CÁO TELEGRAM CHUYÊN SÂU
+                    try:
+                        # --- BIẾN ĐẾM CHUNG ---
+                        up_count = 0
+                        down_count = 0
+                        ref_count = 0
+                        buy_strong = 0
+                        buy_accumulate = 0
+                        avoid = 0
+                        
+                        strong_movers = []
+                        value_stocks = []
+                        danger_stocks = []
+
+                        # --- BIẾN ĐẾM LỖI DỮ LIỆU CHI TIẾT ---
+                        missing_price_count = 0
+                        missing_pe_count = 0
+                        missing_pb_count = 0
+                        missing_roe_count = 0
+                        
+                        # Danh sách mẫu các mã bị thiếu (tối đa 5 mã mỗi loại)
+                        missing_pe_symbols = []
+                        missing_pb_symbols = []
+                        missing_roe_symbols = []
+                        missing_price_symbols = []
+
+                        for r in results:
+                            decision = r.get("final_decision", "")
+                            if "MUA MẠNH" in decision: buy_strong += 1
+                            elif "MUA TÍCH SẢN" in decision: buy_accumulate += 1
+                            elif "TRÁNH" in decision: 
+                                avoid += 1
+                                if len(danger_stocks) < 3:
+                                    danger_stocks.append(f"  • {r['symbol']} (Điểm: {r.get('total_score', 0)})")
+
+                            # Lấy dữ liệu từ DB để phân tích
+                            stock_data = stock_db.get(r['symbol'], {})
+                            pct_change = stock_data.get("price_change_percent", 0)
+                            vol_pct = stock_data.get("volume_percent", 0)
+                            close_price = stock_data.get("close", 0)
+
+                            # 1. Thống kê độ rộng thị trường
+                            if pct_change > 0.05: up_count += 1
+                            elif pct_change < -0.05: down_count += 1
+                            else: ref_count += 1
+
+                            # 2. Lọc mã biến động mạnh (Dòng tiền nóng)
+                            if abs(pct_change) >= 3.0 and vol_pct >= 120.0:
+                                arrow = "🔴" if pct_change < 0 else "🟢"
+                                strong_movers.append(f"  {arrow} <b>{r['symbol']}</b>: {pct_change:+.2f}% (Vol: {vol_pct:.0f}%)")
+
+                            # 3. Lọc mã cơ hội (Rẻ + Cơ bản tốt >= 30đ)
+                            if "RẺ" in r.get("valuation_verdict", "") and r.get("fundamental_score", 0) >= 30:
+                                if len(value_stocks) < 3:
+                                    value_stocks.append(f"  • <b>{r['symbol']}</b> ({r.get('sector')}): Giá {close_price:,.0f} - Vùng mua ≤ {r.get('fair_value_low',0):,.0f}")
+                            
+                            # 4. Đếm lỗi dữ liệu chi tiết
+                            warnings = r.get("data_warnings", [])
+                            if "Thiếu Giá" in warnings: 
+                                missing_price_count += 1
+                                if len(missing_price_symbols) < 5: missing_price_symbols.append(r['symbol'])
+                            if "Thiếu P/E" in warnings: 
+                                missing_pe_count += 1
+                                if len(missing_pe_symbols) < 5: missing_pe_symbols.append(r['symbol'])
+                            if "Thiếu P/B" in warnings: 
+                                missing_pb_count += 1
+                                if len(missing_pb_symbols) < 5: missing_pb_symbols.append(r['symbol'])
+                            if "Thiếu ROE" in warnings: 
+                                missing_roe_count += 1
+                                if len(missing_roe_symbols) < 5: missing_roe_symbols.append(r['symbol'])
+
+                        # --- TẠO CẢNH BÁO DỮ LIỆU CHI TIẾT ---
+                        data_alert_lines = []
+                        if missing_pe_count > 0:
+                            sample = f" (VD: {', '.join(missing_pe_symbols)}...)" if missing_pe_symbols else ""
+                            data_alert_lines.append(f"  • <b>{missing_pe_count} mã</b> thiếu P/E{sample}")
+                        if missing_pb_count > 0:
+                            sample = f" (VD: {', '.join(missing_pb_symbols)}...)" if missing_pb_symbols else ""
+                            data_alert_lines.append(f"  • <b>{missing_pb_count} mã</b> thiếu P/B{sample}")
+                        if missing_roe_count > 0:
+                            sample = f" (VD: {', '.join(missing_roe_symbols)}...)" if missing_roe_symbols else ""
+                            data_alert_lines.append(f"  • <b>{missing_roe_count} mã</b> thiếu ROE{sample}")
+                        if missing_price_count > 0:
+                            sample = f" (VD: {', '.join(missing_price_symbols)}...)" if missing_price_symbols else ""
+                            data_alert_lines.append(f"  • <b>{missing_price_count} mã</b> bị thiếu Giá (Lỗi cào giá){sample}")
+
+                        # --- NHẬN ĐỊNH THỊ TRƯỜNG TỰ ĐỘNG ---
+                        total_up_down = up_count + down_count
+                        if total_up_down > 0:
+                            ratio_up = (up_count / total_up_down) * 100
+                        else:
+                            ratio_up = 50
+
+                        if ratio_up >= 65:
+                            market_view = "🟢 <b>TÂM LÝ HƯNG PHẤN:</b> Dòng tiền lan tỏa mạnh, ưu tiên nắm giữ cổ phiếu."
+                        elif ratio_up <= 35:
+                            market_view = "🔴 <b>TÂM LÝ BI QUAN:</b> Áp lực bán chiếm ưu thế, hạn chế mua mới."
+                        else:
+                            market_view = "🟡 <b>THỊ TRƯỜNG PHÂN HÓA:</b> Dòng tiền có sự chọn lọc, chỉ nên mua các mã có nền tảng tốt."
+
+                        # --- TẠO NỘI DUNG TIN NHẮN ---
+                        msg_lines = []
+                        
+                        # CẢNH BÁO LỖI DỮ LIỆU LÊN ĐẦU TIÊN (NẾU CÓ)
+                        if data_alert_lines:
+                            msg_lines.append(f"⚠️ <b>CẢNH BÁO LỖI DỮ LIỆU API!</b>")
+                            msg_lines.append(f"Phát hiện các mã bị thiếu thông số để chấm điểm:")
+                            msg_lines.extend(data_alert_lines)
+                            msg_lines.append(f"  👉 <i>Hãy chạy lại API /api/crawl-ratios hoặc /api/force-bctc!</i>")
+                            msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
+
+                        msg_lines.extend([
+                            f"📊 <b>BÁO CÁO THỊ TRƯỜNG TỰ ĐỘNG</b>",
+                            f"⏰ Cập nhật: {_now_str()}",
+                            f"━━━━━━━━━━━━━━━━━━",
+                            f"<b>1️⃣ TỔNG QUAN ĐỘ RỘNG</b>",
+                            f"  🟢 Tăng: <b>{up_count}</b> | 🔴 Giảm: <b>{down_count}</b> | ⚪ Đứng: {ref_count}",
+                            f"  👉 {market_view}",
+                            f"━━━━━━━━━━━━━━━━━━",
+                            f"<b>2️⃣ DÒNG TIỀN ĐỘT BIẾN (Hot Money)</b>"
+                        ])
+                        
+                        if strong_movers:
+                            msg_lines.extend(strong_movers)
+                        else:
+                            msg_lines.append("  💤 Không có mã nào biến động quá 3%.")
+
+                        msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
+                        msg_lines.append(f"<b>3️⃣ CƠ HỘI GIẢI NGÂN (Vùng mua an toàn)</b>")
+                        if value_stocks:
+                            msg_lines.extend(value_stocks)
+                        else:
+                            msg_lines.append("  ⏳ Hiện chưa có mã nào thỏa mãn (Rẻ + Cơ bản tốt).")
+
+                        msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
+                        msg_lines.append(f"<b>4️⃣ CẢNH BÁO RỦI RO</b>")
+                        msg_lines.append(f"  ❌ Có <b>{avoid}</b> mã bị đánh giá TRÁNH (Giá đắt, nền tảng yếu).")
+                        if danger_stocks:
+                             msg_lines.append(f"  ⚠️ <i>Điển hình: {', '.join(danger_stocks).replace('  • ', '')}</i>")
+
+                        send_telegram("\n".join(msg_lines))
+                        print("[SCREENER] 🚀 Đã gửi báo cáo thị trường qua Telegram.", flush=True)
+                    except Exception as te:
+                        print(f"[SCREENER] ❌ Lỗi khi gửi Telegram: {te}", flush=True)
+
+                time.sleep(120) # Nghỉ 2 phút sau khi chấm xong
             time.sleep(30)
-        except Exception: time.sleep(60)
-
-threading.Thread(target=auto_crawler_worker, daemon=True).start()
-threading.Thread(target=full_data_crawler_worker, daemon=True).start()
-threading.Thread(target=screener_worker, daemon=True).start()
-
+        except Exception as e: 
+            print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
+            time.sleep(60)
 # ===================== ROUTES =====================
 @app.get("/")
 def home(): 
@@ -1363,6 +1561,7 @@ def force_screener():
             
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
+
 @app.get("/api/force-realtime")
 def force_realtime():
     print(f"\n[API] ⚡ Gọi API /api/force-realtime (Ép cào giá Realtime ngay lập tức)", flush=True)
@@ -1381,6 +1580,7 @@ def force_realtime():
         "status": "success", 
         "message": f"Đã kích hoạt ép cào realtime cho toàn bộ {len(all_symbols)} mã. Vui lòng đợi 1-2 phút rồi F5 trang web!"
     })
+
 @app.get("/api/reset-today")
 def reset_today():
     print(f"\n[API] 📥 Gọi API /api/reset-today (Hủy chốt sổ)", flush=True)
@@ -1406,6 +1606,32 @@ def retry_now():
         return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
+
+# ===================== API LỊCH SỬ (BỔ SUNG CHO ĐỒ THỊ) =====================
+@app.get("/api/history")
+def api_get_history():
+    symbol = request.args.get("symbol", "").upper().strip()
+    if not symbol:
+        return jsonify({"status": "error", "message": "Thiếu mã"}), 400
+        
+    print(f"[API] 📊 Gọi API /api/history | Mã: {symbol}", flush=True)
+    
+    try:
+        hist_doc = history_col.find_one({"symbol": symbol}, {"_id": 0})
+        if not hist_doc:
+            return jsonify({"status": "error", "message": "Không có dữ liệu lịch sử"}), 404
+            
+        # Trả về toàn bộ dữ liệu lịch sử
+        return jsonify({
+            "status": "success", 
+            "symbol": symbol,
+            "history_d1": hist_doc.get("history_d1", []),
+            "history_w1": hist_doc.get("history_w1", []),
+            "history_mn": hist_doc.get("history_mn", [])
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
