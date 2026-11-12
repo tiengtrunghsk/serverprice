@@ -733,7 +733,7 @@ def build_verified_facts(symbol, sm, si, sector):
 
 # ===================== BACKGROUND WORKERS =====================
 def auto_crawler_worker():
-    print("⏰ [AUTO] Đã bật chế độ cào Real-time (Chỉ chạy 9h-15h, nghỉ trưa & cuối tuần)!", flush=True)
+    print("⏰ [AUTO] Đã bật chế độ cào Real-time (Tự động phát hiện ngày nghỉ)!", flush=True)
     while True:
         try:
             global is_auto_crawl_paused
@@ -747,26 +747,67 @@ def auto_crawler_worker():
             current_minute = vn_now.minute
             weekday = vn_now.weekday()
 
+            # 1. KIỂM TRA CUỐI TUẦN
             is_weekend = weekday >= 5
+            if is_weekend:
+                tomorrow = vn_now + timedelta(days=1)
+                while tomorrow.weekday() >= 5:
+                    tomorrow += timedelta(days=1)
+                wake_up_time = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
+                sleep_seconds = (wake_up_time - vn_now).total_seconds()
+                if sleep_seconds > 0:
+                    print(f"🌙 [AUTO] Hôm nay là cuối tuần. Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
+                    time.sleep(min(sleep_seconds, 3600))
+                    continue
+
+            # 2. KIỂM TRA GIỜ GIAO DỊCH
             is_lunch_break = (current_hour == 11 and current_minute >= 30) or (current_hour == 12)
-            is_trading_time = (not is_weekend) and (9 <= current_hour < 15) and (not is_lunch_break)
+            is_trading_time = (9 <= current_hour < 15) and (not is_lunch_break)
 
             if not is_trading_time:
                 if is_lunch_break:
                     wake_up_time = vn_now.replace(hour=13, minute=0, second=0, microsecond=0)
                 else:
                     wake_up_time = vn_now.replace(hour=8, minute=55, second=0, microsecond=0)
-                    if current_hour >= 15 or is_weekend:
+                    if current_hour >= 15:
                         wake_up_time += timedelta(days=1)
                     while wake_up_time.weekday() >= 5:
                         wake_up_time += timedelta(days=1)
-
+                        
                 sleep_seconds = (wake_up_time - vn_now).total_seconds()
                 if sleep_seconds > 0:
                     print(f"🌙 [AUTO] Ngoài giờ giao dịch. Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
                     time.sleep(min(sleep_seconds, 3600))
                     continue
 
+            # 3. PHÁT HIỆN NGÀY LỄ (Kiểm tra toàn bộ 100 mã vào lúc 10h00)
+            if current_hour == 10 and current_minute == 0:
+                all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+                any_changed = False
+                
+                print(f"🔍 [AUTO] Kiểm tra toàn bộ {len(all_symbols)} mã (Ngày lễ hay ngày làm việc?)...", flush=True)
+                
+                for sym in all_symbols:
+                    doc = collection.find_one({"symbol": sym})
+                    if doc:
+                        # Nếu có BẤT KỲ mã nào có close khác prev_close HOẶC volume > 0 -> Thị trường đang chạy
+                        if doc.get("close") != doc.get("prev_close") or doc.get("volume", 0) > 0:
+                            any_changed = True
+                            print(f"  ✅ [AUTO] Thị trường đang giao dịch (Mã {sym} đã biến động).", flush=True)
+                            break
+                
+                if not any_changed:
+                    print(f"🌙 [AUTO] Toàn bộ {len(all_symbols)} mã đều đứng giá. Kết luận: Hôm nay là NGÀY NGHỈ.", flush=True)
+                    tomorrow = vn_now + timedelta(days=1)
+                    while tomorrow.weekday() >= 5:
+                        tomorrow += timedelta(days=1)
+                    wake_up_time = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
+                    sleep_seconds = (wake_up_time - vn_now).total_seconds()
+                    print(f"🌙 [AUTO] Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
+                    time.sleep(min(sleep_seconds, 3600))
+                    continue
+
+            # 4. TIẾN HÀNH CÀO
             collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             crawled_count = collection.count_documents({"chot_so_today": today_str})
@@ -792,7 +833,6 @@ def auto_crawler_worker():
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
-
 def full_data_crawler_worker():
     while True:
         try:
