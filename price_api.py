@@ -65,6 +65,7 @@ GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip()
 
 SYMBOLS_JSON_FILE = "vn100_symbols.json"
+VN100_INFO_FILE = "vn100_full_info.json"
 SCREENER_JSON_FILE = "screener_results.json"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -78,6 +79,24 @@ ALIBABA_API_KEY = os.environ.get("ALIBABA_API_KEY", "").strip()
 AI_API_URL = "https://ws-8lcqaxwxdv0h9xzy.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
 AI_MODEL_NAME = "qwen3.7-max"
 AI_TEMPERATURE = 0.15
+
+# ===================== ĐỌC METADATA TỪ FILE JSON =====================
+VN100_METADATA = {}
+if os.path.exists(VN100_INFO_FILE):
+    try:
+        with open(VN100_INFO_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for item in data:
+                sym = str(item.get("symbol", "")).upper().strip()
+                if sym:
+                    VN100_METADATA[sym] = {
+                        "company_name": item.get("company_name", "") or item.get("organName", "") or "",
+                        "market_cap": float(item.get("market_cap", 0) or item.get("capitalization", 0) or 0),
+                        "total_shares": int(item.get("total_shares", 0) or item.get("shares", 0) or 0)
+                    }
+        logger.info(f"Đã tải metadata cho {len(VN100_METADATA)} mã từ {VN100_INFO_FILE}")
+    except Exception as e:
+        logger.warning(f"Lỗi đọc {VN100_INFO_FILE}: {e}")
 
 # ===================== DATABASE =====================
 logger.info("Đang kết nối MongoDB...")
@@ -107,7 +126,7 @@ except Exception as e:
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
-# === BIẾN TRẠNG THÁI (ĐÃ CHUYỂN LÊN ĐẦU) ===
+# === BIẾN TRẠNG THÁI ===
 is_crawling = False
 is_full_data_running = False
 is_screener_running = False
@@ -181,7 +200,7 @@ def get_historical_return_rate_with_details(symbol):
         }
     except Exception as e: return None
 
-# ===================== CÀO GIÁ (ĐÃ KHÔI PHỤC LOGIC CHUẨN) =====================
+# ===================== CÀO GIÁ =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
     print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True)
     def _do():
@@ -536,13 +555,19 @@ SUB_SECTOR_MAPPING = {
     "AGRI": ["VHC", "ANV", "DBC", "SBT", "ASM", "APH"],
 }
 SUB_SECTOR_CONFIG = {
-    "NGAN_HANG": {"cap_pe": 14, "cap_pb": 1.8, "mos": 0.20}, "CHUNG_KHOAN": {"cap_pe": 14, "cap_pb": 1.8, "mos": 0.25},
-    "BAT_DONG_SAN": {"cap_pe": 12, "cap_pb": 2.0, "mos": 0.30}, "CONG_NGHE_BAN_LE": {"cap_pe": 20, "cap_pb": 3.0, "mos": 0.20},
-    "DIEN_NUOC_HA_TANG": {"cap_pe": 15, "cap_pb": 2.0, "mos": 0.15}, "NGUYEN_VAT_LIEU_CHU_KY": {"cap_pe": 12, "cap_pb": 2.0, "mos": 0.30},
-    "SAN_XUAT_TIEU_DUNG_PHONG_THU": {"cap_pe": 18, "cap_pb": 2.5, "mos": 0.25}, "INSURANCE": {"cap_pe": 16, "cap_pb": 2.0, "mos": 0.25},
-    "PETROLEUM": {"cap_pe": 12, "cap_pb": 1.5, "mos": 0.30}, "MARITIME": {"cap_pe": 10, "cap_pb": 1.5, "mos": 0.30},
-    "AVIATION": {"cap_pe": 15, "cap_pb": 3.0, "mos": 0.35}, "CONSTRUCTION": {"cap_pe": 12, "cap_pb": 1.5, "mos": 0.30},
-    "AGRI": {"cap_pe": 14, "cap_pb": 2.0, "mos": 0.25},
+    "NGAN_HANG": {"cap_pe": 14, "cap_pb": 1.8, "mos": 0.20, "primary_metric": "PB"},
+    "CHUNG_KHOAN": {"cap_pe": 14, "cap_pb": 1.8, "mos": 0.25, "primary_metric": "PB"},
+    "BAT_DONG_SAN": {"cap_pe": 12, "cap_pb": 2.0, "mos": 0.30, "primary_metric": "PB"},
+    "CONG_NGHE_BAN_LE": {"cap_pe": 20, "cap_pb": 3.0, "mos": 0.20, "primary_metric": "PE"},
+    "DIEN_NUOC_HA_TANG": {"cap_pe": 15, "cap_pb": 2.0, "mos": 0.15, "primary_metric": "PE"},
+    "NGUYEN_VAT_LIEU_CHU_KY": {"cap_pe": 12, "cap_pb": 2.0, "mos": 0.30, "primary_metric": "PB"},
+    "SAN_XUAT_TIEU_DUNG_PHONG_THU": {"cap_pe": 18, "cap_pb": 2.5, "mos": 0.25, "primary_metric": "PE"},
+    "INSURANCE": {"cap_pe": 16, "cap_pb": 2.0, "mos": 0.25, "primary_metric": "PB"},
+    "PETROLEUM": {"cap_pe": 12, "cap_pb": 1.5, "mos": 0.30, "primary_metric": "PE"},
+    "MARITIME": {"cap_pe": 10, "cap_pb": 1.5, "mos": 0.30, "primary_metric": "PB"},
+    "AVIATION": {"cap_pe": 15, "cap_pb": 3.0, "mos": 0.35, "primary_metric": "PB"},
+    "CONSTRUCTION": {"cap_pe": 12, "cap_pb": 1.5, "mos": 0.30, "primary_metric": "PB"},
+    "AGRI": {"cap_pe": 14, "cap_pb": 2.0, "mos": 0.25, "primary_metric": "PE"},
 }
 
 def get_sector(symbol):
@@ -593,23 +618,38 @@ def get_median_for_symbol(symbol, sector_medians):
 def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     eps, bvps, close = nd["eps"], nd["bvps"], nd["close_price"]
     cfo, npat = nd["cfo_latest"], nd["net_profit_ttm"]
+    ps = nd.get("ps", 0)
+    roe = nd.get("roe", 0)
     methods = {}
-    med_pe, med_pb, med_roe = sector_median.get("pe") or 12.0, sector_median.get("pb") or 2.0, sector_median.get("roe") or 0.0
+    med_pe, med_pb, med_ps, med_roe = sector_median.get("pe") or 12.0, sector_median.get("pb") or 2.0, sector_median.get("ps") or 0.0, sector_median.get("roe") or 0.0
     cap_pe, cap_pb, mos = config["cap_pe"], config["cap_pb"], config["mos"]
     is_financial = group_label in ("NGAN_HANG", "CHUNG_KHOAN", "INSURANCE")
     
-    if eps > 0 and med_pe > 0: methods["PE_method"] = round(eps * min(med_pe * (1.15 if (nd["roe"] > med_roe) else 1.0), cap_pe), 0)
-    if bvps > 0 and med_pb > 0: methods["PB_method"] = round(bvps * min(med_pb, cap_pb), 0)
-    if not is_financial and eps > 0 and bvps > 0: methods["Graham"] = round((22.5 * eps * bvps) ** 0.5, 0)
-    if not is_financial and npat > 0 and cfo > 0 and (cfo / npat) >= 0.8 and eps > 0 and med_pe > 0: methods["CFO_boost"] = round(eps * min(med_pe, cap_pe) * 1.10, 0)
+    if eps > 0 and med_pe > 0: 
+        roe_bonus = 1.15 if (roe > 0 and roe > med_roe) else 1.0
+        methods["PE_method"] = round(eps * min(med_pe * roe_bonus, cap_pe), 0)
+    if bvps > 0 and med_pb > 0: 
+        methods["PB_method"] = round(bvps * min(med_pb, cap_pb), 0)
+    if not is_financial and eps > 0 and bvps > 0: 
+        methods["Graham"] = round((22.5 * eps * bvps) ** 0.5, 0)
+    if not is_financial and npat > 0 and cfo > 0 and (cfo / npat) >= 0.8 and eps > 0 and med_pe > 0: 
+        methods["CFO_boost"] = round(eps * min(med_pe, cap_pe) * 1.10, 0)
+    
+    # PS_METHOD (Bổ sung từ script cũ)
+    if config.get("primary_metric") == "PB" and ps > 0 and med_ps > 0:
+        sales_per_share = close / ps if ps > 0 else 0
+        target_ps = min(med_ps, 2.5)
+        if sales_per_share > 0:
+            methods["PS_method"] = round(sales_per_share * target_ps, 0)
     
     if not methods: return {"fair_low": 0, "fair_high": 0, "graham": 0, "methods": {}, "mos_pct": round(mos * 100, 1), "rationale": "Không đủ DL.", "discount_to_fair_pct": 0, "verdict": "KHÔNG ĐỦ DỮ LIỆU"}
     
-    weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1}
+    weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1, "PS_method": 1}
     weighted = []
     for k, v in methods.items(): weighted.extend([v] * int(weights.get(k, 1) * 2))
     weighted.sort()
-    fair_high = weighted[len(weighted) // 2]
+    n = len(weighted)
+    fair_high = weighted[n // 2] if n % 2 else (weighted[n // 2 - 1] + weighted[n // 2]) / 2
     fair_low = fair_high * (1 - mos)
     discount_to_fair = ((fair_low - close) / close * 100) if close > 0 else 0.0
     verdict = "KHÔNG CÓ GIÁ" if close <= 0 else ("RẺ - TRONG VÙNG MUA" if close <= fair_low else ("HỢP LÝ - CHỜ ĐIỀU CHỈNH" if close <= fair_high else ("HƠI ĐẮT - KHÔNG MUA" if close <= fair_high * 1.2 else "ĐẮT - TRÁNH")))
@@ -625,6 +665,7 @@ def compute_final_decision(fund_score, tech_score, val_score, total_score, verdi
     if (verdict == "RẺ - TRONG VÙNG MUA" and fund_score >= 30 and tech_score >= 10 and val_score >= 18 and total_score >= 60): return ("✅ MUA TÍCH SẢN", "emerald", "ĐỦ 4 YẾU TỐ.")
     if (fund_score >= 30 and val_score >= 18 and verdict in ("HỢP LÝ - CHỜ ĐIỀU CHỈNH", "HƠI ĐẮT - KHÔNG MUA")): return ("⚠️ CHỜ VỀ VÙNG MUA", "amber", "DN tốt nhưng giá chưa rẻ.")
     if (verdict == "RẺ - TRONG VÙNG MUA" and fund_score >= 30 and val_score >= 18 and tech_score < 10): return ("⏳ CHỜ XÁC NHẬN KỸ THUẬT", "amber", "Chờ tín hiệu.")
+    if (verdict == "RẺ - TRONG VÙNG MUA" and fund_score >= 30 and val_score < 18): return ("⏳ CHỜ ĐỊNH GIÁ TỐT HƠN", "amber", "Định giá chưa hấp dẫn.")
     return ("👀 THEO DÕI", "slate", "Chưa đủ ĐK.")
 
 def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
@@ -735,6 +776,9 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     decision, color, reason = compute_final_decision(fund_score, tech_score, val_score, total_score, fv["verdict"], cfo_latest, net_profit_ttm, roe, debt_to_equity, fv["discount_to_fair_pct"], close_price, fv["fair_high"], fv["fair_low"])
 
     sim_data = get_historical_return_rate_with_details(symbol)
+    
+    # Bổ sung metadata
+    meta = VN100_METADATA.get(symbol, {})
 
     return {
         "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
@@ -752,6 +796,10 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "sim_start_price": sim_data["start_price_mean"] if sim_data else 0,
         "sim_end_quarter": sim_data["end_quarter"] if sim_data else "",
         "sim_end_price": sim_data["end_price_mean"] if sim_data else 0,
+        
+        "company_name": meta.get("company_name", ""),
+        "market_cap": meta.get("market_cap", 0),
+        "total_shares": meta.get("total_shares", 0),
         
         "data_warnings": data_warnings,
         "is_data_incomplete": is_data_incomplete
@@ -1746,7 +1794,7 @@ def retry_now():
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
 
-# ===================== API LỊCH SỬ (BỔ SUNG CHO ĐỒ THỊ) =====================
+# ===================== API LỊCH SỬ =====================
 @app.get("/api/history")
 def api_get_history():
     symbol = request.args.get("symbol", "").upper().strip()
