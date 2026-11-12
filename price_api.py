@@ -653,32 +653,70 @@ def build_verified_facts(symbol, sm, si, sector):
 
 # ===================== BACKGROUND WORKERS =====================
 def auto_crawler_worker():
+    print("⏰ [AUTO] Đã bật chế độ cào Real-time (Chỉ chạy 9h-15h, nghỉ trưa & cuối tuần)!", flush=True)
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
             current_hour = vn_now.hour
+            current_minute = vn_now.minute
+            weekday = vn_now.weekday() # 0 là thứ 2, 6 là chủ nhật
+
+            # 1. KIỂM TRA ĐIỀU KIỆN THỜI GIAN
+            is_weekend = weekday >= 5
+            is_lunch_break = (current_hour == 11 and current_minute >= 30) or (current_hour == 12)
+            
+            # Chỉ cào khi: Trong tuần VÀ Từ 9h sáng đến trước 15h chiều
+            is_trading_time = (not is_weekend) and (9 <= current_hour < 15) and (not is_lunch_break)
+
+            if not is_trading_time:
+                # Tính toán thời gian ngủ (đến 8h55 sáng mai hoặc 13h00 nếu là nghỉ trưa)
+                if is_lunch_break:
+                    wake_up_time = vn_now.replace(hour=13, minute=0, second=0, microsecond=0)
+                else:
+                    wake_up_time = vn_now.replace(hour=8, minute=55, second=0, microsecond=0)
+                    # Nếu đã qua 15h hoặc đang là cuối tuần -> Ngủ đến sáng hôm sau
+                    if current_hour >= 15 or is_weekend:
+                        wake_up_time += timedelta(days=1)
+                    
+                    # Nếu rơi vào thứ 7, CN thì đẩy lùi đến thứ 2
+                    while wake_up_time.weekday() >= 5:
+                        wake_up_time += timedelta(days=1)
+
+                sleep_seconds = (wake_up_time - vn_now).total_seconds()
+                if sleep_seconds > 0:
+                    print(f"🌙 [AUTO] Ngoài giờ giao dịch. Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
+                    # Ngủ tối đa 1 tiếng (để tránh treo nếu có thay đổi cài đặt)
+                    time.sleep(min(sleep_seconds, 3600))
+                    continue
+
+            # 2. TRONG GIỜ GIAO DỊCH -> TIẾN HÀNH CÀO
             collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             crawled_count = collection.count_documents({"chot_so_today": today_str})
-            
-            if current_hour >= 15 and crawled_count >= len(all_symbols):
-                tomorrow = vn_now + timedelta(days=1)
-                wake_up_time = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
-                sleep_seconds = (wake_up_time - vn_now).total_seconds()
-                if sleep_seconds > 0:
-                    time.sleep(min(sleep_seconds, 3600)) 
-                    continue
+
+            # Nếu đã cào xong 100% trong ngày, không cần cào lại
+            if crawled_count >= len(all_symbols) and len(all_symbols) > 0:
+                time.sleep(60)
+                continue
+
             if not is_crawling:
                 symbols_to_crawl = []
                 for sym in all_symbols:
                     doc = collection.find_one({"symbol": sym}, {"chot_so_today": 1})
-                    if not doc or doc.get("chot_so_today") != today_str: symbols_to_crawl.append(sym)
-                if not symbols_to_crawl: symbols_to_crawl = all_symbols 
+                    if not doc or doc.get("chot_so_today") != today_str: 
+                        symbols_to_crawl.append(sym)
+                
+                if not symbols_to_crawl: 
+                    symbols_to_crawl = all_symbols 
+                    
                 _execute_crawl(symbols_to_crawl, is_manual=False)
-            time.sleep(15)
-        except Exception: time.sleep(10)
-
+                
+            time.sleep(15) # Nghỉ 15s trước vòng lặp tiếp theo
+            
+        except Exception as e:
+            print(f"❌ [AUTO] Lỗi: {e}", flush=True)
+            time.sleep(10)
 def full_data_crawler_worker():
     while True:
         try:
