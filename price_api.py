@@ -1076,7 +1076,60 @@ def crawl_full_bctc():
         finally: is_full_data_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào FULL BCTC..."})
+@app.get("/api/crawl-ratios")
+def crawl_ratios():
+    print(f"\n[API] 📥 Gọi API /api/crawl-ratios (Cào P/E, P/B, ROE từ VCI)", flush=True)
+    global is_full_data_running
+    if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
+    is_full_data_running = True
 
+    def _run():
+        global is_full_data_running
+        try:
+            target = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+            print(f"[RATIO-CRAWL] 🚀 Bắt đầu cào bảng Ratio cho {len(target)} mã...", flush=True)
+            
+            for i, sym in enumerate(target):
+                print(f"[RATIO-CRAWL] [{i+1}/{len(target)}] Đang lấy ratio cho {sym}...", flush=True)
+                try:
+                    # Gọi API VCI lấy bảng ratio
+                    df_ratio = Fundamental().equity(sym).ratio(source="vci", period="quarterly")
+                    
+                    if df_ratio is not None and not df_ratio.empty:
+                        # Sắp xếp mới nhất lên đầu
+                        if 'year' in df_ratio.columns and 'quarter' in df_ratio.columns:
+                            df_ratio = df_ratio.sort_values(by=['year', 'quarter'], ascending=[False, False])
+                            df_ratio = df_ratio.head(8) # Lấy 8 quý gần nhất
+                        
+                        records = df_ratio.to_dict(orient="records")
+                        
+                        # Lấy bản ghi mới nhất
+                        latest = records[0]
+                        
+                        # Cập nhật các chỉ số vào bảng stocks
+                        collection.update_one({"symbol": sym}, {"$set": {
+                            "pe": float(latest.get("pe", 0) or 0),
+                            "pb": float(latest.get("pb", 0) or 0),
+                            "ps": float(latest.get("ps", 0) or 0),
+                            "roe": float(latest.get("roe", 0) or 0),
+                            "roa": float(latest.get("roa", 0) or 0),
+                            "eps": float(latest.get("eps", 0) or 0),
+                            "dividend_yield": float(latest.get("dividend_yield", 0) or 0),
+                            "ratio_updated_at": _now_str()
+                        }}, upsert=True)
+                        print(f"  ✅ [RATIO] {sym} thành công (P/E: {latest.get('pe', 0)})", flush=True)
+                    else:
+                        print(f"  ⚠️ [RATIO] {sym} không có dữ liệu trả về.", flush=True)
+                except Exception as e:
+                    print(f"  ❌ [RATIO] Lỗi khi lấy {sym}: {e}", flush=True)
+                time.sleep(1.5) # Nghỉ 1.5s tránh Rate Limit VCI
+                
+            print(f"[RATIO-CRAWL] 🏁 Đã cào xong toàn bộ bảng Ratio.", flush=True)
+        finally: 
+            is_full_data_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "success", "message": "Đang cào bảng Ratio (P/E, ROE...) từ VCI..."})
 @app.get("/api/force-screener")
 def force_screener():
     print(f"\n[API] 📥 Gọi API /api/force-screener (Ép chấm điểm lại)", flush=True)
