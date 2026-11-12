@@ -1316,7 +1316,24 @@ def force_screener():
             
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
-
+@app.get("/api/force-realtime")
+def force_realtime():
+    print(f"\n[API] ⚡ Gọi API /api/force-realtime (Ép cào giá Realtime ngay lập tức)", flush=True)
+    global is_crawling
+    
+    if is_crawling:
+        return jsonify({"status": "error", "message": "Hệ thống đang trong quá trình cào, vui lòng đợi vài giây!"}), 400
+        
+    # Lấy toàn bộ danh sách mã
+    all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+    
+    # Chạy ngầm tiến trình cào để không làm treo request HTTP
+    threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
+    
+    return jsonify({
+        "status": "success", 
+        "message": f"Đã kích hoạt ép cào realtime cho toàn bộ {len(all_symbols)} mã. Vui lòng đợi 1-2 phút rồi F5 trang web!"
+    })
 @app.get("/api/reset-today")
 def reset_today():
     print(f"\n[API] 📥 Gọi API /api/reset-today (Hủy chốt sổ)", flush=True)
