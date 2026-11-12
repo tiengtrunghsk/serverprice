@@ -1920,18 +1920,26 @@ def crawl_ratios():
                 div_val = ratios.get("dividend_yield", 0)
                 if div_val and div_val <= 1: div_val *= 100
 
+                # ================= SỬA TẠI ĐÂY =================
+                eps_raw = ratios.get("eps", 0)
+                # Nếu EPS >= 1000 (tức là đang ở đơn vị VNĐ), chia cho 1000 để đưa về Nghìn VNĐ
+                if eps_raw >= 1000:
+                    eps_raw = eps_raw / 1000.0
+                eps_final = round(eps_raw, 2)
+                # ================================================
+
                 collection.update_one({"symbol": sym}, {"$set": {
                     "pe": round(ratios.get("pe", 0), 2),
                     "pb": round(ratios.get("pb", 0), 2),
                     "ps": round(ratios.get("ps", 0), 2),
-                    "eps": int(ratios.get("eps", 0)),
+                    "eps": eps_final, # Đã dùng biến đã xử lý đơn vị
                     "roe": round(roe_val, 1),
                     "roa": round(roa_val, 1),
                     "dividend_yield": round(div_val, 2),
                     "ratio_updated_at": _now_str()
                 }}, upsert=True)
                 
-                print(f"  ✅ [RATIO] {sym} thành công (P/E: {ratios.get('pe', 0)}, ROE: {round(roe_val, 1)}%)", flush=True)
+                print(f"  ✅ [RATIO] {sym} thành công (P/E: {ratios.get('pe', 0)}, EPS: {eps_final}, ROE: {round(roe_val, 1)}%)", flush=True)
                 time.sleep(0.5)
 
             print(f"[RATIO-CRAWL] 🏁 Đã cào xong toàn bộ bảng Ratio.", flush=True)
