@@ -324,31 +324,27 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 
                 data = _fetch_one(sym)
                 if data:
-                    # LẤY NẾN NGÀY HÔM QUA TỪ MONGODB (Bảng history_data)
                     hist_doc = history_col.find_one({"symbol": sym})
                     prev_close = 0.0
                     avg_vol_20 = 0.0
                     
+                    # 1. LẤY NẾN HÔM QUA TỪ MONGODB (history_data)
                     if hist_doc and hist_doc.get("history_d1"):
                         bars = hist_doc["history_d1"]
-                        # Lọc ra các nến có ngày TRƯỚC ngày hôm nay
                         past_bars = [b for b in bars if b.get("time") and b["time"] < trading_date]
                         
                         if past_bars:
-                            # Sắp xếp để lấy nến gần nhất (ngày hôm qua)
                             past_bars.sort(key=lambda x: x["time"])
                             prev_close = float(past_bars[-1]["close"])
                         
-                        # Tính Avg Volume 20
                         valid_vols = [b.get("volume", 0) for b in bars[-20:] if b.get("volume", 0) > 0]
                         if valid_vols: avg_vol_20 = sum(valid_vols) / len(valid_vols)
 
-                    # Fallback: Nếu Database chưa có nến, mới lấy từ Github
+                    # 2. Fallback: Nếu DB chưa có nến, lấy từ Github
                     if prev_close <= 0:
                         hist_gh, _ = get_github_file_data(f"history/{sym}.json")
                         if hist_gh and hist_gh.get("history_d1"):
                             bars_gh = hist_gh["history_d1"]
-                            # Lấy nến cuối cùng của ngày hôm qua trong file Github
                             past_bars_gh = [b for b in bars_gh if b.get("time") and b["time"] < trading_date]
                             if past_bars_gh:
                                 past_bars_gh.sort(key=lambda x: x["time"])
