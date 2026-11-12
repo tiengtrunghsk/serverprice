@@ -324,33 +324,38 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 
                 data = _fetch_one(sym)
                 if data:
-                    # 1. LẤY NẾN LỊCH SỬ TỪ MONGODB (Bảng history_data)
+                    # LẤY NẾN NGÀY HÔM QUA TỪ MONGODB (Bảng history_data)
                     hist_doc = history_col.find_one({"symbol": sym})
                     prev_close = 0.0
                     avg_vol_20 = 0.0
                     
                     if hist_doc and hist_doc.get("history_d1"):
                         bars = hist_doc["history_d1"]
-                        # Lấy nến của ngày hôm qua (time < trading_date)
-                        valid_bars = [b for b in bars if b.get("time") and b["time"] < trading_date]
-                        if valid_bars:
-                            prev_close = float(valid_bars[-1]["close"])
+                        # Lọc ra các nến có ngày TRƯỚC ngày hôm nay
+                        past_bars = [b for b in bars if b.get("time") and b["time"] < trading_date]
                         
-                        # Tính Avg Volume 20 từ 20 phiên gần nhất
+                        if past_bars:
+                            # Sắp xếp để lấy nến gần nhất (ngày hôm qua)
+                            past_bars.sort(key=lambda x: x["time"])
+                            prev_close = float(past_bars[-1]["close"])
+                        
+                        # Tính Avg Volume 20
                         valid_vols = [b.get("volume", 0) for b in bars[-20:] if b.get("volume", 0) > 0]
                         if valid_vols: avg_vol_20 = sum(valid_vols) / len(valid_vols)
 
-                    # Fallback: Nếu DB chưa có nến, mới lấy từ Github
+                    # Fallback: Nếu Database chưa có nến, mới lấy từ Github
                     if prev_close <= 0:
                         hist_gh, _ = get_github_file_data(f"history/{sym}.json")
                         if hist_gh and hist_gh.get("history_d1"):
-                            bars = hist_gh["history_d1"]
-                            if len(bars) >= 2: 
-                                prev_close = bars[-2]["close"] if bars[-1]["time"] == trading_date else bars[-1]["close"]
-                            elif len(bars) == 1: 
-                                prev_close = bars[0]["close"]
+                            bars_gh = hist_gh["history_d1"]
+                            # Lấy nến cuối cùng của ngày hôm qua trong file Github
+                            past_bars_gh = [b for b in bars_gh if b.get("time") and b["time"] < trading_date]
+                            if past_bars_gh:
+                                past_bars_gh.sort(key=lambda x: x["time"])
+                                prev_close = float(past_bars_gh[-1]["close"])
+                            
                             if avg_vol_20 <= 0:
-                                valid_vols = [b.get("volume", 0) for b in bars[-20:] if b.get("volume", 0) > 0]
+                                valid_vols = [b.get("volume", 0) for b in bars_gh[-20:] if b.get("volume", 0) > 0]
                                 if valid_vols: avg_vol_20 = sum(valid_vols) / len(valid_vols)
 
                     vol_pct = round(data["volume"] / avg_vol_20 * 100, 2) if avg_vol_20 > 0 else 0
@@ -381,7 +386,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         else: d1_bars[d1_idx] = d1_bar
                         d1_bars.sort(key=lambda x: x["time"])
                         hist_doc["history_d1"] = d1_bars
-                        history_col.update_one({"symbol": sym}, {"$set": {"history_d1": d1_bars}}, upsert=True)
                         pending_history_files[f"history/{sym}.json"] = hist_doc
             time.sleep(1)
 
