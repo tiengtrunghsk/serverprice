@@ -57,6 +57,7 @@ if SSI_API_KEY and SSI_API_SECRET:
     os.environ["SSI_API_SECRET"] = SSI_API_SECRET
 else:
     logger.warning("⚠️ CẢNH BÁO: Thiếu SSI_API_KEY hoặc SSI_API_SECRET. Có thể không lấy được giá realtime!")
+
 ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY")
 ENV_FHSC_API_KEY = os.environ.get("FHSC_API_KEY", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -584,6 +585,11 @@ def normalize_stock_data(symbol, data):
     close_price = float(data.get("close", data.get("close_price", 0)) or 0)
     pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
+    
+    # BỔ SUNG: Nếu EPS trong DB vẫn đang là VND (vd: 3000), tự động chia 1000
+    if eps >= 1000:
+        eps = eps / 1000.0
+        
     bctc = data.get("bctc_history", [])
     profit_growth_yoy = float(bctc[0].get("profit_growth_yoy", 0)) if bctc else 0.0
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
@@ -1597,10 +1603,12 @@ def api_ai_analyze():
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.get("/api/admin/force-ai-single")
 def admin_force_ai_single():
-      if request.args.get("key") != ADMIN_SECRET_KEY:
+    if request.args.get("key") != ADMIN_SECRET_KEY:
         return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
+        
     global is_ai_running
     
     # Lấy mã từ URL, ví dụ: /api/admin/force-ai-single?symbol=HCM
@@ -1673,6 +1681,7 @@ def admin_force_ai_single():
         "status": "success", 
         "message": f"Đã bắt đầu chạy AI cho mã {symbol}. Hãy theo dõi log trên Render!"
     })
+
 @app.get("/api/admin/force-ai")
 def admin_force_ai():
     global is_ai_running
@@ -1953,8 +1962,9 @@ def crawl_ratios():
 
 @app.get("/api/force-screener")
 def force_screener():
-      if request.args.get("key") != ADMIN_SECRET_KEY:
+    if request.args.get("key") != ADMIN_SECRET_KEY:
         return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
+        
     print(f"\n[API] 📥 Gọi API /api/force-screener (Ép chấm điểm lại)", flush=True)
     global is_screener_running
     if is_screener_running: 
