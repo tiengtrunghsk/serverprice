@@ -1635,7 +1635,7 @@ def admin_force_ai_single():
             ai_result = _call_ai_for_symbol(symbol, sm, si, sector)
             
             if ai_result:
-                # Lưu vào DB
+                # 1. Lưu vào bảng stocks (collection)
                 collection.update_one({"symbol": symbol}, {"$set": {
                     "ai_bctc": ai_result.get("bctc", ""),
                     "ai_catalyst": ai_result.get("catalyst", ""),
@@ -1644,9 +1644,22 @@ def admin_force_ai_single():
                     "ai_recommendation": ai_result.get("recommendation", ""),
                     "ai_price_zone": ai_result.get("price_zone", ""),
                     "ai_macro_view": ai_result.get("macro_view", ""),
-                    "ai_updated_at": _now_str()
+                    "ai_updated_at": _now_str(),
+                    "ai_source": "AI"  # Đánh dấu nguồn là AI
                 }})
-                print(f"[ADMIN-AI-SINGLE] ✅ {symbol} - Đã lưu phân tích AI thành công!", flush=True)
+                
+                # 2. BỔ SUNG: Lưu vào bảng screener_results (screener_col) để giao diện web đọc được ngay
+                screener_col.update_one({"symbol": symbol}, {"$set": {
+                    "bctc_evaluation": ai_result.get("bctc", ""),
+                    "outlook": ai_result.get("outlook", ""),
+                    "ai_recommendation": ai_result.get("recommendation", ""),
+                    "ai_price_zone": ai_result.get("price_zone", ""),
+                    "macro_view": ai_result.get("macro_view", ""),
+                    "ai_updated_at": _now_str(),
+                    "ai_source": "AI"  # Đánh dấu nguồn là AI
+                }})
+                
+                print(f"[ADMIN-AI-SINGLE] ✅ {symbol} - Đã lưu phân tích AI thành công vào cả 2 bảng!", flush=True)
             else:
                 print(f"[ADMIN-AI-SINGLE] ❌ {symbol} - Gọi AI thất bại. Xem log lỗi ở trên.", flush=True)
         finally:
