@@ -50,7 +50,6 @@ if not MONGO_URI:
     logger.critical("Thiếu biến môi trường MONGO_URI. Server dừng khởi động.")
     sys.exit(1)
 
-# Ép nạp biến môi trường SSI (BẮT BUỘC ĐỂ LẤY ĐƯỢC GIÁ REALTIME)
 SSI_API_KEY = os.environ.get("SSI_API_KEY", "").strip()
 SSI_API_SECRET = os.environ.get("SSI_API_SECRET", "").strip()
 if SSI_API_KEY and SSI_API_SECRET:
@@ -108,9 +107,11 @@ except Exception as e:
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
+# === BIẾN TRẠNG THÁI (ĐÃ CHUYỂN LÊN ĐẦU) ===
 is_crawling = False
 is_full_data_running = False
 is_screener_running = False
+is_ai_running = False
 LAST_TELEGRAM_TIME = 0
 stop_crawl_requested = False
 is_auto_crawl_paused = False
@@ -254,7 +255,7 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
         return df if df is not None and not df.empty else None
     except Exception: return None
 
-# ===================== CÀO BCTC (CẬP NHẬT NGÀY THÁNG & LOG CHI TIẾT) =====================
+# ===================== CÀO BCTC =====================
 def _fetch_bctc_ssi(symbol: str):
     symbol = str(symbol).upper().strip()
     fhsc_key = get_current_fhsc_key()
@@ -344,7 +345,7 @@ def get_vndirect_ratio(symbol, ratio_code):
         pass
     return None
 
-# ===================== CORE LOGIC CÀO & CẢNH BÁO =====================
+# ===================== CORE LOGIC CÀO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
     global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
     if is_crawling: return
@@ -632,7 +633,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     close_price, cfo_latest, net_profit_ttm = nd["close_price"], nd["cfo_latest"], nd["net_profit_ttm"]
     debt_to_equity, profit_growth_yoy, credit_growth_yoy = nd["debt_to_equity"], nd["profit_growth_yoy"], nd["credit_growth_yoy"]
     
-    # --- KIỂM TRA CHẤT LƯỢNG DỮ LIỆU (GẮN CỜ NẾU THIẾU BẤT KỲ CHỈ SỐ NÀO) ---
     data_warnings = []
     if close_price <= 0: data_warnings.append("Thiếu Giá")
     if pe <= 0 and sector not in ["NGAN_HANG", "CHUNG_KHOAN"]: data_warnings.append("Thiếu P/E")
@@ -768,7 +768,7 @@ def aggregate_candles(data, interval):
             groups[key]['high'] = max(groups[key]['high'], bar['high']); groups[key]['low'] = min(groups[key]['low'], bar['low']); groups[key]['close'] = bar['close']; groups[key]['volume'] += bar['volume']
     return sorted(list(groups.values()), key=lambda x: x['time'])
 
-# ===================== AI & CẢNH BÁO BCTC CŨ =====================
+# ===================== AI HELPERS =====================
 SECTOR_NAMES = {"NGAN_HANG": "Ngân hàng", "CHUNG_KHOAN": "Chứng khoán", "BAT_DONG_SAN": "Bất động sản", "CONG_NGHE_BAN_LE": "Công nghệ & Bán lẻ", "DIEN_NUOC_HA_TANG": "Điện, Nước & Hạ tầng", "NGUYEN_VAT_LIEU_CHU_KY": "Vật liệu & Chu kỳ", "SAN_XUAT_TIEU_DUNG_PHONG_THU": "Sản xuất & Tiêu dùng"}
 
 DECISION_TO_RECOMMENDATION = {
@@ -796,6 +796,7 @@ def build_verified_facts(symbol, sm, si, sector):
         f"ĐIỂM: Tổng {si.get('total_score')}/100"
     ]
     return "\n".join(lines)
+
 def _call_ai_for_symbol(symbol, sm, si, sector):
     try:
         verified_facts = build_verified_facts(symbol, sm, si, sector)
@@ -847,7 +848,6 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
             "temperature": AI_TEMPERATURE,
         }
 
-        # THÊM RETRY: Thử tối đa 3 lần nếu AI lỗi
         for attempt in range(3):
             try:
                 res = requests.post(AI_API_URL, headers=headers, json=payload, timeout=60)
@@ -860,7 +860,6 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                     
                     parsed = json.loads(content)
                     
-                    # GUARDRAIL 1: Sửa price_zone nếu AI trả về sai định dạng
                     raw_pz = parsed.get("price_zone", "")
                     if isinstance(raw_pz, dict):
                         parsed["price_zone"] = " | ".join([f"{k}: {v}" for k, v in raw_pz.items()])
@@ -869,7 +868,6 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                     else:
                         parsed["price_zone"] = str(raw_pz)
 
-                    # GUARDRAIL 2: Ghi đè nếu AI bịa số trong price_zone
                     if fair_low > 0:
                         pz_text = parsed["price_zone"]
                         numbers_in_pz = re.findall(r"\d{1,3}(?:[.,]\d{3})+|\d{4,}", pz_text)
@@ -883,7 +881,6 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                                 )
                                 break
 
-                    # GUARDRAIL 3: Ghi đè nếu AI tự đổi khuyến nghị
                     ai_rec = parsed.get("recommendation", "").upper()
                     expected_rec = rec_text.upper()
                     if expected_rec not in ai_rec:
@@ -903,17 +900,13 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                 print(f"  ❌ [{symbol}] Lỗi AI (Lần {attempt + 1}/3): {e}", flush=True)
                 time.sleep(3)
 
-        # NẾU AI LỖI HOÀN TOÀN -> DÙNG TEMPLATE FALLBACK
-        print(f"  ⚠️ [{symbol}] AI lỗi hoàn toàn. Dùng template fallback.", flush=True)
-        fallback = build_fallback_narrative(symbol, sm, si, sector)
-        if fallback:
-            fallback["_source"] = "TEMPLATE_FALLBACK"
-            return fallback
+        print(f"  ⚠️ [{symbol}] AI lỗi hoàn toàn (sau 3 lần thử). Bỏ qua mã này.", flush=True)
         return None
         
     except Exception as e:
         print(f"  ❌ Lỗi nghiêm trọng ở _call_ai_for_symbol cho {symbol}: {e}", flush=True)
         return None
+
 # ===================== BACKGROUND WORKERS =====================
 def auto_crawler_worker():
     print("⏰ [AUTO] Đã bật chế độ cào Real-time (Tự động phát hiện ngày nghỉ)!", flush=True)
@@ -1329,7 +1322,6 @@ def api_get_screener():
     try: return jsonify({"status": "success", "data": list(screener_col.find({}, {"_id": 0}))})
     except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
 
-# ===================== API AI NÂNG CẤP (PROMPT XỊN + GUARDRAILS) =====================
 @app.get("/api/ai-analyze")
 def api_ai_analyze():
     symbol = request.args.get("symbol", "").upper().strip()
@@ -1338,7 +1330,6 @@ def api_ai_analyze():
         return jsonify({"status": "error", "message": "Thiếu mã"}), 400
         
     try:
-        # 1. CHỈ ĐỌC TỪ DATABASE (KHÔNG GỌI AI)
         sm = collection.find_one({"symbol": symbol}, {"_id": 0})
         si = screener_col.find_one({"symbol": symbol}, {"_id": 0})
         bctc_doc = bctc_col.find_one({"symbol": symbol}, {"_id": 0})
@@ -1346,7 +1337,6 @@ def api_ai_analyze():
         if not sm or not si: 
             return jsonify({"status": "error", "message": "Chưa đủ dữ liệu"}), 404
         
-        # Lấy dữ liệu AI đã có sẵn trong Database (do worker chạy ngầm lưu vào)
         ai_data = {
             "bctc": sm.get("ai_bctc", ""),
             "catalyst": sm.get("ai_catalyst", ""),
@@ -1360,7 +1350,6 @@ def api_ai_analyze():
             "_source": "DATABASE"
         }
 
-        # Cảnh báo BCTC cũ (nếu có)
         bctc_warning = ""
         bctc_period = "Không rõ"
         bctc_updated_at = "Chưa cào"
@@ -1374,7 +1363,6 @@ def api_ai_analyze():
             except:
                 pass
         
-        # Kiểm tra xem đã có nội dung AI trong DB chưa
         if not ai_data["bctc"] or not ai_data["outlook"]:
             return jsonify({
                 "status": "warning", 
@@ -1391,6 +1379,84 @@ def api_ai_analyze():
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.get("/api/admin/force-ai")
+def admin_force_ai():
+    global is_ai_running
+    if is_ai_running:
+        return jsonify({"status": "error", "message": "Đang chạy AI cho toàn bộ mã, vui lòng đợi!"}), 400
+    
+    if not ALIBABA_API_KEY:
+        return jsonify({"status": "error", "message": "Thiếu ALIBABA_API_KEY!"}), 500
+    
+    all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+    
+    is_ai_running = True
+    print(f"\n[ADMIN-AI] 🚀 Bắt đầu chạy AI cho toàn bộ {len(all_symbols)} mã...", flush=True)
+    
+    def _run():
+        global is_ai_running
+        try:
+            total = len(all_symbols)
+            count = 0
+            
+            for i, sym in enumerate(all_symbols, 1):
+                sm = collection.find_one({"symbol": sym}, {"_id": 0})
+                si = screener_col.find_one({"symbol": sym}, {"_id": 0})
+                
+                if not sm or not si:
+                    print(f"[ADMIN-AI] [{i}/{total}] ⚠️ {sym} - Thiếu dữ liệu, bỏ qua.", flush=True)
+                    continue
+                
+                sector = si.get("sector", "SAN_XUAT_TIEU_DUNG_PHONG_THU")
+                ai_result = _call_ai_for_symbol(sym, sm, si, sector)
+                
+                if ai_result:
+                    collection.update_one({"symbol": sym}, {"$set": {
+                        "ai_bctc": ai_result.get("bctc", ""),
+                        "ai_catalyst": ai_result.get("catalyst", ""),
+                        "ai_risks": ai_result.get("risks", ""),
+                        "ai_outlook": ai_result.get("outlook", ""),
+                        "ai_recommendation": ai_result.get("recommendation", ""),
+                        "ai_price_zone": ai_result.get("price_zone", ""),
+                        "ai_macro_view": ai_result.get("macro_view", ""),
+                        "ai_updated_at": _now_str()
+                    }})
+                    count += 1
+                    print(f"[ADMIN-AI] [{i}/{total}] ✅ {sym} - OK", flush=True)
+                else:
+                    print(f"[ADMIN-AI] [{i}/{total}] ❌ {sym} - Lỗi", flush=True)
+                
+                time.sleep(3.0)
+            
+            print(f"[ADMIN-AI] 🏁 Hoàn thành: {count}/{total} mã.", flush=True)
+            
+            gh_data, _ = get_github_file_data(SCREENER_JSON_FILE)
+            if gh_data:
+                for item in gh_data:
+                    sym = item.get("symbol")
+                    if sym:
+                        stock_doc = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_outlook": 1, "ai_recommendation": 1, "ai_price_zone": 1, "ai_macro_view": 1, "ai_updated_at": 1})
+                        if stock_doc:
+                            item.update({
+                                "bctc": stock_doc.get("ai_bctc", ""),
+                                "outlook": stock_doc.get("ai_outlook", ""),
+                                "ai_recommendation": stock_doc.get("ai_recommendation", ""),
+                                "ai_price_zone": stock_doc.get("ai_price_zone", ""),
+                                "macro_view": stock_doc.get("ai_macro_view", ""),
+                                "ai_updated_at": stock_doc.get("ai_updated_at", "")
+                            })
+                commit_multiple_files_to_github({SCREENER_JSON_FILE: gh_data}, f"Update AI toàn bộ {_now_str()}")
+                print(f"[ADMIN-AI] 🚀 Đã đồng bộ AI lên Github.", flush=True)
+        finally:
+            is_ai_running = False
+    
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({
+        "status": "success", 
+        "message": f"Đã bắt đầu chạy AI cho {len(all_symbols)} mã. Xem log Render để theo dõi tiến trình!"
+    })
+
 @app.get("/api/force-history")
 def force_history():
     print(f"\n[API] 📥 Gọi API /api/force-history (Ép cào nến 30 ngày)", flush=True)
@@ -1418,65 +1484,7 @@ def force_history():
         finally: is_full_data_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào 30 ngày nến..."})
-is_ai_running = False
 
-@app.get("/api/admin/force-ai")
-def admin_force_ai():
-    global is_ai_running
-    if is_ai_running:
-        return jsonify({"status": "error", "message": "Đang chạy AI cho toàn bộ mã, vui lòng đợi!"}), 400
-    
-    is_ai_running = True
-    print(f"\n[ADMIN-AI] 🚀 Bắt đầu chạy AI cho toàn bộ 100 mã...", flush=True)
-    
-    def _run():
-        global is_ai_running
-        try:
-            # Lấy toàn bộ mã
-            all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-            total = len(all_symbols)
-            count = 0
-            
-            for i, sym in enumerate(all_symbols, 1):
-                sm = collection.find_one({"symbol": sym}, {"_id": 0})
-                si = screener_col.find_one({"symbol": sym}, {"_id": 0})
-                
-                if not sm or not si:
-                    continue
-                
-                sector = si.get("sector", "SAN_XUAT_TIEU_DUNG_PHONG_THU")
-                
-                # Gọi AI (dùng lại logic của API /api/ai-analyze cũ)
-                ai_result = _call_ai_for_symbol(sym, sm, si, sector)
-                
-                if ai_result:
-                    collection.update_one({"symbol": sym}, {"$set": {
-                        "ai_bctc": ai_result.get("bctc", ""),
-                        "ai_catalyst": ai_result.get("catalyst", ""),
-                        "ai_risks": ai_result.get("risks", ""),
-                        "ai_outlook": ai_result.get("outlook", ""),
-                        "ai_recommendation": ai_result.get("recommendation", ""),
-                        "ai_price_zone": ai_result.get("price_zone", ""),
-                        "ai_macro_view": ai_result.get("macro_view", ""),
-                        "ai_updated_at": _now_str()
-                    }})
-                    count += 1
-                    print(f"[ADMIN-AI] [{i}/{total}] ✅ {sym} - OK", flush=True)
-                else:
-                    print(f"[ADMIN-AI] [{i}/{total}] ❌ {sym} - Lỗi", flush=True)
-                
-                # Nghỉ 3s giữa các mã để tránh rate limit
-                time.sleep(3.0)
-            
-            print(f"[ADMIN-AI] 🏁 Hoàn thành: {count}/{total} mã.", flush=True)
-        finally:
-            is_ai_running = False
-    
-    threading.Thread(target=_run, daemon=True).start()
-    return jsonify({
-        "status": "success", 
-        "message": f"Đã bắt đầu chạy AI cho {len(all_symbols)} mã. Xem log Render để theo dõi tiến trình!"
-    })
 @app.get("/api/crawl-full-history")
 def crawl_full_history():
     print(f"\n[API] 📥 Gọi API /api/crawl-full-history (Ép cào nến 10 năm)", flush=True)
