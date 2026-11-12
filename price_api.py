@@ -786,6 +786,42 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     # Bổ sung metadata
     meta = VN100_METADATA.get(symbol, {})
 
+    # === BỔ SUNG: BỐC BÀI VIẾT AI TỪ STOCKS SANG VÀ TỰ TÍNH LẠI PRICE_ZONE ===
+    ai_data = {
+        "bctc": "", "catalyst": "", "risks": "", "outlook": "", 
+        "recommendation": "", "price_zone": "", "macro_view": "", 
+        "ai_updated_at": "Chưa phân tích", "ai_source": ""
+    }
+    
+    # 1. Tìm trong bảng stocks xem mã này đã có bài AI chưa
+    stock_doc = collection.find_one({"symbol": symbol}, {
+        "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1, 
+        "ai_updated_at": 1, "ai_source": 1
+    })
+    
+    if stock_doc and stock_doc.get("ai_bctc"):
+        # Nếu có, bốc toàn bộ văn bản AI sang
+        ai_data["bctc"] = stock_doc.get("ai_bctc", "")
+        ai_data["catalyst"] = stock_doc.get("ai_catalyst", "")
+        ai_data["risks"] = stock_doc.get("ai_risks", "")
+        ai_data["macro_view"] = stock_doc.get("ai_macro_view", "")
+        ai_data["ai_updated_at"] = stock_doc.get("ai_updated_at", "Chưa phân tích")
+        ai_data["ai_source"] = stock_doc.get("ai_source", "AI")
+        
+        # 2. TỰ TÍNH LẠI VÙNG MUA VÀ KHUYẾN NGHỊ (Không cho AI tự tính)
+        temp_template = build_fallback_narrative(symbol, nd, {
+            "fundamental_score": fund_score, 
+            "valuation_score": val_score, 
+            "total_score": total_score,
+            "profit_growth_yoy": profit_growth_yoy, 
+            "final_decision": decision
+        }, sector)
+        
+        ai_data["outlook"] = temp_template.get("outlook", "")
+        ai_data["recommendation"] = temp_template.get("recommendation", "")
+        ai_data["price_zone"] = temp_template.get("price_zone", "")
+    # =======================================================================
+
     return {
         "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
         "roe": roe, "roa": roa, "eps": round(nd["eps"], 0), "bvps": round(nd["bvps"], 0), "dividend_yield": nd["dividend_yield"], "profit_growth_yoy": profit_growth_yoy,
@@ -808,7 +844,16 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "total_shares": meta.get("total_shares", 0),
         
         "data_warnings": data_warnings,
-        "is_data_incomplete": is_data_incomplete
+        "is_data_incomplete": is_data_incomplete,
+        
+        # Các trường trả về cho bảng screener_results
+        "bctc_evaluation": ai_data["bctc"],
+        "outlook": ai_data["outlook"],
+        "ai_recommendation": ai_data["recommendation"],
+        "ai_price_zone": ai_data["price_zone"],
+        "macro_view": ai_data["macro_view"],
+        "ai_updated_at": ai_data["ai_updated_at"],
+        "ai_source": ai_data["ai_source"]
     }
 
 def aggregate_candles(data, interval):
