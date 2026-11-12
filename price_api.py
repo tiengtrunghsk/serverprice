@@ -185,34 +185,58 @@ def _fetch_one(symbol: str) -> Optional[dict]:
     print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True)
     def _do():
         try:
-            # Lấy nến 1 phút trong vài ngày gần nhất
             today = datetime.now().strftime("%Y-%m-%d")
             past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
             
-            # THAY ĐỔI: Dùng interval="1m" và source="vci"
+            # Gọi nến 1 phút từ nguồn SSI
             df = Market().equity(symbol).ohlcv(
                 start=past_7d, 
                 end=today, 
-                interval="1m",   # <-- Lấy nến 1 phút
-                source="ssi"     # <-- Nguồn VCI hỗ trợ nến phút tốt
+                interval="1m", 
+                source="ssi"
             )
             
             if df is not None and not df.empty:
-                latest = df.iloc[-1]
-                return {
-                    "close": float(latest["close"]), 
-                    "open": float(latest["open"]), 
-                    "high": float(latest["high"]), 
-                    "low": float(latest["low"]), 
-                    "volume": int(latest["volume"])
-                }
+                # Chuyển cột thời gian sang dạng ngày để lọc
+                df['time'] = pd.to_datetime(df['time'])
+                df['date_str'] = df['time'].dt.strftime('%Y-%m-%d')
+                
+                # Chỉ lấy các nến của ngày hôm nay
+                df_today = df[df['date_str'] == today]
+                
+                if not df_today.empty:
+                    # Lấy nến mới nhất (để lấy giá hiện tại)
+                    latest_candle = df_today.iloc[-1]
+                    
+                    # Tính tổng volume của tất cả các nến trong ngày hôm nay
+                    total_volume_today = int(df_today['volume'].sum())
+                    
+                    return {
+                        "close": float(latest_candle["close"]), 
+                        "open": float(latest_candle["open"]), 
+                        "high": float(latest_candle["high"]), 
+                        "low": float(latest_candle["low"]), 
+                        "volume": total_volume_today  # <-- Đã là tổng volume trong ngày
+                    }
+                else:
+                    # Nếu không có nến nào của hôm nay (VD: ngày lễ, cuối tuần)
+                    # Thì fallback lấy nến cuối cùng của ngày gần nhất
+                    latest_candle = df.iloc[-1]
+                    return {
+                        "close": float(latest_candle["close"]), 
+                        "open": float(latest_candle["open"]), 
+                        "high": float(latest_candle["high"]), 
+                        "low": float(latest_candle["low"]), 
+                        "volume": int(latest_candle["volume"])
+                    }
             return None
         except Exception as e:
             print(f"    ❌ [FETCH ERROR] Lỗi gọi Vnstock cho {symbol}: {e}", flush=True)
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        try: data = ex.submit(_do).result(timeout=15)
+        try: 
+            data = ex.submit(_do).result(timeout=15)
         except concurrent.futures.TimeoutError:
             print(f"    ❌ [FETCH TIMEOUT] Quá 15s không lấy được giá {symbol}", flush=True)
             return None
@@ -220,10 +244,18 @@ def _fetch_one(symbol: str) -> Optional[dict]:
             print(f"    ❌ [FETCH THREAD ERROR] {symbol}: {e}", flush=True)
             return None
 
-    if not data or data["close"] <= 0 or data["open"] <= 0: return None
+    if not data or data["close"] <= 0 or data["open"] <= 0: 
+        return None
+        
+    # Xử lý đơn vị giá (nếu cần)
     if data["close"] >= 1000:
-        for k in ["close", "open", "high", "low"]: data[k] /= 1000.0
-    if 0 < data["volume"] < 100000: data["volume"] *= VOLUME_MULTIPLIER
+        for k in ["close", "open", "high", "low"]: 
+            data[k] /= 1000.0
+            
+    # Xử lý khối lượng (nếu cần)
+    if 0 < data["volume"] < 100000: 
+        data["volume"] *= VOLUME_MULTIPLIER
+        
     return data
 
 def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
