@@ -331,8 +331,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     
                     if hist_doc and hist_doc.get("history_d1"):
                         bars = hist_doc["history_d1"]
-                        # Tìm nến của ngày hôm qua (time < trading_date)
-                        # Sắp xếp nến mới nhất lên đầu để dễ tìm
+                        # Lấy nến của ngày hôm qua (time < trading_date)
                         valid_bars = [b for b in bars if b.get("time") and b["time"] < trading_date]
                         if valid_bars:
                             prev_close = float(valid_bars[-1]["close"])
@@ -374,15 +373,16 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
-                    if _is_after_15h() and hist_gh is not None:
-                        d1_bars = hist_gh.get("history_d1", [])
+                    if _is_after_15h() and hist_doc is not None:
+                        d1_bars = hist_doc.get("history_d1", [])
                         d1_bar = {"time": trading_date, "open": data["open"], "high": data["high"], "low": data["low"], "close": data["close"], "volume": data["volume"]}
                         d1_idx = next((i for i, b in enumerate(d1_bars) if b["time"] == trading_date), -1)
                         if d1_idx == -1: d1_bars.append(d1_bar)
                         else: d1_bars[d1_idx] = d1_bar
                         d1_bars.sort(key=lambda x: x["time"])
-                        hist_gh["history_d1"] = d1_bars
-                        pending_history_files[f"history/{sym}.json"] = hist_gh
+                        hist_doc["history_d1"] = d1_bars
+                        history_col.update_one({"symbol": sym}, {"$set": {"history_d1": d1_bars}}, upsert=True)
+                        pending_history_files[f"history/{sym}.json"] = hist_doc
             time.sleep(1)
 
         if _is_after_15h() and pending_history_files:
