@@ -271,6 +271,33 @@ def _fetch_bctc_ssi(symbol: str):
         print(f"  ❌ [BCTC] Lỗi khi cào {symbol}: {e}", flush=True)
         return None
 
+# ===================== CÀO RATIO TỪ VNDIRECT =====================
+VNDIRECT_RATIOS = {
+    "pe": "PRICE_TO_EARNINGS",
+    "pb": "PRICE_TO_BOOK",
+    "ps": "PRICE_TO_SALES",
+    "eps": "EPS_TR",
+    "roe": "ROAE_TR_AVG5Q",
+    "roa": "ROAA_TR_AVG5Q",
+    "dividend_yield": "DIVIDEND_YIELD"
+}
+
+def get_vndirect_ratio(symbol, ratio_code):
+    url = "https://api-finfo.vndirect.com.vn/v4/ratios"
+    params = {"q": f"code:{symbol}~ratioCode:{ratio_code}", "size": 1, "sort": "reportDate:desc"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            if data:
+                val = data[0].get("value")
+                if val is not None:
+                    return float(val)
+    except Exception:
+        pass
+    return None
+
 # ===================== CORE LOGIC CÀO & CẢNH BÁO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
     global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
@@ -1102,7 +1129,7 @@ def crawl_full_bctc():
 
 @app.get("/api/crawl-ratios")
 def crawl_ratios():
-    print(f"\n[API] 📥 Gọi API /api/crawl-ratios (Cào P/E, P/B, ROE từ FHSC)", flush=True)
+    print(f"\n[API] 📥 Gọi API /api/crawl-ratios (Cào P/E, P/B, ROE từ VNDirect)", flush=True)
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
@@ -1115,45 +1142,42 @@ def crawl_ratios():
             
             for i, sym in enumerate(target):
                 print(f"[RATIO-CRAWL] [{i+1}/{len(target)}] Đang lấy ratio cho {sym}...", flush=True)
-                try:
-                    # Gọi API FHSC lấy bảng ratio (thay vì VCI bị lỗi)
-                    df_ratio = Fundamental().equity(sym).ratio(source="fhsc", period="quarterly")
-                    
-                    if df_ratio is not None and not df_ratio.empty:
-                        # Sắp xếp mới nhất lên đầu và cắt 8 quý
-                        if 'year' in df_ratio.columns and 'quarter' in df_ratio.columns:
-                            df_ratio = df_ratio.sort_values(by=['year', 'quarter'], ascending=[False, False])
-                            df_ratio = df_ratio.head(8) # Lấy 8 quý gần nhất
-                        
-                        records = df_ratio.to_dict(orient="records")
-                        
-                        # Lấy bản ghi mới nhất
-                        latest = records[0]
-                        
-                        # Cập nhật các chỉ số vào bảng stocks
-                        collection.update_one({"symbol": sym}, {"$set": {
-                            "pe": float(latest.get("pe", 0) or 0),
-                            "pb": float(latest.get("pb", 0) or 0),
-                            "ps": float(latest.get("ps", 0) or 0),
-                            "roe": float(latest.get("roe", 0) or 0),
-                            "roa": float(latest.get("roa", 0) or 0),
-                            "eps": float(latest.get("eps", 0) or 0),
-                            "dividend_yield": float(latest.get("dividend_yield", 0) or 0),
-                            "ratio_updated_at": _now_str()
-                        }}, upsert=True)
-                        print(f"  ✅ [RATIO] {sym} thành công (P/E: {latest.get('pe', 0)}, ROE: {latest.get('roe', 0)})", flush=True)
-                    else:
-                        print(f"  ⚠️ [RATIO] {sym} không có dữ liệu trả về.", flush=True)
-                except Exception as e:
-                    print(f"  ❌ [RATIO] Lỗi khi lấy {sym}: {e}", flush=True)
-                time.sleep(1.5) # Nghỉ 1.5s tránh Rate Limit
                 
+                ratios = {}
+                for key, code in VNDIRECT_RATIOS.items():
+                    val = get_vndirect_ratio(sym, code)
+                    ratios[key] = val if val is not None else 0
+                    time.sleep(0.2)
+
+                roe_val = ratios.get("roe", 0)
+                if roe_val and roe_val <= 1: roe_val *= 100
+                
+                roa_val = ratios.get("roa", 0)
+                if roa_val and roa_val <= 1: roa_val *= 100
+                
+                div_val = ratios.get("dividend_yield", 0)
+                if div_val and div_val <= 1: div_val *= 100
+
+                collection.update_one({"symbol": sym}, {"$set": {
+                    "pe": round(ratios.get("pe", 0), 2),
+                    "pb": round(ratios.get("pb", 0), 2),
+                    "ps": round(ratios.get("ps", 0), 2),
+                    "eps": int(ratios.get("eps", 0)),
+                    "roe": round(roe_val, 1),
+                    "roa": round(roa_val, 1),
+                    "dividend_yield": round(div_val, 2),
+                    "ratio_updated_at": _now_str()
+                }}, upsert=True)
+                
+                print(f"  ✅ [RATIO] {sym} thành công (P/E: {ratios.get('pe', 0)}, ROE: {round(roe_val, 1)}%)", flush=True)
+                time.sleep(0.5)
+
             print(f"[RATIO-CRAWL] 🏁 Đã cào xong toàn bộ bảng Ratio.", flush=True)
         finally: 
             is_full_data_running = False
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"status": "success", "message": "Đang cào bảng Ratio (P/E, ROE...) từ FHSC..."})
+    return jsonify({"status": "success", "message": "Đang cào bảng Ratio (P/E, ROE...) từ VNDirect..."})
 
 @app.get("/api/force-screener")
 def force_screener():
