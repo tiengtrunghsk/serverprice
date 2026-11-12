@@ -194,7 +194,7 @@ def _fetch_one(symbol: str) -> Optional[dict]:
                 start=past_7d, 
                 end=today, 
                 interval="1m",   # <-- Lấy nến 1 phút
-                source="vci"     # <-- Nguồn VCI hỗ trợ nến phút tốt
+                source="ssi"     # <-- Nguồn VCI hỗ trợ nến phút tốt
             )
             
             if df is not None and not df.empty:
