@@ -57,7 +57,7 @@ if SSI_API_KEY and SSI_API_SECRET:
     os.environ["SSI_API_SECRET"] = SSI_API_SECRET
 else:
     logger.warning("⚠️ CẢNH BÁO: Thiếu SSI_API_KEY hoặc SSI_API_SECRET. Có thể không lấy được giá realtime!")
-
+ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY")
 ENV_FHSC_API_KEY = os.environ.get("FHSC_API_KEY", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
@@ -1599,6 +1599,8 @@ def api_ai_analyze():
         return jsonify({"status": "error", "message": str(e)}), 500
 @app.get("/api/admin/force-ai-single")
 def admin_force_ai_single():
+      if request.args.get("key") != ADMIN_SECRET_KEY:
+        return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
     global is_ai_running
     
     # Lấy mã từ URL, ví dụ: /api/admin/force-ai-single?symbol=HCM
@@ -1951,6 +1953,8 @@ def crawl_ratios():
 
 @app.get("/api/force-screener")
 def force_screener():
+      if request.args.get("key") != ADMIN_SECRET_KEY:
+        return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
     print(f"\n[API] 📥 Gọi API /api/force-screener (Ép chấm điểm lại)", flush=True)
     global is_screener_running
     if is_screener_running: 
