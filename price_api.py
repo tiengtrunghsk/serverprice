@@ -844,7 +844,119 @@ def build_verified_facts(symbol, sm, si, sector):
         f"ĐIỂM: Tổng {si.get('total_score')}/100"
     ]
     return "\n".join(lines)
+def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
+    """Tạo báo cáo Template khi chưa có AI."""
+    close = float(stock_metrics.get("close", stock_metrics.get("close_price", 0)) or 0)
+    pe = float(stock_metrics.get("pe", 0) or 0)
+    pb = float(stock_metrics.get("pb", 0) or 0)
+    roe = float(stock_metrics.get("roe", 0) or 0)
+    roa = float(stock_metrics.get("roa", 0) or 0)
+    eps = float(stock_metrics.get("eps", 0) or 0)
+    cfo = float(stock_metrics.get("cfo_latest", 0) or 0)
+    npat = float(stock_metrics.get("net_profit_ttm", 0) or 0)
+    de = float(stock_metrics.get("debt_to_equity", 0) or 0)
+    gm = float(stock_metrics.get("gross_margin", 0) or 0)
+    div_yield = float(stock_metrics.get("dividend_yield", 0) or 0)
 
+    fair_low = float(stock_metrics.get("fair_value_low", 0) or 0)
+    fair_high = float(stock_metrics.get("fair_value_high", 0) or 0)
+    discount_pct = float(stock_metrics.get("discount_to_fair_pct", 0) or 0)
+    verdict = stock_metrics.get("valuation_verdict", "CHƯA TÍNH")
+    mos_pct = float(stock_metrics.get("margin_of_safety_pct", 0) or 0)
+    
+    fund_score = screener_item.get("fundamental_score", 0)
+    val_score = screener_item.get("valuation_score", 0)
+    tech_score = screener_item.get("technical_score", 0)
+    total_score = screener_item.get("total_score", 0)
+    growth_yoy = float(screener_item.get("profit_growth_yoy", 0) or 0)
+    final_decision = screener_item.get("final_decision", "CHƯA XÁC ĐỊNH")
+
+    sector_name = SECTOR_NAMES.get(sector, sector)
+    is_bank_or_sec = sector in ("NGAN_HANG", "CHUNG_KHOAN")
+
+    # --- Phần BCTC ---
+    bctc_parts = [f"Chỉ số sinh lời: ROE đạt {roe:.1f}%, ROA {roa:.1f}%."]
+    if is_bank_or_sec:
+        bctc_parts.append(f"P/E {pe:.2f}x và P/B {pb:.2f}x phản ánh mức định giá của định chế tài chính. D/E {de:.2f} là bản chất ngân hàng.")
+    else:
+        bctc_parts.append(f"Định giá P/E {pe:.2f}x và P/B {pb:.2f}x.")
+        if gm > 0: bctc_parts.append(f"Biên lợi nhuận gộp {gm:.1f}%.")
+
+    if npat > 0 and cfo != 0:
+        cfo_ratio = cfo / npat
+        if cfo_ratio >= 1.0:
+            bctc_parts.append(f"Chất lượng lợi nhuận tốt với CFO {cfo:,.0f} tỷ ≥ LNST {npat:,.0f} tỷ.")
+        elif cfo_ratio >= 0.5:
+            bctc_parts.append(f"CFO {cfo:,.0f} tỷ so với LNST {npat:,.0f} tỷ — chấp nhận được.")
+        else:
+            bctc_parts.append(f"⚠️ Cảnh báo: CFO/LNST chỉ {cfo_ratio:.2f}x.")
+
+    bctc_parts.append(f"EPS đạt {eps:,.0f} VNĐ.")
+    if div_yield > 0: bctc_parts.append(f"Cổ tức {div_yield}%/năm.")
+    bctc = " ".join(bctc_parts)
+
+    # --- Phần Catalyst & Risks ---
+    moat_map = {
+        "NGAN_HANG": "tệp khách hàng bán lẻ trung thành và chi phí vốn thấp",
+        "CHUNG_KHOAN": "thị phần môi giới ổn định và quan hệ với nhà đầu tư tổ chức",
+        "BAT_DONG_SAN": "quỹ đất sạch tại vị trí đắc địa và thương hiệu uy tín",
+        "CONG_NGHE_BAN_LE": "thương hiệu mạnh và chuỗi cung ứng tối ưu",
+        "DIEN_NUOC_HA_TANG": "vị thế độc quyền tự nhiên và dòng tiền ổn định",
+        "NGUYEN_VAT_LIEU_CHU_KY": "quy mô sản xuất lớn và chi phí biên thấp",
+        "SAN_XUAT_TIEU_DUNG_PHONG_THU": "thương hiệu quốc dân và mạng lưới phân phối rộng",
+    }
+    moat = moat_map.get(sector, "lợi thế cạnh tranh dài hạn")
+    catalyst = f"Lợi thế cạnh tranh cốt lõi nằm ở {moat}. LNST tăng {growth_yoy:.1f}% YoY."
+
+    risk_map = {
+        "NGAN_HANG": f"Rủi ro nợ xấu và áp lực thu hẹp NIM. D/E hiện ở mức {de:.2f}.",
+        "CHUNG_KHOAN": f"Rủi ro thanh khoản thị trường và danh mục tự doanh.",
+        "BAT_DONG_SAN": "Rủi ro pháp lý dự án và đòn bẩy nợ cao.",
+        "CONG_NGHE_BAN_LE": "Rủi ro cạnh tranh và biên lợi nhuận bị thu hẹp.",
+        "DIEN_NUOC_HA_TANG": "Rủi ro chính sách giá và chi phí vốn tăng.",
+        "NGUYEN_VAT_LIEU_CHU_KY": f"Rủi ro giá hàng hóa đảo chiều làm biên gộp {gm:.1f}% co lại.",
+        "SAN_XUAT_TIEU_DUNG_PHONG_THU": "Rủi ro cạnh tranh từ hàng nhập khẩu và sức mua yếu.",
+    }
+    risks = risk_map.get(sector, f"Rủi ro chung của ngành {sector_name}.")
+
+    # --- Phần Outlook ---
+    if verdict == "RẺ - TRONG VÙNG MUA":
+        outlook = f"Giá {close:,.0f} VNĐ nằm dưới vùng mua an toàn {fair_low:,.0f} VNĐ, biên an toàn {discount_pct:.1f}% (MoS {mos_pct:.0f}%). Đây là vùng định giá hấp dẫn cho tích sản dài hạn. Quyết định: {final_decision}."
+    elif verdict == "HỢP LÝ - CHỜ ĐIỀU CHỈNH":
+        outlook = f"Giá {close:,.0f} VNĐ giữa vùng mua {fair_low:,.0f} và fair value {fair_high:,.0f}. Chờ điều chỉnh về vùng mua. Quyết định: {final_decision}."
+    elif verdict in ("HƠI ĐẮT - KHÔNG MUA", "ĐẮT - TRÁNH"):
+        outlook = f"Giá {close:,.0f} VNĐ đã vượt fair value {fair_high:,.0f}. Định giá chưa hấp dẫn. Quyết định: {final_decision}."
+    else:
+        outlook = f"Chưa đủ dữ liệu định giá. Verdict: {verdict}."
+
+    # --- Recommendation ---
+    rec_text, rec_weight = DECISION_TO_RECOMMENDATION.get(final_decision, ("NẮM GIỮ / THEO DÕI", "Tỷ trọng 0%"))
+    recommendation = f"{rec_text} — {rec_weight}"
+
+    price_zone = f"Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | Giá: {close:,.0f} | Verdict: {verdict}"
+
+    macro_map = {
+        "NGAN_HANG": "Chu kỳ tín dụng phục hồi khi lãi suất thấp. Rủi ro nợ xấu BĐS còn hiện hữu.",
+        "CHUNG_KHOAN": "Thanh khoản thị trường quyết định doanh thu ngành. Chính sách nâng hạng tạo catalyst.",
+        "BAT_DONG_SAN": "Pháp lý BĐS đang dần tháo gỡ. Chu kỳ phục hồi phụ thuộc niềm tin người mua.",
+        "CONG_NGHE_BAN_LE": "Sức mua tiêu dùng phục hồi. Xu hướng chuyển đổi số tạo dư địa tăng trưởng.",
+        "DIEN_NUOC_HA_TANG": "Nhu cầu điện tăng theo GDP. Chính sách năng lượng tái tạo tạo cơ hội.",
+        "NGUYEN_VAT_LIEU_CHU_KY": "Chu kỳ giá hàng hóa phụ thuộc kinh tế Trung Quốc và chính sách bảo hộ.",
+        "SAN_XUAT_TIEU_DUNG_PHONG_THU": "Tiêu dùng nội địa phục hồi chậm. Cơ hội từ xuất khẩu nếu tỷ giá thuận lợi.",
+    }
+    macro_view = macro_map.get(sector, f"Ngành {sector_name} chịu ảnh hưởng chung từ vĩ mô.")
+
+    return {
+        "bctc": bctc,
+        "catalyst": catalyst,
+        "risks": risks,
+        "valuation_verdict": verdict,
+        "outlook": outlook,
+        "recommendation": recommendation,
+        "price_zone": price_zone,
+        "macro_view": macro_view,
+        "_source": "TEMPLATE",
+    }
 def _call_ai_for_symbol(symbol, sm, si, sector):
     try:
         verified_facts = build_verified_facts(symbol, sm, si, sector)
@@ -1144,6 +1256,35 @@ def screener_worker():
                         r["final_decision_color"] = fd_color
                         r["final_decision_reason"] = fd_reason
                     print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
+                # === KẾT THÚC BỔ SUNG ===
+
+                # === BỔ SUNG: TỰ ĐỘNG TẠO TEMPLATE CHO CÁC MÃ CHƯA CÓ AI ===
+                if results:
+                    print(f"[SCREENER] 📝 Đang tạo Template cho các mã chưa có AI...", flush=True)
+                    template_count = 0
+                    for r in results:
+                        sym = r["symbol"]
+                        existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1})
+                        if existing and existing.get("ai_bctc"):
+                            continue  # Đã có AI, bỏ qua
+                        
+                        nd_for_template = normalized_db.get(sym, {})
+                        template_data = build_fallback_narrative(sym, nd_for_template, r, get_sector(sym))
+                        
+                        if template_data:
+                            collection.update_one({"symbol": sym}, {"$set": {
+                                "ai_bctc": template_data.get("bctc", ""),
+                                "ai_catalyst": template_data.get("catalyst", ""),
+                                "ai_risks": template_data.get("risks", ""),
+                                "ai_outlook": template_data.get("outlook", ""),
+                                "ai_recommendation": template_data.get("recommendation", ""),
+                                "ai_price_zone": template_data.get("price_zone", ""),
+                                "ai_macro_view": template_data.get("macro_view", ""),
+                                "ai_updated_at": _now_str(),
+                                "ai_source": "TEMPLATE"
+                            }})
+                            template_count += 1
+                    print(f"[SCREENER] ✅ Đã tạo Template cho {template_count} mã chưa có AI.", flush=True)
                 # === KẾT THÚC BỔ SUNG ===
                         
                 if results:
