@@ -645,6 +645,21 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     close_price, cfo_latest, net_profit_ttm = nd["close_price"], nd["cfo_latest"], nd["net_profit_ttm"]
     debt_to_equity, profit_growth_yoy, credit_growth_yoy = nd["debt_to_equity"], nd["profit_growth_yoy"], nd["credit_growth_yoy"]
     
+    # --- BẮT ĐẦU: KIỂM TRA CHẤT LƯỢNG DỮ LIỆU (GẮN CỜ NẾU THIẾU BẤT KỲ CHỈ SỐ NÀO) ---
+    data_warnings = []
+    if close_price <= 0: 
+        data_warnings.append("Thiếu Giá")
+    if pe <= 0 and sector not in ["NGAN_HANG", "CHUNG_KHOAN"]: 
+        data_warnings.append("Thiếu P/E")
+    if pb <= 0: 
+        data_warnings.append("Thiếu P/B")
+    if roe == 0: 
+        data_warnings.append("Thiếu ROE")
+    
+    # Gắn cờ cảnh báo nếu thiếu BẤT KỲ chỉ số nào
+    is_data_incomplete = len(data_warnings) > 0
+    # --- KẾT THÚC KIỂM TRA ---
+
     fund_score = 0
     fund_notes = []
     
@@ -756,7 +771,11 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "sim_start_quarter": sim_data["start_quarter"] if sim_data else "",
         "sim_start_price": sim_data["start_price_mean"] if sim_data else 0,
         "sim_end_quarter": sim_data["end_quarter"] if sim_data else "",
-        "sim_end_price": sim_data["end_price_mean"] if sim_data else 0
+        "sim_end_price": sim_data["end_price_mean"] if sim_data else 0,
+        
+        # TRẢ VỀ 2 TRƯỜNG CẢNH BÁO DỮ LIỆU
+        "data_warnings": data_warnings,
+        "is_data_incomplete": is_data_incomplete
     }
 
 def aggregate_candles(data, interval):
@@ -971,11 +990,10 @@ def screener_worker():
 
                     # 4. TỔNG HỢP VÀ GỬI BÁO CÁO TELEGRAM CHUYÊN SÂU
                     try:
-                        # --- BIẾN ĐẾM ---
+                        # --- BIẾN ĐẾM CHUNG ---
                         up_count = 0
                         down_count = 0
                         ref_count = 0
-                        
                         buy_strong = 0
                         buy_accumulate = 0
                         avoid = 0
@@ -983,10 +1001,18 @@ def screener_worker():
                         strong_movers = []
                         value_stocks = []
                         danger_stocks = []
+
+                        # --- BIẾN ĐẾM LỖI DỮ LIỆU CHI TIẾT ---
+                        missing_price_count = 0
+                        missing_pe_count = 0
+                        missing_pb_count = 0
+                        missing_roe_count = 0
                         
-                        # BIẾN ĐẾM LỖI DỮ LIỆU
-                        incomplete_data_count = 0
-                        incomplete_symbols = []
+                        # Danh sách mẫu các mã bị thiếu (tối đa 5 mã mỗi loại)
+                        missing_pe_symbols = []
+                        missing_pb_symbols = []
+                        missing_roe_symbols = []
+                        missing_price_symbols = []
 
                         for r in results:
                             decision = r.get("final_decision", "")
@@ -1018,12 +1044,35 @@ def screener_worker():
                                 if len(value_stocks) < 3:
                                     value_stocks.append(f"  • <b>{r['symbol']}</b> ({r.get('sector')}): Giá {close_price:,.0f} - Vùng mua ≤ {r.get('fair_value_low',0):,.0f}")
                             
-                            # 4. Kiểm tra lỗi dữ liệu
-                            if r.get("is_data_incomplete", False):
-                                incomplete_data_count += 1
-                                if len(incomplete_symbols) < 5:
-                                    warnings = ', '.join(r.get('data_warnings', []))
-                                    incomplete_symbols.append(f"{r['symbol']} ({warnings})")
+                            # 4. Đếm lỗi dữ liệu chi tiết
+                            warnings = r.get("data_warnings", [])
+                            if "Thiếu Giá" in warnings: 
+                                missing_price_count += 1
+                                if len(missing_price_symbols) < 5: missing_price_symbols.append(r['symbol'])
+                            if "Thiếu P/E" in warnings: 
+                                missing_pe_count += 1
+                                if len(missing_pe_symbols) < 5: missing_pe_symbols.append(r['symbol'])
+                            if "Thiếu P/B" in warnings: 
+                                missing_pb_count += 1
+                                if len(missing_pb_symbols) < 5: missing_pb_symbols.append(r['symbol'])
+                            if "Thiếu ROE" in warnings: 
+                                missing_roe_count += 1
+                                if len(missing_roe_symbols) < 5: missing_roe_symbols.append(r['symbol'])
+
+                        # --- TẠO CẢNH BÁO DỮ LIỆU CHI TIẾT ---
+                        data_alert_lines = []
+                        if missing_pe_count > 0:
+                            sample = f" (VD: {', '.join(missing_pe_symbols)}...)" if missing_pe_symbols else ""
+                            data_alert_lines.append(f"  • <b>{missing_pe_count} mã</b> thiếu P/E{sample}")
+                        if missing_pb_count > 0:
+                            sample = f" (VD: {', '.join(missing_pb_symbols)}...)" if missing_pb_symbols else ""
+                            data_alert_lines.append(f"  • <b>{missing_pb_count} mã</b> thiếu P/B{sample}")
+                        if missing_roe_count > 0:
+                            sample = f" (VD: {', '.join(missing_roe_symbols)}...)" if missing_roe_symbols else ""
+                            data_alert_lines.append(f"  • <b>{missing_roe_count} mã</b> thiếu ROE{sample}")
+                        if missing_price_count > 0:
+                            sample = f" (VD: {', '.join(missing_price_symbols)}...)" if missing_price_symbols else ""
+                            data_alert_lines.append(f"  • <b>{missing_price_count} mã</b> bị thiếu Giá (Lỗi cào giá){sample}")
 
                         # --- NHẬN ĐỊNH THỊ TRƯỜNG TỰ ĐỘNG ---
                         total_up_down = up_count + down_count
@@ -1042,11 +1091,12 @@ def screener_worker():
                         # --- TẠO NỘI DUNG TIN NHẮN ---
                         msg_lines = []
                         
-                        # CẢNH BÁO LỖI DỮ LIỆU LÊN ĐẦU TIÊN
-                        if incomplete_data_count > 0:
-                            msg_lines.append(f"⚠️ <b>CẢNH BÁO: CÓ {incomplete_data_count} MÃ BỊ LỖI DỮ LIỆU API!</b>")
-                            msg_lines.append(f"  Chi tiết một số mã: <i>{'; '.join(incomplete_symbols)}</i>")
-                            msg_lines.append(f"  👉 Điểm số của các mã này có thể không chính xác. Hãy kiểm tra lại API!")
+                        # CẢNH BÁO LỖI DỮ LIỆU LÊN ĐẦU TIÊN (NẾU CÓ)
+                        if data_alert_lines:
+                            msg_lines.append(f"⚠️ <b>CẢNH BÁO LỖI DỮ LIỆU API!</b>")
+                            msg_lines.append(f"Phát hiện các mã bị thiếu thông số để chấm điểm:")
+                            msg_lines.extend(data_alert_lines)
+                            msg_lines.append(f"  👉 <i>Hãy chạy lại API /api/crawl-ratios hoặc /api/force-bctc!</i>")
                             msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
 
                         msg_lines.extend([
@@ -1088,7 +1138,6 @@ def screener_worker():
         except Exception as e: 
             print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
             time.sleep(60)
-
 # ===================== ROUTES =====================
 @app.get("/")
 def home(): 
