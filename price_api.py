@@ -50,6 +50,15 @@ if not MONGO_URI:
     logger.critical("Thiếu biến môi trường MONGO_URI. Server dừng khởi động.")
     sys.exit(1)
 
+# Ép nạp biến môi trường SSI (BẮT BUỘC ĐỂ LẤY ĐƯỢC GIÁ REALTIME)
+SSI_API_KEY = os.environ.get("SSI_API_KEY", "").strip()
+SSI_API_SECRET = os.environ.get("SSI_API_SECRET", "").strip()
+if SSI_API_KEY and SSI_API_SECRET:
+    os.environ["SSI_API_KEY"] = SSI_API_KEY
+    os.environ["SSI_API_SECRET"] = SSI_API_SECRET
+else:
+    logger.warning("⚠️ CẢNH BÁO: Thiếu SSI_API_KEY hoặc SSI_API_SECRET. Có thể không lấy được giá realtime!")
+
 ENV_FHSC_API_KEY = os.environ.get("FHSC_API_KEY", "").strip()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
@@ -171,7 +180,7 @@ def get_historical_return_rate_with_details(symbol):
         }
     except Exception as e: return None
 
-# ===================== CÀO GIÁ =====================
+# ===================== CÀO GIÁ (ĐÃ KHÔI PHỤC LOGIC CHUẨN) =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
     print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True)
     def _do():
@@ -308,7 +317,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     print(f"\n[CRAWL] 🚀 [{'CÀO BÙ' if is_retry else ('CÀO TAY' if is_manual else 'REAL-TIME')}] Bắt đầu xử lý {len(symbols)} mã...", flush=True)
     try:
         vn_now = datetime.utcnow() + timedelta(hours=7)
-        real_today = vn_now.strftime("%Y-%m-%d") # Ngày thực tế để lưu nến
+        real_today = vn_now.strftime("%Y-%m-%d")
         current_hour = vn_now.hour
 
         alert_batch, pending_history_files = [], {}
@@ -329,20 +338,17 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     hist_doc = history_col.find_one({"symbol": sym})
                     prev_close = 0.0
                     avg_vol_20 = 0.0
-                    latest_history_date = None # Ngày giao dịch gần nhất trong lịch sử
+                    latest_history_date = None 
                     
-                    # 1. TÌM NẾN GẦN NHẤT TRONG LỊCH SỬ ĐỂ LÀM PREV_CLOSE
                     if hist_doc and hist_doc.get("history_d1"):
                         bars = hist_doc["history_d1"]
                         bars_sorted = sorted(bars, key=lambda x: x.get("time", ""))
                         
-                        # Nếu đã có nến của hôm nay, prev_close là nến trước đó
                         if bars_sorted and bars_sorted[-1]["time"] == real_today:
                             if len(bars_sorted) >= 2:
                                 prev_close = float(bars_sorted[-2]["close"])
                                 latest_history_date = bars_sorted[-2]["time"]
                         else:
-                            # Nếu chưa có nến hôm nay, prev_close là nến cuối cùng trong lịch sử
                             prev_close = float(bars_sorted[-1]["close"])
                             latest_history_date = bars_sorted[-1]["time"]
                         
@@ -359,10 +365,8 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     if pct_change > 0: arrow, color = "▲", "emerald"
                     elif pct_change < 0: arrow, color = "▼", "rose"
 
-                    # 2. XÁC ĐỊNH TRẠNG THÁI MỞ SỔ / CHỐT SỔ
                     is_locked = doc.get("is_locked", True) if doc else True
                     if current_hour >= 9 and is_locked:
-                        # Nếu giá khác giá tham chiếu -> Mở sổ
                         if data["close"] != prev_close:
                             is_locked = False
                             print(f"  🔓 [MỞ SỔ] {sym}: Giá biến động từ {prev_close} -> {data['close']}", flush=True)
@@ -378,16 +382,15 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "updated_at": _now_str(), "is_locked": is_locked, "is_incomplete": False
                     }}, upsert=True)
                     
+                    print(f"  ✅ [OK] {sym}: Giá {data['close']:,} | KL: {data['volume']:,} | Vol%: {vol_pct}%", flush=True)
+                    
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
-                    # 3. CHỐT SỔ SAU 15H (Dùng real_today để lưu nến thực tế)
                     if current_hour >= 15 and not is_locked:
                         d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
-                        # Xóa nến hôm nay cũ (nếu có) để tránh trùng lặp
                         d1_bars = [b for b in d1_bars if b.get("time") != real_today]
                         
-                        # Thêm nến hôm nay
                         d1_bars.append({
                             "time": real_today, 
                             "open": data["open"], 
@@ -404,6 +407,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         if hist_doc is None: hist_doc = {"symbol": sym}
                         hist_doc["history_d1"] = d1_bars
                         pending_history_files[f"history/{sym}.json"] = hist_doc
+                else:
+                    print(f"  ❌ [LỖI] {sym}: Không lấy được dữ liệu.", flush=True)
+                    collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": _now_str()}}, upsert=True)
             time.sleep(1)
 
         if current_hour >= 15 and pending_history_files:
@@ -430,6 +436,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     finally:
         is_crawling = False
         stop_crawl_requested = False
+
 # ===================== GITHUB HELPER =====================
 def get_github_file_data(file_path):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
@@ -786,7 +793,6 @@ def auto_crawler_worker():
                 for sym in all_symbols:
                     doc = collection.find_one({"symbol": sym})
                     if doc:
-                        # Nếu có BẤT KỲ mã nào có close khác prev_close HOẶC volume > 0 -> Thị trường đang chạy
                         if doc.get("close") != doc.get("prev_close") or doc.get("volume", 0) > 0:
                             any_changed = True
                             print(f"  ✅ [AUTO] Thị trường đang giao dịch (Mã {sym} đã biến động).", flush=True)
