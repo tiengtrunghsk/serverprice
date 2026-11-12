@@ -103,6 +103,8 @@ is_crawling = False
 is_full_data_running = False
 is_screener_running = False
 LAST_TELEGRAM_TIME = 0
+stop_crawl_requested = False
+is_auto_crawl_paused = False
 
 def get_current_fhsc_key():
     setting = settings_col.find_one({"_id": "fhsc_key"})
@@ -271,17 +273,25 @@ def _fetch_bctc_ssi(symbol: str):
 
 # ===================== CORE LOGIC CÀO & CẢNH BÁO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
-    global is_crawling, LAST_TELEGRAM_TIME
+    global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
     if is_crawling: return
     is_crawling = True
+    stop_crawl_requested = False 
+    
     print(f"\n[CRAWL] 🚀 [{'CÀO BÙ' if is_retry else ('CÀO TAY' if is_manual else 'REAL-TIME')}] Bắt đầu xử lý {len(symbols)} mã...", flush=True)
     try:
         trading_date = _get_trading_date_str()
         alert_batch, pending_history_files = [], {}
 
         for chunk_idx in range(0, len(symbols), 5):
+            if stop_crawl_requested:
+                print("[CRAWL] 🛑 Đã nhận lệnh dừng khẩn cấp!", flush=True)
+                break
+
             chunk = symbols[chunk_idx:chunk_idx+5]
             for sym in chunk:
+                if stop_crawl_requested: break
+                
                 doc = collection.find_one({"symbol": sym})
                 if doc and doc.get("chot_so_today") == trading_date: continue
                 
@@ -353,6 +363,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 print(f"[TELEGRAM] ⏳ Có {len(alert_batch)} mã đột biến nhưng chưa đủ 2 tiếng, bỏ qua gửi tin.", flush=True)
     finally:
         is_crawling = False
+        stop_crawl_requested = False
 
 # ===================== GITHUB HELPER =====================
 def get_github_file_data(file_path):
@@ -656,46 +667,41 @@ def auto_crawler_worker():
     print("⏰ [AUTO] Đã bật chế độ cào Real-time (Chỉ chạy 9h-15h, nghỉ trưa & cuối tuần)!", flush=True)
     while True:
         try:
+            global is_auto_crawl_paused
+            if is_auto_crawl_paused:
+                time.sleep(10)
+                continue
+
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
             current_hour = vn_now.hour
             current_minute = vn_now.minute
-            weekday = vn_now.weekday() # 0 là thứ 2, 6 là chủ nhật
+            weekday = vn_now.weekday()
 
-            # 1. KIỂM TRA ĐIỀU KIỆN THỜI GIAN
             is_weekend = weekday >= 5
             is_lunch_break = (current_hour == 11 and current_minute >= 30) or (current_hour == 12)
-            
-            # Chỉ cào khi: Trong tuần VÀ Từ 9h sáng đến trước 15h chiều
             is_trading_time = (not is_weekend) and (9 <= current_hour < 15) and (not is_lunch_break)
 
             if not is_trading_time:
-                # Tính toán thời gian ngủ (đến 8h55 sáng mai hoặc 13h00 nếu là nghỉ trưa)
                 if is_lunch_break:
                     wake_up_time = vn_now.replace(hour=13, minute=0, second=0, microsecond=0)
                 else:
                     wake_up_time = vn_now.replace(hour=8, minute=55, second=0, microsecond=0)
-                    # Nếu đã qua 15h hoặc đang là cuối tuần -> Ngủ đến sáng hôm sau
                     if current_hour >= 15 or is_weekend:
                         wake_up_time += timedelta(days=1)
-                    
-                    # Nếu rơi vào thứ 7, CN thì đẩy lùi đến thứ 2
                     while wake_up_time.weekday() >= 5:
                         wake_up_time += timedelta(days=1)
 
                 sleep_seconds = (wake_up_time - vn_now).total_seconds()
                 if sleep_seconds > 0:
                     print(f"🌙 [AUTO] Ngoài giờ giao dịch. Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
-                    # Ngủ tối đa 1 tiếng (để tránh treo nếu có thay đổi cài đặt)
                     time.sleep(min(sleep_seconds, 3600))
                     continue
 
-            # 2. TRONG GIỜ GIAO DỊCH -> TIẾN HÀNH CÀO
             collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             crawled_count = collection.count_documents({"chot_so_today": today_str})
 
-            # Nếu đã cào xong 100% trong ngày, không cần cào lại
             if crawled_count >= len(all_symbols) and len(all_symbols) > 0:
                 time.sleep(60)
                 continue
@@ -712,11 +718,12 @@ def auto_crawler_worker():
                     
                 _execute_crawl(symbols_to_crawl, is_manual=False)
                 
-            time.sleep(15) # Nghỉ 15s trước vòng lặp tiếp theo
+            time.sleep(15)
             
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
+
 def full_data_crawler_worker():
     while True:
         try:
@@ -784,7 +791,23 @@ def home():
 @app.get("/api/status")
 def api_status():
     print("[API] 📊 Gọi API /api/status", flush=True)
-    return jsonify({"status": "success", "is_crawling": is_crawling, "message": "Đang cào real-time" if is_crawling else "Sẵn sàng"})
+    return jsonify({"status": "success", "is_crawling": is_crawling, "is_paused": is_auto_crawl_paused, "message": "Đang cào real-time" if is_crawling else "Sẵn sàng"})
+
+@app.get("/api/pause-crawl")
+def pause_crawl():
+    global is_auto_crawl_paused, stop_crawl_requested
+    is_auto_crawl_paused = True
+    stop_crawl_requested = True
+    print("\n[API] ⏸️ Đã TẠM DỪNG hoàn toàn tiến trình cào tự động!", flush=True)
+    return jsonify({"status": "success", "message": "Đã tạm dừng cào tự động."})
+
+@app.get("/api/resume-crawl")
+def resume_crawl():
+    global is_auto_crawl_paused, stop_crawl_requested
+    is_auto_crawl_paused = False
+    stop_crawl_requested = False
+    print("\n[API] ▶️ Đã TIẾP TỤC tiến trình cào tự động!", flush=True)
+    return jsonify({"status": "success", "message": "Đã tiếp tục cào tự động."})
 
 @app.post("/api/set-fhsc-key")
 def api_set_fhsc_key():
@@ -1076,9 +1099,10 @@ def crawl_full_bctc():
         finally: is_full_data_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào FULL BCTC..."})
+
 @app.get("/api/crawl-ratios")
 def crawl_ratios():
-    print(f"\n[API] 📥 Gọi API /api/crawl-ratios (Cào P/E, P/B, ROE từ VCI)", flush=True)
+    print(f"\n[API] 📥 Gọi API /api/crawl-ratios (Cào P/E, P/B, ROE từ FHSC)", flush=True)
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
@@ -1092,11 +1116,11 @@ def crawl_ratios():
             for i, sym in enumerate(target):
                 print(f"[RATIO-CRAWL] [{i+1}/{len(target)}] Đang lấy ratio cho {sym}...", flush=True)
                 try:
-                    # Gọi API VCI lấy bảng ratio
-                    df_ratio = Fundamental().equity(sym).ratio(source="vci", period="quarterly")
+                    # Gọi API FHSC lấy bảng ratio (thay vì VCI bị lỗi)
+                    df_ratio = Fundamental().equity(sym).ratio(source="fhsc", period="quarterly")
                     
                     if df_ratio is not None and not df_ratio.empty:
-                        # Sắp xếp mới nhất lên đầu
+                        # Sắp xếp mới nhất lên đầu và cắt 8 quý
                         if 'year' in df_ratio.columns and 'quarter' in df_ratio.columns:
                             df_ratio = df_ratio.sort_values(by=['year', 'quarter'], ascending=[False, False])
                             df_ratio = df_ratio.head(8) # Lấy 8 quý gần nhất
@@ -1117,19 +1141,20 @@ def crawl_ratios():
                             "dividend_yield": float(latest.get("dividend_yield", 0) or 0),
                             "ratio_updated_at": _now_str()
                         }}, upsert=True)
-                        print(f"  ✅ [RATIO] {sym} thành công (P/E: {latest.get('pe', 0)})", flush=True)
+                        print(f"  ✅ [RATIO] {sym} thành công (P/E: {latest.get('pe', 0)}, ROE: {latest.get('roe', 0)})", flush=True)
                     else:
                         print(f"  ⚠️ [RATIO] {sym} không có dữ liệu trả về.", flush=True)
                 except Exception as e:
                     print(f"  ❌ [RATIO] Lỗi khi lấy {sym}: {e}", flush=True)
-                time.sleep(1.5) # Nghỉ 1.5s tránh Rate Limit VCI
+                time.sleep(1.5) # Nghỉ 1.5s tránh Rate Limit
                 
             print(f"[RATIO-CRAWL] 🏁 Đã cào xong toàn bộ bảng Ratio.", flush=True)
         finally: 
             is_full_data_running = False
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"status": "success", "message": "Đang cào bảng Ratio (P/E, ROE...) từ VCI..."})
+    return jsonify({"status": "success", "message": "Đang cào bảng Ratio (P/E, ROE...) từ FHSC..."})
+
 @app.get("/api/force-screener")
 def force_screener():
     print(f"\n[API] 📥 Gọi API /api/force-screener (Ép chấm điểm lại)", flush=True)
