@@ -307,7 +307,11 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     
     print(f"\n[CRAWL] 🚀 [{'CÀO BÙ' if is_retry else ('CÀO TAY' if is_manual else 'REAL-TIME')}] Bắt đầu xử lý {len(symbols)} mã...", flush=True)
     try:
+        vn_now = datetime.utcnow() + timedelta(hours=7)
+        real_today = vn_now.strftime("%Y-%m-%d")
         trading_date = _get_trading_date_str()
+        current_hour = vn_now.hour
+
         alert_batch, pending_history_files = [], {}
 
         for chunk_idx in range(0, len(symbols), 5):
@@ -320,46 +324,30 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 if stop_crawl_requested: break
                 
                 doc = collection.find_one({"symbol": sym})
-                if doc and doc.get("chot_so_today") == trading_date: continue
-                
                 data = _fetch_one(sym)
+                
                 if data:
                     hist_doc = history_col.find_one({"symbol": sym})
                     prev_close = 0.0
                     avg_vol_20 = 0.0
                     
-                    # 1. LẤY NẾN HÔM QUA TỪ MONGODB (history_data)
                     if hist_doc and hist_doc.get("history_d1"):
                         bars = hist_doc["history_d1"]
-                        # Sắp xếp lại mảng theo thứ tự thời gian tăng dần để chắc chắn
                         bars_sorted = sorted(bars, key=lambda x: x.get("time", ""))
                         
-                        # Duyệt ngược từ cuối mảng để tìm nến gần nhất TRƯỚC ngày hôm nay
+                        # Tìm nến gần nhất TRƯỚC trading_date (lùi 1 ngày)
                         for b in reversed(bars_sorted):
                             b_time = b.get("time")
                             if b_time and b_time < trading_date:
                                 prev_close = float(b["close"])
-                                break # Tìm thấy là dừng luôn
+                                break 
                         
                         # Tính Avg Volume 20
                         valid_vols = [b.get("volume", 0) for b in bars_sorted[-20:] if b.get("volume", 0) > 0]
                         if valid_vols: avg_vol_20 = sum(valid_vols) / len(valid_vols)
 
-                    # 2. Fallback: Nếu DB chưa có nến, lấy từ Github
-                    if prev_close <= 0:
-                        hist_gh, _ = get_github_file_data(f"history/{sym}.json")
-                        if hist_gh and hist_gh.get("history_d1"):
-                            bars_gh = hist_gh["history_d1"]
-                            bars_gh_sorted = sorted(bars_gh, key=lambda x: x.get("time", ""))
-                            for b in reversed(bars_gh_sorted):
-                                b_time = b.get("time")
-                                if b_time and b_time < trading_date:
-                                    prev_close = float(b["close"])
-                                    break
-                            
-                            if avg_vol_20 <= 0:
-                                valid_vols = [b.get("volume", 0) for b in bars_gh_sorted[-20:] if b.get("volume", 0) > 0]
-                                if valid_vols: avg_vol_20 = sum(valid_vols) / len(valid_vols)
+                    if prev_close <= 0 and doc:
+                        prev_close = float(doc.get("close", 0))
 
                     vol_pct = round(data["volume"] / avg_vol_20 * 100, 2) if avg_vol_20 > 0 else 0
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0
@@ -368,6 +356,13 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     if pct_change > 0: arrow, color = "▲", "emerald"
                     elif pct_change < 0: arrow, color = "▼", "rose"
 
+                    # XÁC ĐỊNH TRẠNG THÁI MỞ SỔ / CHỐT SỔ
+                    is_locked = doc.get("is_locked", True) if doc else True
+                    if current_hour >= 9 and is_locked:
+                        if data["close"] != prev_close:
+                            is_locked = False
+                            print(f"  🔓 [MỞ SỔ] {sym}: Giá biến động", flush=True)
+
                     collection.update_one({"symbol": sym}, {"$set": {
                         "close": data["close"], "prev_close": prev_close, 
                         "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
@@ -375,21 +370,20 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "price_change_percent": pct_change,
                         "price_change_available": prev_close > 0,
                         "price_arrow": arrow, "price_color": color,
-                        "trading_date": trading_date, "updated_at": _now_str(), "is_locked": _is_after_15h(), "is_incomplete": False
+                        "trading_date": trading_date, "updated_at": _now_str(), "is_locked": is_locked, "is_incomplete": False
                     }}, upsert=True)
                     
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
-                    # 3. LƯU NẾN HÔM NAY TRỰC TIẾP VÀO DATABASE (Để sáng mai lấy làm prev_close)
-                    if _is_after_15h():
+                    # CHỐT SỔ SAU 15H (CHỈ CHỐT NẾU HÔM NAY ĐÃ MỞ SỔ)
+                    if current_hour >= 15 and not is_locked:
                         d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
-                        # Xóa nến hôm nay cũ (nếu có) để tránh trùng lặp
-                        d1_bars = [b for b in d1_bars if b.get("time") != trading_date]
+                        # Dùng real_today để lưu nến thực tế
+                        d1_bars = [b for b in d1_bars if b.get("time") != real_today]
                         
-                        # Thêm nến hôm nay vào
                         d1_bars.append({
-                            "time": trading_date, 
+                            "time": real_today, 
                             "open": data["open"], 
                             "high": data["high"], 
                             "low": data["low"], 
@@ -398,24 +392,20 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         })
                         d1_bars.sort(key=lambda x: x["time"])
                         
-                        # Lưu vào Database
                         history_col.update_one({"symbol": sym}, {"$set": {"history_d1": d1_bars}}, upsert=True)
+                        collection.update_one({"symbol": sym}, {"$set": {"is_locked": True, "chot_so_today": real_today}})
                         
-                        # Chuẩn bị đẩy lên Github
                         if hist_doc is None: hist_doc = {"symbol": sym}
                         hist_doc["history_d1"] = d1_bars
                         pending_history_files[f"history/{sym}.json"] = hist_doc
             time.sleep(1)
 
-        if _is_after_15h() and pending_history_files:
+        if current_hour >= 15 and pending_history_files:
             files_to_push = list(pending_history_files.keys())
             for i in range(0, len(files_to_push), 10):
                 chunk_files = files_to_push[i:i+10]
                 chunk_data = {k: pending_history_files[k] for k in chunk_files}
-                if commit_multiple_files_to_github(chunk_data, f"Cập nhật nến {trading_date}"):
-                    for path in chunk_files:
-                        if path.startswith("history/"):
-                            collection.update_one({"symbol": path.split("/")[1].replace(".json", "")}, {"$set": {"chot_so_today": trading_date, "is_locked": True}})
+                commit_multiple_files_to_github(chunk_data, f"Cập nhật nến {real_today}")
                 time.sleep(2)
 
         if alert_batch:
