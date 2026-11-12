@@ -920,33 +920,174 @@ def screener_worker():
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
-            if vn_now.hour == 16 and vn_now.minute == 30 and vn_now.second < 10:
+            today_str = vn_now.strftime("%Y-%m-%d")
+            current_hour = vn_now.hour
+            
+            # Kiểm tra tiến độ chốt sổ
+            all_symbols_count = collection.count_documents({})
+            crawled_count = collection.count_documents({"chot_so_today": today_str})
+            
+            # Điều kiện chạy: Đúng 16h30 (dự phòng) HOẶC vừa chốt sổ xong
+            is_1630 = (current_hour == 16 and vn_now.minute == 30 and vn_now.second < 10)
+            is_just_closed = (current_hour >= 15 and crawled_count >= all_symbols_count and all_symbols_count > 0)
+
+            if is_1630 or is_just_closed:
+                # Chống chạy lặp lại trong cùng 1 ngày
+                today_screener_check = screener_col.find_one({"date": today_str})
+                if today_screener_check:
+                    time.sleep(60)
+                    continue
+
+                print(f"\n[SCREENER] ⏰ Kích hoạt chấm điểm (Lý do: {'16h30' if is_1630 else 'Vừa chốt sổ xong'})", flush=True)
+                
+                # 1. LẤY DỮ LIỆU TỪ DATABASE
                 stock_db = {}
                 for doc in collection.find({}):
                     bctc = bctc_col.find_one({"symbol": doc["symbol"]}, {"_id": 0})
                     doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                     stock_db[doc["symbol"]] = doc
+                
+                # 2. TÍNH TOÁN ĐIỂM
                 normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
                 sector_medians = compute_sector_medians(normalized_db)
                 results = []
+                
                 for symbol, nd in normalized_db.items():
                     grp = get_sub_sector(symbol)
                     cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(symbol))
                     med, _ = get_median_for_symbol(symbol, sector_medians)
                     res = evaluate_stock_from_db(symbol, nd, med, grp, cfg)
-                    if res: results.append(res)
+                    if res: 
+                        res["date"] = today_str # Đánh dấu ngày để chống chạy lặp
+                        results.append(res)
+                        
                 if results:
+                    # 3. LƯU VÀO DATABASE VÀ GITHUB
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
                     screener_col.delete_many({}) 
                     screener_col.insert_many(results) 
                     commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Update Screener {_now_str()}")
-                time.sleep(120) 
-            time.sleep(30)
-        except Exception: time.sleep(60)
+                    print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã.", flush=True)
 
-threading.Thread(target=auto_crawler_worker, daemon=True).start()
-threading.Thread(target=full_data_crawler_worker, daemon=True).start()
-threading.Thread(target=screener_worker, daemon=True).start()
+                    # 4. TỔNG HỢP VÀ GỬI BÁO CÁO TELEGRAM CHUYÊN SÂU
+                    try:
+                        # --- BIẾN ĐẾM ---
+                        up_count = 0
+                        down_count = 0
+                        ref_count = 0
+                        
+                        buy_strong = 0
+                        buy_accumulate = 0
+                        avoid = 0
+                        
+                        strong_movers = []
+                        value_stocks = []
+                        danger_stocks = []
+                        
+                        # BIẾN ĐẾM LỖI DỮ LIỆU
+                        incomplete_data_count = 0
+                        incomplete_symbols = []
+
+                        for r in results:
+                            decision = r.get("final_decision", "")
+                            if "MUA MẠNH" in decision: buy_strong += 1
+                            elif "MUA TÍCH SẢN" in decision: buy_accumulate += 1
+                            elif "TRÁNH" in decision: 
+                                avoid += 1
+                                if len(danger_stocks) < 3:
+                                    danger_stocks.append(f"  • {r['symbol']} (Điểm: {r.get('total_score', 0)})")
+
+                            # Lấy dữ liệu từ DB để phân tích
+                            stock_data = stock_db.get(r['symbol'], {})
+                            pct_change = stock_data.get("price_change_percent", 0)
+                            vol_pct = stock_data.get("volume_percent", 0)
+                            close_price = stock_data.get("close", 0)
+
+                            # 1. Thống kê độ rộng thị trường
+                            if pct_change > 0.05: up_count += 1
+                            elif pct_change < -0.05: down_count += 1
+                            else: ref_count += 1
+
+                            # 2. Lọc mã biến động mạnh (Dòng tiền nóng)
+                            if abs(pct_change) >= 3.0 and vol_pct >= 120.0:
+                                arrow = "🔴" if pct_change < 0 else "🟢"
+                                strong_movers.append(f"  {arrow} <b>{r['symbol']}</b>: {pct_change:+.2f}% (Vol: {vol_pct:.0f}%)")
+
+                            # 3. Lọc mã cơ hội (Rẻ + Cơ bản tốt >= 30đ)
+                            if "RẺ" in r.get("valuation_verdict", "") and r.get("fundamental_score", 0) >= 30:
+                                if len(value_stocks) < 3:
+                                    value_stocks.append(f"  • <b>{r['symbol']}</b> ({r.get('sector')}): Giá {close_price:,.0f} - Vùng mua ≤ {r.get('fair_value_low',0):,.0f}")
+                            
+                            # 4. Kiểm tra lỗi dữ liệu
+                            if r.get("is_data_incomplete", False):
+                                incomplete_data_count += 1
+                                if len(incomplete_symbols) < 5:
+                                    warnings = ', '.join(r.get('data_warnings', []))
+                                    incomplete_symbols.append(f"{r['symbol']} ({warnings})")
+
+                        # --- NHẬN ĐỊNH THỊ TRƯỜNG TỰ ĐỘNG ---
+                        total_up_down = up_count + down_count
+                        if total_up_down > 0:
+                            ratio_up = (up_count / total_up_down) * 100
+                        else:
+                            ratio_up = 50
+
+                        if ratio_up >= 65:
+                            market_view = "🟢 <b>TÂM LÝ HƯNG PHẤN:</b> Dòng tiền lan tỏa mạnh, ưu tiên nắm giữ cổ phiếu."
+                        elif ratio_up <= 35:
+                            market_view = "🔴 <b>TÂM LÝ BI QUAN:</b> Áp lực bán chiếm ưu thế, hạn chế mua mới."
+                        else:
+                            market_view = "🟡 <b>THỊ TRƯỜNG PHÂN HÓA:</b> Dòng tiền có sự chọn lọc, chỉ nên mua các mã có nền tảng tốt."
+
+                        # --- TẠO NỘI DUNG TIN NHẮN ---
+                        msg_lines = []
+                        
+                        # CẢNH BÁO LỖI DỮ LIỆU LÊN ĐẦU TIÊN
+                        if incomplete_data_count > 0:
+                            msg_lines.append(f"⚠️ <b>CẢNH BÁO: CÓ {incomplete_data_count} MÃ BỊ LỖI DỮ LIỆU API!</b>")
+                            msg_lines.append(f"  Chi tiết một số mã: <i>{'; '.join(incomplete_symbols)}</i>")
+                            msg_lines.append(f"  👉 Điểm số của các mã này có thể không chính xác. Hãy kiểm tra lại API!")
+                            msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
+
+                        msg_lines.extend([
+                            f"📊 <b>BÁO CÁO THỊ TRƯỜNG TỰ ĐỘNG</b>",
+                            f"⏰ Cập nhật: {_now_str()}",
+                            f"━━━━━━━━━━━━━━━━━━",
+                            f"<b>1️⃣ TỔNG QUAN ĐỘ RỘNG</b>",
+                            f"  🟢 Tăng: <b>{up_count}</b> | 🔴 Giảm: <b>{down_count}</b> | ⚪ Đứng: {ref_count}",
+                            f"  👉 {market_view}",
+                            f"━━━━━━━━━━━━━━━━━━",
+                            f"<b>2️⃣ DÒNG TIỀN ĐỘT BIẾN (Hot Money)</b>"
+                        ])
+                        
+                        if strong_movers:
+                            msg_lines.extend(strong_movers)
+                        else:
+                            msg_lines.append("  💤 Không có mã nào biến động quá 3%.")
+
+                        msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
+                        msg_lines.append(f"<b>3️⃣ CƠ HỘI GIẢI NGÂN (Vùng mua an toàn)</b>")
+                        if value_stocks:
+                            msg_lines.extend(value_stocks)
+                        else:
+                            msg_lines.append("  ⏳ Hiện chưa có mã nào thỏa mãn (Rẻ + Cơ bản tốt).")
+
+                        msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
+                        msg_lines.append(f"<b>4️⃣ CẢNH BÁO RỦI RO</b>")
+                        msg_lines.append(f"  ❌ Có <b>{avoid}</b> mã bị đánh giá TRÁNH (Giá đắt, nền tảng yếu).")
+                        if danger_stocks:
+                             msg_lines.append(f"  ⚠️ <i>Điển hình: {', '.join(danger_stocks).replace('  • ', '')}</i>")
+
+                        send_telegram("\n".join(msg_lines))
+                        print("[SCREENER] 🚀 Đã gửi báo cáo thị trường qua Telegram.", flush=True)
+                    except Exception as te:
+                        print(f"[SCREENER] ❌ Lỗi khi gửi Telegram: {te}", flush=True)
+
+                time.sleep(120) # Nghỉ 2 phút sau khi chấm xong
+            time.sleep(30)
+        except Exception as e: 
+            print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
+            time.sleep(60)
 
 # ===================== ROUTES =====================
 @app.get("/")
