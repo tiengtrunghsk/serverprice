@@ -425,7 +425,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "price_change_percent": pct_change,
                         "price_change_available": prev_close > 0,
                         "price_arrow": arrow, "price_color": color,
-                        "trading_date": latest_history_date if latest_history_date else real_today, 
+                        "trading_date": real_today, # SỬA: Luôn dùng ngày hôm nay cho giá realtime
                         "updated_at": _now_str(), "is_locked": is_locked, "is_incomplete": False
                     }}, upsert=True)
                     
@@ -1363,6 +1363,7 @@ def force_screener():
             
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
+
 @app.get("/api/force-realtime")
 def force_realtime():
     print(f"\n[API] ⚡ Gọi API /api/force-realtime (Ép cào giá Realtime ngay lập tức)", flush=True)
@@ -1381,6 +1382,7 @@ def force_realtime():
         "status": "success", 
         "message": f"Đã kích hoạt ép cào realtime cho toàn bộ {len(all_symbols)} mã. Vui lòng đợi 1-2 phút rồi F5 trang web!"
     })
+
 @app.get("/api/reset-today")
 def reset_today():
     print(f"\n[API] 📥 Gọi API /api/reset-today (Hủy chốt sổ)", flush=True)
@@ -1406,6 +1408,32 @@ def retry_now():
         return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
+
+# ===================== API LỊCH SỬ (BỔ SUNG CHO ĐỒ THỊ) =====================
+@app.get("/api/history")
+def api_get_history():
+    symbol = request.args.get("symbol", "").upper().strip()
+    if not symbol:
+        return jsonify({"status": "error", "message": "Thiếu mã"}), 400
+        
+    print(f"[API] 📊 Gọi API /api/history | Mã: {symbol}", flush=True)
+    
+    try:
+        hist_doc = history_col.find_one({"symbol": symbol}, {"_id": 0})
+        if not hist_doc:
+            return jsonify({"status": "error", "message": "Không có dữ liệu lịch sử"}), 404
+            
+        # Trả về toàn bộ dữ liệu lịch sử
+        return jsonify({
+            "status": "success", 
+            "symbol": symbol,
+            "history_d1": hist_doc.get("history_d1", []),
+            "history_w1": hist_doc.get("history_w1", []),
+            "history_mn": hist_doc.get("history_mn", [])
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
