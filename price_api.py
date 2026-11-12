@@ -1597,7 +1597,67 @@ def api_ai_analyze():
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+@app.get("/api/admin/force-ai-single")
+def admin_force_ai_single():
+    global is_ai_running
+    
+    # Lấy mã từ URL, ví dụ: /api/admin/force-ai-single?symbol=HCM
+    symbol = request.args.get("symbol", "").upper().strip()
+    
+    if not symbol:
+        return jsonify({"status": "error", "message": "Vui lòng truyền tham số ?symbol=XXX"}), 400
+        
+    if is_ai_running:
+        return jsonify({"status": "error", "message": "Hệ thống đang chạy AI hàng loạt, vui lòng đợi!"}), 400
+    
+    if not ALIBABA_API_KEY:
+        return jsonify({"status": "error", "message": "Thiếu ALIBABA_API_KEY trong biến môi trường!"}), 500
+    
+    # Kiểm tra xem mã này có dữ liệu trong Database chưa
+    sm = collection.find_one({"symbol": symbol}, {"_id": 0})
+    si = screener_col.find_one({"symbol": symbol}, {"_id": 0})
+    
+    if not sm or not si:
+        return jsonify({
+            "status": "error", 
+            "message": f"Mã {symbol} chưa đủ dữ liệu nền (chưa có trong bảng giá hoặc chưa được chấm điểm). Hãy chạy /api/force-screener trước."
+        }), 404
 
+    is_ai_running = True
+    print(f"\n[ADMIN-AI-SINGLE] 🚀 Bắt đầu chạy AI cho mã {symbol}...", flush=True)
+    
+    def _run():
+        global is_ai_running
+        try:
+            sector = si.get("sector", "SAN_XUAT_TIEU_DUNG_PHONG_THU")
+            
+            # Gọi AI
+            ai_result = _call_ai_for_symbol(symbol, sm, si, sector)
+            
+            if ai_result:
+                # Lưu vào DB
+                collection.update_one({"symbol": symbol}, {"$set": {
+                    "ai_bctc": ai_result.get("bctc", ""),
+                    "ai_catalyst": ai_result.get("catalyst", ""),
+                    "ai_risks": ai_result.get("risks", ""),
+                    "ai_outlook": ai_result.get("outlook", ""),
+                    "ai_recommendation": ai_result.get("recommendation", ""),
+                    "ai_price_zone": ai_result.get("price_zone", ""),
+                    "ai_macro_view": ai_result.get("macro_view", ""),
+                    "ai_updated_at": _now_str()
+                }})
+                print(f"[ADMIN-AI-SINGLE] ✅ {symbol} - Đã lưu phân tích AI thành công!", flush=True)
+            else:
+                print(f"[ADMIN-AI-SINGLE] ❌ {symbol} - Gọi AI thất bại. Xem log lỗi ở trên.", flush=True)
+        finally:
+            is_ai_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    
+    return jsonify({
+        "status": "success", 
+        "message": f"Đã bắt đầu chạy AI cho mã {symbol}. Hãy theo dõi log trên Render!"
+    })
 @app.get("/api/admin/force-ai")
 def admin_force_ai():
     global is_ai_running
