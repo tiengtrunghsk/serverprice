@@ -1258,15 +1258,16 @@ def screener_worker():
                     print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
                 # === KẾT THÚC BỔ SUNG ===
 
-                # === BỔ SUNG: TỰ ĐỘNG TẠO TEMPLATE CHO CÁC MÃ CHƯA CÓ AI ===
+                # === BỔ SUNG: TỰ ĐỘNG TẠO TEMPLATE CHO CÁC MÃ CHƯA CÓ AI THẬT ===
                 if results:
-                    print(f"[SCREENER] 📝 Đang tạo Template cho các mã chưa có AI...", flush=True)
+                    print(f"[SCREENER] 📝 Đang tạo/cập nhật Template cho các mã chưa có AI thật...", flush=True)
                     template_count = 0
                     for r in results:
                         sym = r["symbol"]
-                        existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1})
-                        if existing and existing.get("ai_bctc"):
-                            continue  # Đã có AI, bỏ qua
+                        # SỬA: Chỉ bỏ qua nếu đã có AI THẬT (ai_source == "AI"). Template sẽ được cập nhật lại.
+                        existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
+                        if existing and existing.get("ai_bctc") and existing.get("ai_source") == "AI":
+                            continue  # Đã có AI thật, không ghi đè
                         
                         nd_for_template = normalized_db.get(sym, {})
                         template_data = build_fallback_narrative(sym, nd_for_template, r, get_sector(sym))
@@ -1284,7 +1285,7 @@ def screener_worker():
                                 "ai_source": "TEMPLATE"
                             }})
                             template_count += 1
-                    print(f"[SCREENER] ✅ Đã tạo Template cho {template_count} mã chưa có AI.", flush=True)
+                    print(f"[SCREENER] ✅ Đã tạo/cập nhật Template cho {template_count} mã (chưa có AI thật).", flush=True)
                 # === KẾT THÚC BỔ SUNG ===
                         
                 if results:
