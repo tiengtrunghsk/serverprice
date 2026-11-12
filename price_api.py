@@ -185,12 +185,27 @@ def _fetch_one(symbol: str) -> Optional[dict]:
     print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True)
     def _do():
         try:
+            # Lấy nến 1 phút trong vài ngày gần nhất
             today = datetime.now().strftime("%Y-%m-%d")
             past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            df = Market().equity(symbol).ohlcv(start=past_7d, end=today, source="ssi")
+            
+            # THAY ĐỔI: Dùng interval="1m" và source="vci"
+            df = Market().equity(symbol).ohlcv(
+                start=past_7d, 
+                end=today, 
+                interval="1m",   # <-- Lấy nến 1 phút
+                source="vci"     # <-- Nguồn VCI hỗ trợ nến phút tốt
+            )
+            
             if df is not None and not df.empty:
                 latest = df.iloc[-1]
-                return {"close": float(latest["close"]), "open": float(latest["open"]), "high": float(latest["high"]), "low": float(latest["low"]), "volume": int(latest["volume"])}
+                return {
+                    "close": float(latest["close"]), 
+                    "open": float(latest["open"]), 
+                    "high": float(latest["high"]), 
+                    "low": float(latest["low"]), 
+                    "volume": int(latest["volume"])
+                }
             return None
         except Exception as e:
             print(f"    ❌ [FETCH ERROR] Lỗi gọi Vnstock cho {symbol}: {e}", flush=True)
