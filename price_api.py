@@ -77,7 +77,7 @@ ALLOWED_ORIGINS = "*" if (_raw_origins == "*" or not _raw_origins) else [o.strip
 
 ALIBABA_API_KEY = os.environ.get("ALIBABA_API_KEY", "").strip()
 AI_API_URL = "https://ws-8lcqaxwxdv0h9xzy.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
-AI_MODEL_NAME = "qwen3.7-max"
+AI_MODEL_NAME = os.environ.get("AI_MODEL_NAME", "qwen3.7-max-2026-06-08")
 AI_TEMPERATURE = 0.15
 
 # ===================== ĐỌC METADATA TỪ FILE JSON =====================
