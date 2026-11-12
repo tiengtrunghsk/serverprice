@@ -809,7 +809,17 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         ai_data["ai_source"] = stock_doc.get("ai_source", "AI")
         
         # 2. TỰ TÍNH LẠI VÙNG MUA VÀ KHUYẾN NGHỊ (Không cho AI tự tính)
-        temp_template = build_fallback_narrative(symbol, nd, {
+        # Gộp dữ liệu thô (nd) với kết quả định giá (fv) để truyền vào hàm tạo Template
+        metrics_for_template = {
+            **nd,
+            "fair_value_low": fv["fair_low"],
+            "fair_value_high": fv["fair_high"],
+            "valuation_verdict": fv["verdict"],
+            "discount_to_fair_pct": fv["discount_to_fair_pct"],
+            "margin_of_safety_pct": fv["mos_pct"]
+        }
+        
+        temp_template = build_fallback_narrative(symbol, metrics_for_template, {
             "fundamental_score": fund_score, 
             "valuation_score": val_score, 
             "total_score": total_score,
