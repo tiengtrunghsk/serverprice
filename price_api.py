@@ -325,13 +325,24 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 data = _fetch_one(sym)
                 if data:
                     hist_data, _ = get_github_file_data(f"history/{sym}.json")
-                    prev_close, avg_vol_20 = 0.0, 0.0
+                    avg_vol_20 = 0.0
+                    
+                    # 1. LẤY AVG_VOL_20 TỪ GITHUB (Nếu có)
                     if hist_data and hist_data.get("history_d1"):
+                        bars = hist_data["history_d1"]
+                        valid_vols = [b.get("volume", 0) for b in bars[-20:] if b.get("volume", 0) > 0]
+                        if valid_vols: avg_vol_20 = sum(valid_vols) / len(valid_vols)
+                    
+                    # 2. LẤY PREV_CLOSE ƯU TIÊN TỪ DATABASE
+                    prev_close = 0.0
+                    if doc and doc.get("close"):
+                        # Nếu trong DB đã có giá đóng cửa hôm qua, dùng nó
+                        prev_close = float(doc["close"])
+                    elif hist_data and hist_data.get("history_d1"):
+                        # Nếu DB chưa có, fallback về Github
                         bars = hist_data["history_d1"]
                         if len(bars) >= 2: prev_close = bars[-2]["close"] if bars[-1]["time"] == trading_date else bars[-1]["close"]
                         elif len(bars) == 1: prev_close = bars[0]["close"]
-                        valid_vols = [b.get("volume", 0) for b in bars[-20:] if b.get("volume", 0) > 0]
-                        if valid_vols: avg_vol_20 = sum(valid_vols) / len(valid_vols)
                     
                     vol_pct = round(data["volume"] / avg_vol_20 * 100, 2) if avg_vol_20 > 0 else 0
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0
@@ -391,7 +402,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     finally:
         is_crawling = False
         stop_crawl_requested = False
-
 # ===================== GITHUB HELPER =====================
 def get_github_file_data(file_path):
     if not all([GITHUB_TOKEN, GITHUB_USERNAME, GITHUB_REPO]): return None, None
