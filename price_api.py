@@ -36,7 +36,7 @@ def log_exception(context: str, exc: Exception):
     logger.error("%s | %s: %s", context, type(exc).__name__, str(exc), exc_info=True)
 
 # ===================== VNSTOCK THẾ HỆ 6 =====================
-from vnstock import Market, Reference, Fundamental
+from vnstock import Market, Fundamental
 
 try:
     from ptkt import ProfessionalTechnicalAnalyzer
@@ -60,11 +60,6 @@ else:
 
 ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY")
 ENV_FHSC_API_KEY = os.environ.get("FHSC_API_KEY", "").strip()
-
-# v6 yêu cầu đăng ký key với FHSC, ta nạp nó vào biến môi trường
-if ENV_FHSC_API_KEY:
-    os.environ["FHSC_API_KEY"] = ENV_FHSC_API_KEY
-
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
@@ -270,7 +265,7 @@ def extract_metrics_from_bctc_data(bctc_doc):
             
     return metrics
 
-# ===================== CÀO GIÁ (SSI v6) =====================
+# ===================== CÀO GIÁ =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
     print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True)
     def _do():
@@ -278,11 +273,11 @@ def _fetch_one(symbol: str) -> Optional[dict]:
             today = datetime.now().strftime("%Y-%m-%d")
             past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
             
-            # V6 bắt buộc khai báo source
-            df = Market(source="ssi").equity(symbol).ohlcv(
+            df = Market().equity(symbol).ohlcv(
                 start=past_7d, 
                 end=today, 
-                interval="1m"
+                interval="1m", 
+                source="ssi"
             )
             
             if df is not None and not df.empty:
@@ -340,24 +335,29 @@ def _fetch_one(symbol: str) -> Optional[dict]:
 
 def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
     try:
-        df = Market(source="ssi").equity(symbol).ohlcv(start=start_date, end=end_date)
+        df = Market().equity(symbol).ohlcv(start=start_date, end=end_date, source="ssi")
         return df if df is not None and not df.empty else None
     except Exception: return None
 
-# ===================== CÀO BCTC (VCI v6) =====================
-def _fetch_bctc_vci(symbol: str):
+# ===================== CÀO BCTC =====================
+def _fetch_bctc_ssi(symbol: str):
     symbol = str(symbol).upper().strip()
-    print(f"  [BCTC] 🚀 Bắt đầu lấy dữ liệu VCI cho mã {symbol}...", flush=True)
+    fhsc_key = get_current_fhsc_key()
+    if not fhsc_key: 
+        print(f"  ⚠️ [BCTC] Bỏ qua {symbol} - Chưa có FHSC API KEY", flush=True)
+        return None
+        
+    os.environ["FHSC_API_KEY"] = fhsc_key
+    print(f"  [BCTC] 🚀 Bắt đầu lấy dữ liệu cho mã {symbol}...", flush=True)
 
     try:
-        # Chỉ định nguồn vci cho BCTC ở thế hệ 6
-        equity = Fundamental(source="vci").equity(symbol)
+        equity = Fundamental().equity(symbol)
         reports = {}
         report_names = ("balance_sheet", "income_statement", "cash_flow")
 
         def fetch_with_retry(func, period="quarter", max_retries=3, limit=8):
             for attempt in range(max_retries):
-                try: return func(period=period, limit=limit)
+                try: return func(period=period, source="fhsc", limit=limit)
                 except Exception as e:
                     err_str = str(e).lower()
                     if any(k in err_str for k in ["429", "rate limit", "vượt giới hạn"]): 
@@ -383,13 +383,12 @@ def _fetch_bctc_vci(symbol: str):
                     clean_df = df.astype(object).where(pd.notna(df), None)
                     records = clean_df.to_dict(orient="records")
                     
-                    # VCI v6 trả về long format (period, id, value), không cần parse year/quarter
                     if records and latest_period == "Chưa xác định":
-                        for r in records:
-                            p = r.get("period")
-                            if p:
-                                latest_period = p
-                                break
+                        try:
+                            first_record = records[0]
+                            y, q = first_record.get("year"), first_record.get("quarter")
+                            if y and q: latest_period = f"Q{q}/{y}"
+                        except: pass
                             
                     reports[report_name] = json.loads(json.dumps(records, ensure_ascii=False, default=str))
                     print(f"    ✓ Đã lấy {report_name} ({len(records)} dòng)", flush=True)
@@ -402,22 +401,6 @@ def _fetch_bctc_vci(symbol: str):
     except Exception as e:
         print(f"  ❌ [BCTC] Lỗi khi cào {symbol}: {e}", flush=True)
         return None
-
-# ===================== CÀO SỐ LƯỢNG CỔ PHIẾU & METADATA (FHSC v6) =====================
-def fetch_total_shares_fhsc(symbol):
-    """Lấy SLCP từ FHSC qua vnstock v6."""
-    fhsc_key = get_current_fhsc_key()
-    if not fhsc_key: return 0
-    
-    os.environ["FHSC_API_KEY"] = fhsc_key
-    try:
-        ref = Reference(source="fhsc")
-        df = ref.company(symbol).info()
-        if df is not None and not df.empty:
-            return int(float(df.iloc[0].get("issue_share", 0) or 0))
-    except Exception as e:
-        print(f"  ⚠️ [SHARES] {symbol}: {e}", flush=True)
-    return 0
 
 # ===================== CÀO RATIO TỪ VNDIRECT =====================
 VNDIRECT_RATIOS = {
@@ -1339,7 +1322,7 @@ def full_data_crawler_worker():
                             if datetime.strptime(bctc_doc["updated_at"], "%d/%m/%Y %H:%M:%S") < thirty_days_ago: need = True
                         except: need = True
                     if need:
-                        res = _fetch_bctc_vci(symbol)
+                        res = _fetch_bctc_ssi(symbol)
                         if res:
                             res.update({"symbol": symbol, "updated_at": _now_str()})
                             bctc_col.update_one({"symbol": symbol}, {"$set": res}, upsert=True)
@@ -1349,12 +1332,6 @@ def full_data_crawler_worker():
                             if extracted:
                                 collection.update_one({"symbol": symbol}, {"$set": extracted})
                                 
-                        # Bổ sung: tự động lấy SLCP nếu bị thiếu
-                        total_shares = collection.find_one({"symbol": symbol}, {"total_shares": 1})
-                        if not total_shares or total_shares.get("total_shares", 0) == 0:
-                            shares = fetch_total_shares_fhsc(symbol)
-                            if shares > 0:
-                                collection.update_one({"symbol": symbol}, {"$set": {"total_shares": shares}})
                         time.sleep(3.0)
                 time.sleep(3600) 
             else: time.sleep(30)
@@ -2011,7 +1988,7 @@ def force_bctc():
             
             for i, sym in enumerate(target):
                 print(f"\n[BCTC-CRAWL] [{i+1}/{len(target)}] Đang xử lý {sym}...", flush=True)
-                res = _fetch_bctc_vci(sym)
+                res = _fetch_bctc_ssi(sym)
                 
                 if res: 
                     bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
@@ -2073,7 +2050,7 @@ def crawl_full_bctc():
             print(f"[BCTC-CRAWL] 🚀 Bắt đầu cào toàn bộ BCTC cho {len(target)} mã...", flush=True)
             for i, sym in enumerate(target):
                 print(f"[BCTC-CRAWL] [{i+1}/{len(target)}] Đang xử lý {sym}...", flush=True)
-                res = _fetch_bctc_vci(sym)
+                res = _fetch_bctc_ssi(sym)
                 if res: 
                     bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
                     extracted = extract_metrics_from_bctc_data(res)
