@@ -37,6 +37,10 @@ def log_exception(context: str, exc: Exception):
 
 # ===================== VNSTOCK THẾ HỆ 6 =====================
 from vnstock import Market, Fundamental
+try:
+    from vnstock import Company  # Bổ sung để lấy số lượng cổ phiếu
+except ImportError:
+    Company = None
 
 try:
     from ptkt import ProfessionalTechnicalAnalyzer
@@ -217,7 +221,7 @@ def _get_bctc_value(report_array, target_ids, period=None):
     return 0.0
 
 def extract_metrics_from_bctc_data(bctc_doc):
-    """Trích xuất CFO, LNST TTM, D/E, Biên gộp từ document BCTC"""
+    """Trích xuất CFO, LNST TTM, D/E, Biên gộp từ document BCTC (Có fallback tự động tính nếu BCTC bị cắt cụt)"""
     if not bctc_doc: return {}
     
     metrics = {}
@@ -228,8 +232,39 @@ def extract_metrics_from_bctc_data(bctc_doc):
     # 1. LNST TTM (4 quý)
     periods = sorted(list(set([item.get("period") for item in income if item.get("period")])), reverse=True)
     npat_ttm = 0
+    
     for p in periods[:4]:
-        npat_ttm += _get_bctc_value(income, ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX", "IS_NET_PROFIT"], p)
+        npat_quy = 0.0
+        
+        # Tìm ID chuẩn
+        for item in income:
+            if item.get("period") == p:
+                id_str = str(item.get("id", "")).upper()
+                if id_str in ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX", "IS_NET_PROFIT"]:
+                    npat_quy = _safe_float(item.get("value"))
+                    break
+                    
+        # Nếu không có, tự động tính từ Lợi nhuận gộp + Doanh thu tài chính + Chi phí tài chính + Lãi liên doanh
+        if npat_quy == 0:
+            gross_profit = 0.0; fin_income = 0.0; fin_expense = 0.0; share_jv = 0.0
+            selling_exp = 0.0; admin_exp = 0.0; tax_exp = 0.0
+            for item in income:
+                if item.get("period") == p:
+                    id_str = str(item.get("id", "")).upper()
+                    val = _safe_float(item.get("value"))
+                    if id_str == "IS_GROSS_PROFIT": gross_profit = val
+                    elif id_str == "IS_FINANCIAL_INCOME": fin_income = val
+                    elif id_str == "IS_FINANCIAL_EXPENSES": fin_expense = val
+                    elif id_str == "IS_SHARE_OF_ASSOCIATES_AND_JOINT_VENTURES_RESULT": share_jv = val
+                    elif id_str in ["IS_SELLING_EXPENSES", "IS_SELLING_EXPENSE"]: selling_exp = val
+                    elif id_str in ["IS_GENERAL_AND_ADMIN_EXPENSES", "IS_ADMIN_EXPENSES"]: admin_exp = val
+                    elif id_str in ["IS_CORPORATE_INCOME_TAX", "IS_BUSINESS_INCOME_TAX", "IS_INCOME_TAX_EXPENSE"]: tax_exp = val
+            
+            estimated_npat = gross_profit + fin_income + fin_expense + share_jv + selling_exp + admin_exp + tax_exp
+            if estimated_npat != 0:
+                npat_quy = estimated_npat
+                
+        npat_ttm += npat_quy
     metrics["net_profit_ttm"] = round(npat_ttm / 1e9, 2)
     
     # 2. CFO TTM (4 quý)
@@ -264,6 +299,19 @@ def extract_metrics_from_bctc_data(bctc_doc):
             metrics["debt_to_equity"] = round(liab / eq, 2)
             
     return metrics
+
+def fetch_total_shares_vci(symbol):
+    """Tự động lấy số lượng cổ phiếu đang lưu hành từ VCI"""
+    if Company is None: return 0
+    try:
+        company = Company(source="vci", symbol=symbol)
+        df = company.overview()
+        if df is not None and not df.empty:
+            total_shares = int(df.iloc[0].get('issue_share', 0))
+            return total_shares
+    except Exception as e:
+        print(f"  ⚠️ [SHARES] Không lấy được số lượng CP cho {symbol}: {e}", flush=True)
+    return 0
 
 # ===================== CÀO GIÁ =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
@@ -666,7 +714,6 @@ def normalize_stock_data(symbol, data):
     pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
     
-    # BỔ SUNG: Nếu EPS trong DB vẫn đang là VND (vd: 3000), tự động chia 1000
     if eps >= 1000:
         eps = eps / 1000.0
         
@@ -675,10 +722,26 @@ def normalize_stock_data(symbol, data):
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
     bvps = (close_price / pb) if pb > 0 and close_price > 0 else 0
     if eps == 0 and pe > 0 and close_price > 0: eps = close_price / pe
-    return {"close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
-            "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
-            "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
-            "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy}
+    
+    # === BỔ SUNG: XỬ LÝ NET PROFIT TTM (Nếu BCTC lỗi/rỗng, tính từ EPS) ===
+    net_profit_ttm = float(data.get("net_profit_ttm", 0) or 0)
+    if net_profit_ttm == 0 and eps > 0:
+        total_shares = float(data.get("total_shares", 0) or 0)
+        if total_shares > 0:
+            net_profit_ttm = round((eps * 1000 * total_shares) / 1e9, 2)
+    # =========================================================
+
+    return {
+        "close_price": close_price, "pe": pe, "pb": pb, "ps": ps, 
+        "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
+        "dividend_yield": float(data.get("dividend_yield", 0)), 
+        "cfo_latest": float(data.get("cfo_latest", 0)),
+        "net_profit_ttm": net_profit_ttm,
+        "debt_to_equity": float(data.get("debt_to_equity", 0)),
+        "gross_margin": float(data.get("gross_margin", 0)), 
+        "profit_growth_yoy": profit_growth_yoy, 
+        "credit_growth_yoy": credit_growth_yoy
+    }
 
 def compute_sector_medians(normalized_db):
     buckets = {}
@@ -721,7 +784,6 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     if not is_financial and npat > 0 and cfo > 0 and (cfo / npat) >= 0.8 and eps > 0 and med_pe > 0: 
         methods["CFO_boost"] = round(eps * min(med_pe, cap_pe) * 1.10, 0)
     
-    # PS_METHOD (Bổ sung từ script cũ)
     if config.get("primary_metric") == "PB" and ps > 0 and med_ps > 0:
         sales_per_share = close / ps if ps > 0 else 0
         target_ps = min(med_ps, 2.5)
@@ -744,7 +806,7 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
 def compute_final_decision(fund_score, tech_score, val_score, total_score, verdict, cfo, npat, roe, debt_to_equity, discount_to_fair_pct=0.0, close_price=0.0, fair_high=0.0, fair_low=0.0):
     is_bank_or_sec = roe > 0 and debt_to_equity > 3.0
     if fund_score < 20: return ("❌ TRÁNH", "rose", f"PTCB yếu")
-    if not is_bank_or_sec and cfo < 0 and npat > 0 and fund_score < 25: return ("⚠️ CẢNH BÁO LỢI NHUẬN ẢO", "amber", f"CFO âm.")
+    if not is_bank_or_sec and npat > 0 and cfo < 0 and fund_score < 25: return ("⚠️ CẢNH BÁO LỢI NHUẬN ẢO", "amber", f"CFO âm.")
     if close_price > 0 and fair_high > 0 and close_price > fair_high * 1.2: return ("❌ TRÁNH", "rose", f"Giá vượt xa fair_high.")
     if close_price > 0 and fair_high > 0 and close_price > fair_high: return ("⚠️ CHỜ VỀ VÙNG MUA", "amber", f"Giá cao hơn fair_high.")
     if (verdict == "RẺ - TRONG VÙNG MUA" and fund_score >= 40 and tech_score >= 15 and val_score >= 24 and total_score >= 75 and discount_to_fair_pct >= 5): return ("🎯 MUA MẠNH", "emerald", "ĐỦ 4 YẾU TỐ.")
@@ -863,24 +925,20 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
 
     sim_data = get_historical_return_rate_with_details(symbol)
     
-    # Bổ sung metadata
     meta = VN100_METADATA.get(symbol, {})
 
-    # === BỔ SUNG: BỐC BÀI VIẾT AI TỪ STOCKS SANG VÀ TỰ TÍNH LẠI PRICE_ZONE ===
     ai_data = {
         "bctc": "", "catalyst": "", "risks": "", "outlook": "", 
         "recommendation": "", "price_zone": "", "macro_view": "", 
         "ai_updated_at": "Chưa phân tích", "ai_source": ""
     }
     
-    # 1. Tìm trong bảng stocks xem mã này đã có bài AI chưa
     stock_doc = collection.find_one({"symbol": symbol}, {
         "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1, 
         "ai_updated_at": 1, "ai_source": 1
     })
     
     if stock_doc and stock_doc.get("ai_bctc"):
-        # Nếu có, bốc toàn bộ văn bản AI sang
         ai_data["bctc"] = stock_doc.get("ai_bctc", "")
         ai_data["catalyst"] = stock_doc.get("ai_catalyst", "")
         ai_data["risks"] = stock_doc.get("ai_risks", "")
@@ -888,7 +946,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         ai_data["ai_updated_at"] = stock_doc.get("ai_updated_at", "Chưa phân tích")
         ai_data["ai_source"] = stock_doc.get("ai_source", "AI")
         
-        # 2. TỰ TÍNH LẠI VÙNG MUA VÀ KHUYẾN NGHỊ (Không cho AI tự tính)
         metrics_for_template = {
             **nd,
             "fair_value_low": fv["fair_low"],
@@ -909,7 +966,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         ai_data["outlook"] = temp_template.get("outlook", "")
         ai_data["recommendation"] = temp_template.get("recommendation", "")
         ai_data["price_zone"] = temp_template.get("price_zone", "")
-    # =======================================================================
 
     return {
         "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
@@ -985,7 +1041,6 @@ def build_verified_facts(symbol, sm, si, sector):
     return "\n".join(lines)
 
 def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
-    """Tạo báo cáo Template khi chưa có AI."""
     close = float(stock_metrics.get("close", stock_metrics.get("close_price", 0)) or 0)
     pe = float(stock_metrics.get("pe", 0) or 0)
     pb = float(stock_metrics.get("pb", 0) or 0)
@@ -1004,17 +1059,19 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     verdict = stock_metrics.get("valuation_verdict", "CHƯA TÍNH")
     mos_pct = float(stock_metrics.get("margin_of_safety_pct", 0) or 0)
     
-    fund_score = screener_item.get("fundamental_score", 0)
-    val_score = screener_item.get("valuation_score", 0)
-    tech_score = screener_item.get("technical_score", 0)
-    total_score = screener_item.get("total_score", 0)
     growth_yoy = float(screener_item.get("profit_growth_yoy", 0) or 0)
     final_decision = screener_item.get("final_decision", "CHƯA XÁC ĐỊNH")
 
     sector_name = SECTOR_NAMES.get(sector, sector)
     is_bank_or_sec = sector in ("NGAN_HANG", "CHUNG_KHOAN")
 
-    # --- Phần BCTC ---
+    # --- Phần BCTC (Tính từ EPS nếu LNST gốc = 0) ---
+    display_npat = npat
+    if display_npat == 0 and eps > 0:
+        total_shares = float(stock_metrics.get("total_shares", 0) or 0)
+        if total_shares > 0:
+            display_npat = round((eps * 1000 * total_shares) / 1e9, 2)
+            
     bctc_parts = [f"Chỉ số sinh lời: ROE đạt {roe:.1f}%, ROA {roa:.1f}%."]
     if is_bank_or_sec:
         bctc_parts.append(f"P/E {pe:.2f}x và P/B {pb:.2f}x phản ánh mức định giá của định chế tài chính. D/E {de:.2f} là bản chất ngân hàng.")
@@ -1022,20 +1079,22 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
         bctc_parts.append(f"Định giá P/E {pe:.2f}x và P/B {pb:.2f}x.")
         if gm > 0: bctc_parts.append(f"Biên lợi nhuận gộp {gm:.1f}%.")
 
-    if npat > 0 and cfo != 0:
-        cfo_ratio = cfo / npat
+    if display_npat > 0 and cfo != 0:
+        cfo_ratio = cfo / display_npat
         if cfo_ratio >= 1.0:
-            bctc_parts.append(f"Chất lượng lợi nhuận tốt với CFO {cfo:,.0f} tỷ ≥ LNST {npat:,.0f} tỷ.")
+            bctc_parts.append(f"Chất lượng lợi nhuận tốt với CFO {cfo:,.0f} tỷ ≥ LNST (ước tính) {display_npat:,.0f} tỷ.")
         elif cfo_ratio >= 0.5:
-            bctc_parts.append(f"CFO {cfo:,.0f} tỷ so với LNST {npat:,.0f} tỷ — chấp nhận được.")
+            bctc_parts.append(f"CFO {cfo:,.0f} tỷ so với LNST (ước tính) {display_npat:,.0f} tỷ — chấp nhận được.")
         else:
             bctc_parts.append(f"⚠️ Cảnh báo: CFO/LNST chỉ {cfo_ratio:.2f}x.")
+    elif eps > 0:
+        bctc_parts.append(f"Lợi nhuận trên mỗi cổ phiếu (EPS) đạt {eps:,.0f} VNĐ. (Dữ liệu BCTC gốc bị thiếu dòng LNST, số liệu đang tính toán dựa trên EPS).")
 
     bctc_parts.append(f"EPS đạt {eps:,.0f} VNĐ.")
     if div_yield > 0: bctc_parts.append(f"Cổ tức {div_yield}%/năm.")
     bctc = " ".join(bctc_parts)
 
-    # --- Phần Catalyst & Risks ---
+    # --- Các phần còn lại giữ nguyên ---
     moat_map = {
         "NGAN_HANG": "tệp khách hàng bán lẻ trung thành và chi phí vốn thấp",
         "CHUNG_KHOAN": "thị phần môi giới ổn định và quan hệ với nhà đầu tư tổ chức",
@@ -1059,7 +1118,6 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     }
     risks = risk_map.get(sector, f"Rủi ro chung của ngành {sector_name}.")
 
-    # --- Phần Outlook ---
     if verdict == "RẺ - TRONG VÙNG MUA":
         outlook = f"Giá {close:,.0f} VNĐ nằm dưới vùng mua an toàn {fair_low:,.0f} VNĐ, biên an toàn {discount_pct:.1f}% (MoS {mos_pct:.0f}%). Đây là vùng định giá hấp dẫn cho tích sản dài hạn. Quyết định: {final_decision}."
     elif verdict == "HỢP LÝ - CHỜ ĐIỀU CHỈNH":
@@ -1069,10 +1127,8 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     else:
         outlook = f"Chưa đủ dữ liệu định giá. Verdict: {verdict}."
 
-    # --- Recommendation ---
     rec_text, rec_weight = DECISION_TO_RECOMMENDATION.get(final_decision, ("NẮM GIỮ / THEO DÕI", "Tỷ trọng 0%"))
     recommendation = f"{rec_text} — {rec_weight}"
-
     price_zone = f"Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | Giá: {close:,.0f} | Verdict: {verdict}"
 
     macro_map = {
@@ -1097,6 +1153,7 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
         "macro_view": macro_view,
         "_source": "TEMPLATE",
     }
+
 def _call_ai_for_symbol(symbol, sm, si, sector):
     try:
         verified_facts = build_verified_facts(symbol, sm, si, sector)
@@ -1111,6 +1168,14 @@ def _call_ai_for_symbol(symbol, sm, si, sector):
         discount_pct = float(sm.get("discount_to_fair_pct", 0) or 0)
         close_price = float(sm.get("close", sm.get("close_price", 0)) or 0)
         
+        # Kiểm tra nếu thiếu LNST thì ra lệnh cho AI dùng EPS
+        net_profit_for_ai = si.get("net_profit_ttm", 0)
+        eps_for_ai = sm.get("eps", 0)
+        if net_profit_for_ai == 0 and eps_for_ai > 0:
+            ai_note = f"LƯU Ý ĐẶC BIỆT: Dữ liệu BCTC gốc bị thiếu dòng Lợi nhuận sau thuế (LNST). Hãy đánh giá doanh nghiệp dựa trên chỉ số EPS = {eps_for_ai:,.0f} VNĐ và P/E = {sm.get('pe',0)}. TUYỆT ĐỐI KHÔNG kết luận doanh nghiệp lỗ hay LNST bằng 0. Không dùng từ 'LNST' nếu không có số liệu, hãy nói về EPS."
+        else:
+            ai_note = "Dữ liệu BCTC đầy đủ. Hãy phân tích dựa trên LNST và CFO."
+
         prompt = f"""Bạn là Chuyên gia Phân tích Đầu tư Giá trị (Value Investing) với 20 năm kinh nghiệm tại các quỹ lớn ở Việt Nam.
 
 NHIỆM VỤ: Diễn giải dữ liệu đã tính sẵn cho mã {symbol}. KHÔNG được bịa số liệu. Mọi con số phải TRÍCH DẪN TRỰC TIẾP từ khối DỮ KIỆN bên dưới.
@@ -1120,6 +1185,8 @@ NHIỆM VỤ: Diễn giải dữ liệu đã tính sẵn cho mã {symbol}. KHÔN
 
 --- HƯỚNG DẪN THEO NGÀNH ---
 {sector_guidance}
+
+--- {ai_note} ---
 
 --- QUY TẮC BẮT BUỘC ---
 1. MỌI nhận định phải có SỐ CỤ THỂ từ dữ kiện.
@@ -1131,7 +1198,7 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
 
 --- ĐỊNH DẠNG: JSON THUẦN TÚY (KHÔNG ```json) ---
 {{
-  "bctc": "6-8 câu phân tích BCTC, trích số: ROE={sm.get('roe',0)}%, ROA={sm.get('roa',0)}%, P/E={sm.get('pe',0)}, P/B={sm.get('pb',0)}, CFO/LNST, D/E={sm.get('debt_to_equity',0)}. Kết luận lợi nhuận thật/ảo.",
+  "bctc": "6-8 câu phân tích BCTC, trích số: ROE={sm.get('roe',0)}%, ROA={sm.get('roa',0)}%, P/E={sm.get('pe',0)}, P/B={sm.get('pb',0)}, D/E={sm.get('debt_to_equity',0)}. Nếu có EPS hãy nói về EPS. Kết luận lợi nhuận thật/ảo dựa trên CFO.",
   "catalyst": "3-4 câu. Economic Moat cụ thể + động lực tăng trưởng 2-3 năm.",
   "risks": "3 câu. Rủi ro trọng yếu nhất phù hợp ngành.",
   "valuation_verdict": "Copy nguyên văn: '{verdict}'",
@@ -1332,6 +1399,12 @@ def full_data_crawler_worker():
                             if extracted:
                                 collection.update_one({"symbol": symbol}, {"$set": extracted})
                                 
+                        # BỔ SUNG: Tự động lấy số lượng cổ phiếu nếu bị thiếu
+                        total_shares = collection.find_one({"symbol": symbol}, {"total_shares": 1})
+                        if not total_shares or total_shares.get("total_shares", 0) == 0:
+                            shares = fetch_total_shares_vci(symbol)
+                            if shares > 0:
+                                collection.update_one({"symbol": symbol}, {"$set": {"total_shares": shares}})
                         time.sleep(3.0)
                 time.sleep(3600) 
             else: time.sleep(30)
@@ -1422,7 +1495,6 @@ def screener_worker():
                     template_count = 0
                     for r in results:
                         sym = r["symbol"]
-                        # SỬA: Chỉ bỏ qua nếu đã có AI THẬT (ai_source == "AI"). Template sẽ được cập nhật lại.
                         existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
                         if existing and existing.get("ai_bctc") and existing.get("ai_source") == "AI":
                             continue  # Đã có AI thật, không ghi đè
@@ -2003,6 +2075,14 @@ def force_bctc():
                 else:
                     print(f"  ❌ [THẤT BẠI] {sym} | Không lấy được dữ liệu", flush=True)
                     
+                # BỔ SUNG: Tự động lấy số lượng cổ phiếu nếu bị thiếu
+                total_shares = collection.find_one({"symbol": sym}, {"total_shares": 1})
+                if not total_shares or total_shares.get("total_shares", 0) == 0:
+                    shares = fetch_total_shares_vci(sym)
+                    if shares > 0:
+                        collection.update_one({"symbol": sym}, {"$set": {"total_shares": shares}})
+                        print(f"  ✅ [SHARES] {sym}: Đã lấy {shares:,} CP", flush=True)
+                        
                 time.sleep(3.0)
                 
             print(f"\n[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ {len(target)} mã.", flush=True)
@@ -2056,6 +2136,14 @@ def crawl_full_bctc():
                     extracted = extract_metrics_from_bctc_data(res)
                     if extracted:
                         collection.update_one({"symbol": sym}, {"$set": extracted})
+                        
+                # BỔ SUNG: Tự động lấy số lượng cổ phiếu nếu bị thiếu
+                total_shares = collection.find_one({"symbol": sym}, {"total_shares": 1})
+                if not total_shares or total_shares.get("total_shares", 0) == 0:
+                    shares = fetch_total_shares_vci(sym)
+                    if shares > 0:
+                        collection.update_one({"symbol": sym}, {"$set": {"total_shares": shares}})
+                        
                 time.sleep(3.0)
             print(f"[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ BCTC.", flush=True)
         finally: is_full_data_running = False
