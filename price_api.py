@@ -366,6 +366,7 @@ def get_vndirect_ratio(symbol, ratio_code):
     return None
 
 # ===================== CORE LOGIC CÀO =====================
+# ===================== CORE LOGIC CÀO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
     global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
     if is_crawling: return
@@ -429,9 +430,28 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             is_locked = False
                             print(f"  🔓 [MỞ SỔ] {sym}: Giá biến động từ {prev_close} -> {data['close']}", flush=True)
 
+                    # === SỬA TẠI ĐÂY: TÍNH TOÁN OPEN, HIGH, LOW TÍCH LŨY ===
+                    # Kiểm tra xem hôm nay đã có dữ liệu trong Database chưa
+                    today_record = collection.find_one({"symbol": sym, "trading_date": real_today})
+                    
+                    if today_record and today_record.get("trading_date") == real_today:
+                        # Nếu đã có: Open giữ nguyên, High/Low lấy max/min
+                        final_open = today_record.get("open", data["open"])
+                        final_high = max(today_record.get("high", data["high"]), data["high"])
+                        final_low = min(today_record.get("low", data["low"]), data["low"])
+                    else:
+                        # Nếu là lần đầu trong ngày: Lấy từ API
+                        final_open = data["open"]
+                        final_high = data["high"]
+                        final_low = data["low"]
+                    # ========================================================
+
                     collection.update_one({"symbol": sym}, {"$set": {
                         "close": data["close"], "prev_close": prev_close, 
-                        "open": data["open"], "high": data["high"], "low": data["low"], "volume": data["volume"],
+                        "open": final_open,    # Dùng giá trị tích lũy
+                        "high": final_high,    # Dùng giá trị tích lũy
+                        "low": final_low,      # Dùng giá trị tích lũy
+                        "volume": data["volume"],
                         "volume_percent": vol_pct, "avg_volume_20": round(avg_vol_20, 2),
                         "price_change_percent": pct_change,
                         "price_change_available": prev_close > 0,
@@ -440,7 +460,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "updated_at": _now_str(), "is_locked": is_locked, "is_incomplete": False
                     }}, upsert=True)
                     
-                    print(f"  ✅ [OK] {sym}: Giá {data['close']:,} | KL: {data['volume']:,} | Vol%: {vol_pct}%", flush=True)
+                    print(f"  ✅ [OK] {sym}: Giá {data['close']:,} (O:{final_open} H:{final_high} L:{final_low}) | KL: {data['volume']:,} | Vol%: {vol_pct}%", flush=True)
                     
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
@@ -452,11 +472,12 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
                             d1_bars = [b for b in d1_bars if b.get("time") != real_today]
                             
+                            # Khi chốt sổ, dùng dữ liệu tích lũy cuối ngày
                             d1_bars.append({
                                 "time": real_today, 
-                                "open": data["open"], 
-                                "high": data["high"], 
-                                "low": data["low"], 
+                                "open": final_open, 
+                                "high": final_high, 
+                                "low": final_low, 
                                 "close": data["close"], 
                                 "volume": data["volume"]
                             })
