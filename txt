@@ -1,7 +1,0 @@
-flask>=3.0
-flask-cors>=4.0
-lotusmarket[fetchers]
-gunicorn
-httpx
-pymongo
-requests

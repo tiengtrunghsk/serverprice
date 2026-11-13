@@ -1,0 +1,7 @@
+--extra-index-url https://vnstocks.com/api/packages
+vnstock
+gunicorn
+pymongo
+requests
+flask
+flask-cors
