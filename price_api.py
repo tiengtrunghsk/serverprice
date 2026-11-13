@@ -145,6 +145,12 @@ def get_current_fhsc_key():
 def _now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
 
+def _get_trading_date_str() -> str:
+    vn_now = datetime.utcnow() + timedelta(hours=7)
+    if vn_now.hour < 9: vn_now -= timedelta(days=1)
+    while vn_now.weekday() >= 5: vn_now -= timedelta(days=1)
+    return vn_now.strftime("%Y-%m-%d")
+
 def _is_after_15h() -> bool:
     return (datetime.utcnow() + timedelta(hours=7)).hour >= 15
 
@@ -422,34 +428,6 @@ def get_vndirect_ratio(symbol, ratio_code):
     except Exception:
         pass
     return None
-
-# HÀM MỚI: Lấy EPS TTM từ VNDirect và tính LNST TTM
-def fetch_and_update_net_profit_from_vndirect(symbol):
-    stock_doc = collection.find_one({"symbol": symbol})
-    if not stock_doc: return
-
-    total_shares = stock_doc.get("total_shares", 0)
-    if total_shares <= 0: return
-
-    # Lấy EPS TTM từ VNDirect
-    eps_val = get_vndirect_ratio(symbol, "EPS_TR")
-    
-    # Nếu EPS_TR trống, dùng EPS lưu trong DB (đã chia 1000)
-    if not eps_val or eps_val == 0:
-        db_eps = stock_doc.get("eps", 0)
-        if db_eps > 0:
-            eps_val = db_eps * 1000 # Trả về đơn vị VNĐ gốc để nhân với SLCP
-
-    if eps_val and eps_val > 0:
-        # Tính LNST = EPS * SLCP / 1e9 (đơn vị Tỷ VNĐ)
-        net_profit_ttm = round((eps_val * total_shares) / 1e9, 2)
-        
-        # Cập nhật thẳng vào DB
-        collection.update_one(
-            {"symbol": symbol},
-            {"$set": {"net_profit_ttm": net_profit_ttm}}
-        )
-        print(f"  💡 [LNST-VND] {symbol}: Đã tính lại net_profit_ttm = {net_profit_ttm} Tỷ (từ EPS {eps_val:.0f})", flush=True)
 
 # ===================== CORE LOGIC CÀO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
@@ -1219,7 +1197,7 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                 print(f"  ⏳ [{symbol}] AI Timeout (Lần {attempt + 1}/3), thử lại...", flush=True)
                 time.sleep(3)
             except Exception as e:
-                print(f"  ❌ [{symbol}] AI (Lần {attempt + 1}/3): {e}", flush=True)
+                print(f"  ❌ [{symbol}] Lỗi AI (Lần {attempt + 1}/3): {e}", flush=True)
                 time.sleep(3)
 
         print(f"  ⚠️ [{symbol}] AI lỗi hoàn toàn (sau 3 lần thử). Bỏ qua mã này.", flush=True)
@@ -1354,9 +1332,6 @@ def full_data_crawler_worker():
                             if extracted:
                                 collection.update_one({"symbol": symbol}, {"$set": extracted})
                                 
-                        # BỔ SUNG: Gọi hàm lấy EPS và cập nhật LNST tự động
-                        fetch_and_update_net_profit_from_vndirect(symbol)
-                        
                         time.sleep(3.0)
                 time.sleep(3600) 
             else: time.sleep(30)
@@ -1398,14 +1373,7 @@ def screener_worker():
                             collection.update_one({"symbol": sym}, {"$set": extracted})
                     # ================================================================
                     
-                    # BỔ SUNG: Kiểm tra và cập nhật lại LNST từ VNDirect nếu bị 0
-                    if doc.get("net_profit_ttm", 0) == 0:
-                        fetch_and_update_net_profit_from_vndirect(sym)
-                        # Load lại doc sau khi update
-                        doc = collection.find_one({"symbol": sym})
-                        stock_db[sym] = doc
-                    else:
-                        stock_db[sym] = doc
+                    stock_db[sym] = doc
                 
                 normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
                 sector_medians = compute_sector_medians(normalized_db)
@@ -2034,10 +2002,7 @@ def force_bctc():
                         print(f"  ✅ [FINANCIALS] {sym}: Đã trích xuất thành công (CFO, LNST, D/E, GM)", flush=True)
                 else:
                     print(f"  ❌ [THẤT BẠI] {sym} | Không lấy được dữ liệu", flush=True)
-                
-                # BỔ SUNG: Gọi hàm lấy EPS và cập nhật LNST tự động
-                fetch_and_update_net_profit_from_vndirect(sym)
-                
+                    
                 time.sleep(3.0)
                 
             print(f"\n[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ {len(target)} mã.", flush=True)
@@ -2091,10 +2056,6 @@ def crawl_full_bctc():
                     extracted = extract_metrics_from_bctc_data(res)
                     if extracted:
                         collection.update_one({"symbol": sym}, {"$set": extracted})
-                        
-                # BỔ SUNG: Gọi hàm lấy EPS và cập nhật LNST tự động
-                fetch_and_update_net_profit_from_vndirect(sym)
-                
                 time.sleep(3.0)
             print(f"[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ BCTC.", flush=True)
         finally: is_full_data_running = False
@@ -2149,10 +2110,6 @@ def crawl_ratios():
                 }}, upsert=True)
                 
                 print(f"  ✅ [RATIO] {sym} thành công (P/E: {ratios.get('pe', 0)}, EPS: {eps_final}, ROE: {round(roe_val, 1)}%)", flush=True)
-                
-                # BỔ SUNG: Gọi hàm lấy EPS và cập nhật LNST tự động
-                fetch_and_update_net_profit_from_vndirect(sym)
-                
                 time.sleep(0.5)
 
             print(f"[RATIO-CRAWL] 🏁 Đã cào xong toàn bộ bảng Ratio.", flush=True)
@@ -2194,11 +2151,6 @@ def force_screener():
                         collection.update_one({"symbol": sym}, {"$set": extracted})
                 # =============================================
                 
-                # BỔ SUNG: Kiểm tra và cập nhật lại LNST từ VNDirect nếu bị 0
-                if doc.get("net_profit_ttm", 0) == 0:
-                    fetch_and_update_net_profit_from_vndirect(sym)
-                    doc = collection.find_one({"symbol": sym})
-                    
                 stock_db[sym] = doc
             
             print(f"[SCREENER] 📊 Đã tải dữ liệu của {len(stock_db)} mã từ Database.", flush=True)
