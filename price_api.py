@@ -18,7 +18,7 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
-# ===================== LOGGING =====================
+# ===================== LOGGING CHẨN ĐOÁN =====================
 logger = logging.getLogger("price_api")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -35,7 +35,7 @@ logger.propagate = False
 def log_exception(context: str, exc: Exception):
     logger.error("%s | %s: %s", context, type(exc).__name__, str(exc), exc_info=True)
 
-# ===================== VNSTOCK V5 =====================
+# ===================== VNSTOCK THẾ HỆ 6 =====================
 from vnstock import Market, Reference, Fundamental
 
 try:
@@ -56,9 +56,15 @@ if SSI_API_KEY and SSI_API_SECRET:
     os.environ["SSI_API_KEY"] = SSI_API_KEY
     os.environ["SSI_API_SECRET"] = SSI_API_SECRET
 else:
-    logger.warning("Thiếu SSI_API_KEY hoặc SSI_API_SECRET. Có thể không lấy được giá realtime!")
+    logger.warning("⚠️ CẢNH BÁO: Thiếu SSI_API_KEY hoặc SSI_API_SECRET. Có thể không lấy được giá realtime!")
 
 ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY")
+ENV_FHSC_API_KEY = os.environ.get("FHSC_API_KEY", "").strip()
+
+# v6 yêu cầu đăng ký key với FHSC, ta nạp nó vào biến môi trường
+if ENV_FHSC_API_KEY:
+    os.environ["FHSC_API_KEY"] = ENV_FHSC_API_KEY
+
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
@@ -80,73 +86,23 @@ AI_API_URL = "https://ws-8lcqaxwxdv0h9xzy.ap-southeast-1.maas.aliyuncs.com/compa
 AI_MODEL_NAME = os.environ.get("AI_MODEL_NAME", "qwen3.7-max-2026-06-08")
 AI_TEMPERATURE = 0.15
 
-# ===================== METADATA: TỰ ĐỘNG LẤY TỪ VCI V5 =====================
+# ===================== ĐỌC METADATA TỪ FILE JSON =====================
 VN100_METADATA = {}
-SYMBOLS_MASTER = []
-
-try:
-    if os.path.exists(SYMBOLS_JSON_FILE):
-        with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
-            SYMBOLS_MASTER = [str(s).upper().strip() for s in json.load(f) if str(s).strip()]
-        logger.info(f"Đã nạp {len(SYMBOLS_MASTER)} mã từ {SYMBOLS_JSON_FILE}")
-except Exception as e:
-    logger.warning(f"Lỗi đọc {SYMBOLS_JSON_FILE}: {e}")
-
-def _fetch_company_meta_from_vci(symbol: str) -> dict:
-    """Lấy tên, SLCP, ngành từ VCI qua vnstock v5."""
+if os.path.exists(VN100_INFO_FILE):
     try:
-        ref = Reference()
-        df = ref.company(symbol).overview()
-        if df is None or df.empty:
-            return {}
-        row = df.iloc[0]
-        return {
-            "company_name": str(row.get("company_name", "") or row.get("organ_name", "") or ""),
-            "total_shares": int(float(row.get("issue_share", 0) or 0)),
-            "sector_raw": str(row.get("icb_name3", "") or row.get("icb_name2", "") or ""),
-        }
+        with open(VN100_INFO_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            for item in data:
+                sym = str(item.get("symbol", "")).upper().strip()
+                if sym:
+                    VN100_METADATA[sym] = {
+                        "company_name": item.get("company_name", "") or item.get("organName", "") or "",
+                        "market_cap": float(item.get("market_cap", 0) or item.get("capitalization", 0) or 0),
+                        "total_shares": int(item.get("total_shares", 0) or item.get("shares", 0) or 0)
+                    }
+        logger.info(f"Đã tải metadata cho {len(VN100_METADATA)} mã từ {VN100_INFO_FILE}")
     except Exception as e:
-        logger.warning(f"[META-VCI] {symbol}: {e}")
-        return {}
-
-def _build_metadata_with_fallback():
-    """Ưu tiên file JSON cũ, thiếu thì gọi VCI."""
-    old_from_file = {}
-    if os.path.exists(VN100_INFO_FILE):
-        try:
-            with open(VN100_INFO_FILE, "r", encoding="utf-8") as f:
-                for item in json.load(f):
-                    sym = str(item.get("symbol", "")).upper().strip()
-                    if sym:
-                        old_from_file[sym] = {
-                            "company_name": item.get("company_name", "") or "",
-                            "total_shares": int(item.get("total_shares", 0) or 0),
-                        }
-            logger.info(f"Đã nạp metadata cũ cho {len(old_from_file)} mã từ {VN100_INFO_FILE}")
-        except Exception as e:
-            logger.warning(f"Lỗi đọc {VN100_INFO_FILE}: {e}")
-
-    targets = SYMBOLS_MASTER or list(old_from_file.keys())
-    for i, sym in enumerate(targets, 1):
-        cached = old_from_file.get(sym, {})
-        if cached.get("company_name") and cached.get("total_shares", 0) > 0:
-            VN100_METADATA[sym] = cached
-            continue
-        fetched = _fetch_company_meta_from_vci(sym)
-        merged = {
-            "company_name": fetched.get("company_name") or cached.get("company_name", ""),
-            "total_shares": fetched.get("total_shares") or cached.get("total_shares", 0),
-        }
-        VN100_METADATA[sym] = merged
-        if i % 10 == 0:
-            logger.info(f"[META-VCI] Đã lấy {i}/{len(targets)} mã...")
-        time.sleep(1.2)
-
-    logger.info(f"Hoàn tất metadata: {len(VN100_METADATA)} mã "
-                f"({sum(1 for v in VN100_METADATA.values() if v.get('total_shares',0)>0)} mã có SLCP)")
-
-# Bật tự động lấy metadata khi khởi động (chậm ~2 phút lần đầu)
-# _build_metadata_with_fallback()
+        logger.warning(f"Lỗi đọc {VN100_INFO_FILE}: {e}")
 
 # ===================== DATABASE =====================
 logger.info("Đang kết nối MongoDB...")
@@ -158,8 +114,9 @@ try:
     history_col = db["history_data"]
     bctc_col = db["bctc_data"]
     screener_col = db["screener_results"]
+    settings_col = db["settings"]
     logger.info("MongoDB đã kết nối thành công!")
-
+    
     if os.path.exists(SYMBOLS_JSON_FILE):
         with open(SYMBOLS_JSON_FILE, "r", encoding="utf-8") as f:
             json_symbols = set(str(s).upper().strip() for s in json.load(f))
@@ -168,7 +125,7 @@ try:
             for sym in (json_symbols - db_symbols): collection.insert_one({"symbol": sym})
             if db_symbols - json_symbols: collection.delete_many({"symbol": {"$in": list(db_symbols - json_symbols)}})
 except Exception as e:
-    log_exception("[MONGODB STARTUP]", e)
+    log_exception("[MONGODB STARTUP] Lỗi kết nối MongoDB", e)
     sys.exit(1)
 
 # ===================== APP =====================
@@ -184,9 +141,20 @@ LAST_TELEGRAM_TIME = 0
 stop_crawl_requested = False
 is_auto_crawl_paused = False
 
+def get_current_fhsc_key():
+    setting = settings_col.find_one({"_id": "fhsc_key"})
+    if setting and setting.get("value"): return setting["value"]
+    return ENV_FHSC_API_KEY
+
 # ===================== HELPERS =====================
 def _now_str() -> str:
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
+
+def _get_trading_date_str() -> str:
+    vn_now = datetime.utcnow() + timedelta(hours=7)
+    if vn_now.hour < 9: vn_now -= timedelta(days=1)
+    while vn_now.weekday() >= 5: vn_now -= timedelta(days=1)
+    return vn_now.strftime("%Y-%m-%d")
 
 def _is_after_15h() -> bool:
     return (datetime.utcnow() + timedelta(hours=7)).hour >= 15
@@ -198,41 +166,37 @@ def send_telegram(message: str):
     try: requests.post(url, json=payload, timeout=10)
     except Exception as e: log_exception("[TELEGRAM]", e)
 
-def _safe_float(v):
-    try: return float(v) if v is not None else 0.0
-    except: return 0.0
-
-# ===================== CAGR =====================
+# ===================== HÀM TÍNH CAGR & GIÁ TRUNG BÌNH QUÝ (5 NĂM) =====================
 def get_historical_return_rate_with_details(symbol):
     try:
         hist_data = history_col.find_one({"symbol": symbol})
         if not hist_data or not hist_data.get("history_d1"): return None
         history_bars = hist_data["history_d1"]
         if len(history_bars) < 30: return None
-
+            
         df = pd.DataFrame(history_bars)
         df['date'] = pd.to_datetime(df['time'])
         df = df.sort_values('date')
-
+        
         max_date = df['date'].max()
         cutoff_date = max_date - pd.DateOffset(years=5)
         df_5years = df.loc[df['date'] >= cutoff_date].copy()
-
+        
         if len(df_5years) < 30: return None
-
+            
         df_5years['year_quarter'] = df_5years['date'].dt.to_period('Q')
         df_quarterly = df_5years.groupby('year_quarter').agg({'close': 'mean', 'date': 'first'}).reset_index()
-
+        
         if len(df_quarterly) < 2: return None
-
+            
         start_row, end_row = df_quarterly.iloc[0], df_quarterly.iloc[-1]
         days = (end_row['date'] - start_row['date']).days
         if days < 30: return None
-
+            
         years = days / 365.25
         cagr = (end_row['close'] / start_row['close']) ** (1 / years) - 1
         cagr = max(-0.5, min(cagr, 1.0))
-
+        
         return {
             "annual_rate_percent": round(cagr * 100, 2),
             "start_quarter": str(start_row['year_quarter']),
@@ -240,188 +204,220 @@ def get_historical_return_rate_with_details(symbol):
             "end_quarter": str(end_row['year_quarter']),
             "end_price_mean": round(end_row['close'], 2)
         }
-    except Exception:
-        return None
+    except Exception as e: return None
 
-# ===================== BCTC V5: EXTRACT =====================
+# ===================== HÀM BỔ SUNG: BÓC TÁCH DỮ LIỆU TÀI CHÍNH TỪ BCTC =====================
+def _safe_float(v):
+    try: return float(v) if v is not None else 0.0
+    except: return 0.0
+
+def _get_bctc_value(report_array, target_ids, period=None):
+    """Tìm giá trị của một chỉ tiêu BCTC theo ID (hỗ trợ nhiều ID)"""
+    if not report_array: return 0.0
+    if isinstance(target_ids, str): target_ids = [target_ids]
+    for item in report_array:
+        if item.get("id") in target_ids:
+            if period is None or item.get("period") == period:
+                return _safe_float(item.get("value"))
+    return 0.0
+
 def extract_metrics_from_bctc_data(bctc_doc):
-    """
-    Trích xuất CFO TTM, LNST TTM, D/E, biên gộp từ BCTC VCI v5 (long format).
-    Mỗi row: {period, id, name, value, ...}
-    """
-    if not bctc_doc:
-        return {}
-
-    def _sum_ttm(rows, target_ids):
-        if not rows:
-            return 0.0
-        periods = sorted(
-            {r.get("period") for r in rows if r.get("period")},
-            reverse=True
-        )[:4]
-        total = 0.0
-        for p in periods:
-            for r in rows:
-                if r.get("period") == p and r.get("id") in target_ids:
-                    total += _safe_float(r.get("value"))
-                    break
-        return total
-
-    def _latest_value(rows, target_ids):
-        if not rows:
-            return 0.0
-        periods = sorted(
-            {r.get("period") for r in rows if r.get("period")},
-            reverse=True
-        )
-        if not periods:
-            return 0.0
-        for r in rows:
-            if r.get("period") == periods[0] and r.get("id") in target_ids:
-                return _safe_float(r.get("value"))
-        return 0.0
-
-    income = bctc_doc.get("income_statement") or []
-    cashflow = bctc_doc.get("cash_flow") or []
-    balance = bctc_doc.get("balance_sheet") or []
-
+    """Trích xuất CFO, LNST TTM, D/E, Biên gộp từ document BCTC"""
+    if not bctc_doc: return {}
+    
     metrics = {}
-
-    npat_ttm = _sum_ttm(income, {"IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX", "IS_NET_PROFIT"})
+    income = bctc_doc.get("income_statement", [])
+    cashflow = bctc_doc.get("cash_flow", [])
+    balance = bctc_doc.get("balance_sheet", [])
+    
+    # 1. LNST TTM (4 quý)
+    periods = sorted(list(set([item.get("period") for item in income if item.get("period")])), reverse=True)
+    npat_ttm = 0
+    for p in periods[:4]:
+        npat_ttm += _get_bctc_value(income, ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX", "IS_NET_PROFIT"], p)
     metrics["net_profit_ttm"] = round(npat_ttm / 1e9, 2)
-
-    cfo_ttm = _sum_ttm(cashflow, {"CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"})
+    
+    # 2. CFO TTM (4 quý)
+    cf_periods = sorted(list(set([item.get("period") for item in cashflow if item.get("period")])), reverse=True)
+    cfo_ttm = 0
+    for p in cf_periods[:4]:
+        cfo_ttm += _get_bctc_value(cashflow, "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES", p)
     metrics["cfo_latest"] = round(cfo_ttm / 1e9, 2)
-
-    rev = _latest_value(income, {"IS_NET_REVENUE"})
-    cogs = _latest_value(income, {"IS_COST_OF_GOODS_SOLD"})
-    if rev > 0:
-        metrics["gross_margin"] = round((rev - cogs) / rev * 100, 1)
-
-    eq = _latest_value(balance, {"BS_OWNERS_EQUITY", "BS_EQUITY"})
-    liab = _latest_value(balance, {"BS_LIABILITIES"})
-    if eq > 0:
-        metrics["debt_to_equity"] = round(liab / eq, 2)
-
+    
+    # 3. Biên gộp (Quý mới nhất)
+    latest_period = periods[0] if periods else None
+    if latest_period:
+        rev = _get_bctc_value(income, "IS_NET_REVENUE", latest_period)
+        cogs = _get_bctc_value(income, "IS_COST_OF_GOODS_SOLD", latest_period)
+        if rev > 0:
+            metrics["gross_margin"] = round((rev + cogs) / rev * 100, 1)
+            
+    # 4. D/E (Quý mới nhất)
+    bs_periods = sorted(list(set([item.get("period") for item in balance if item.get("period")])), reverse=True)
+    latest_bs_period = bs_periods[0] if bs_periods else None
+    if latest_bs_period:
+        eq = _get_bctc_value(balance, ["BS_OWNERS_EQUITY", "BS_EQUITY"], latest_bs_period)
+        total_assets = _get_bctc_value(balance, "BS_TOTAL_ASSETS", latest_bs_period)
+        if total_assets == 0:
+            total_assets = _get_bctc_value(balance, "BS_SHORT_TERM_ASSETS", latest_bs_period) + _get_bctc_value(balance, "BS_LONG_TERM_ASSETS", latest_bs_period)
+            
+        liab = _get_bctc_value(balance, "BS_LIABILITIES", latest_bs_period)
+        if liab == 0 and total_assets > 0 and eq > 0:
+            liab = total_assets - eq
+            
+        if eq > 0:
+            metrics["debt_to_equity"] = round(liab / eq, 2)
+            
     return metrics
 
-def fetch_total_shares_vci(symbol):
-    """Lấy SLCP từ VCI qua vnstock v5."""
-    try:
-        ref = Reference()
-        df = ref.company(symbol).overview()
-        if df is not None and not df.empty:
-            return int(float(df.iloc[0].get("issue_share", 0) or 0))
-    except Exception as e:
-        print(f"  ⚠️ [SHARES] {symbol}: {e}", flush=True)
-    return 0
-
-# ===================== CÀO GIÁ =====================
+# ===================== CÀO GIÁ (SSI v6) =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
     print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True)
     def _do():
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             past_7d = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-
-            df = Market().equity(symbol).ohlcv(
-                start=past_7d,
-                end=today,
-                interval="1m",
-                source="ssi"
+            
+            # V6 bắt buộc khai báo source
+            df = Market(source="ssi").equity(symbol).ohlcv(
+                start=past_7d, 
+                end=today, 
+                interval="1m"
             )
-
+            
             if df is not None and not df.empty:
                 df['time'] = pd.to_datetime(df['time'])
                 df['date_str'] = df['time'].dt.strftime('%Y-%m-%d')
-
+                
                 df_today = df[df['date_str'] == today]
-
+                
                 if not df_today.empty:
                     latest_candle = df_today.iloc[-1]
                     total_volume_today = int(df_today['volume'].sum())
+                    
                     return {
-                        "close": float(latest_candle["close"]),
-                        "open": float(latest_candle["open"]),
-                        "high": float(latest_candle["high"]),
-                        "low": float(latest_candle["low"]),
+                        "close": float(latest_candle["close"]), 
+                        "open": float(latest_candle["open"]), 
+                        "high": float(latest_candle["high"]), 
+                        "low": float(latest_candle["low"]), 
                         "volume": total_volume_today
                     }
                 else:
                     latest_candle = df.iloc[-1]
                     return {
-                        "close": float(latest_candle["close"]),
-                        "open": float(latest_candle["open"]),
-                        "high": float(latest_candle["high"]),
-                        "low": float(latest_candle["low"]),
+                        "close": float(latest_candle["close"]), 
+                        "open": float(latest_candle["open"]), 
+                        "high": float(latest_candle["high"]), 
+                        "low": float(latest_candle["low"]), 
                         "volume": int(latest_candle["volume"])
                     }
             return None
         except Exception as e:
-            print(f"    ❌ [FETCH ERROR] {symbol}: {e}", flush=True)
+            print(f"    ❌ [FETCH ERROR] Lỗi gọi Vnstock cho {symbol}: {e}", flush=True)
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-        try:
+        try: 
             data = ex.submit(_do).result(timeout=15)
         except concurrent.futures.TimeoutError:
-            print(f"    ❌ [FETCH TIMEOUT] {symbol}", flush=True)
+            print(f"    ❌ [FETCH TIMEOUT] Quá 15s không lấy được giá {symbol}", flush=True)
             return None
         except Exception as e:
             print(f"    ❌ [FETCH THREAD ERROR] {symbol}: {e}", flush=True)
             return None
 
-    if not data or data["close"] <= 0 or data["open"] <= 0:
+    if not data or data["close"] <= 0 or data["open"] <= 0: 
         return None
-
+        
     if data["close"] >= 1000:
-        for k in ["close", "open", "high", "low"]:
+        for k in ["close", "open", "high", "low"]: 
             data[k] /= 1000.0
-
-    if 0 < data["volume"] < 100000:
+            
+    if 0 < data["volume"] < 100000: 
         data["volume"] *= VOLUME_MULTIPLIER
-
+        
     return data
 
 def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
     try:
-        df = Market().equity(symbol).ohlcv(start=start_date, end=end_date, source="ssi")
+        df = Market(source="ssi").equity(symbol).ohlcv(start=start_date, end=end_date)
         return df if df is not None and not df.empty else None
-    except Exception:
-        return None
+    except Exception: return None
 
-# ===================== CÀO BCTC V5 =====================
+# ===================== CÀO BCTC (VCI v6) =====================
 def _fetch_bctc_vci(symbol: str):
     symbol = str(symbol).upper().strip()
-    print(f"  [BCTC-VCI] Bắt đầu lấy {symbol}...", flush=True)
+    print(f"  [BCTC] 🚀 Bắt đầu lấy dữ liệu VCI cho mã {symbol}...", flush=True)
+
     try:
-        fund = Fundamental().equity(symbol)
+        # Chỉ định nguồn vci cho BCTC ở thế hệ 6
+        equity = Fundamental(source="vci").equity(symbol)
         reports = {}
-        for method_name, key in [
-            ("income_statement", "income_statement"),
-            ("balance_sheet", "balance_sheet"),
-            ("cash_flow", "cash_flow"),
-        ]:
-            try:
-                method = getattr(fund, method_name)
-                df = method(period="quarter", lang="vi")
-                if df is not None and not df.empty:
-                    reports[key] = df.to_dict(orient="records")
-                    print(f"    ✓ {key}: {len(df)} dòng", flush=True)
-            except Exception as e:
-                print(f"    ❌ {key}: {e}", flush=True)
-        if not reports:
+        report_names = ("balance_sheet", "income_statement", "cash_flow")
+
+        def fetch_with_retry(func, period="quarter", max_retries=3, limit=8):
+            for attempt in range(max_retries):
+                try: return func(period=period, limit=limit)
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if any(k in err_str for k in ["429", "rate limit", "vượt giới hạn"]): 
+                        time.sleep((attempt + 1) * 10)
+                    elif any(k in err_str for k in ["networkerror", "remoteprotocolerror", "connection", "kết nối", "timeout"]): 
+                        time.sleep((attempt + 1) * 5)
+                    else: 
+                        print(f"    ❌ [BCTC ERROR] {symbol} | {str(e)}", flush=True)
+                        raise e
             return None
-        periods = sorted(
-            {r.get("period") for r in reports.get("income_statement", []) if r.get("period")},
-            reverse=True
-        )
-        reports["latest_period"] = periods[0] if periods else "N/A"
-        print(f"  ✅ [BCTC-VCI] {symbol} | Kỳ: {reports['latest_period']}", flush=True)
-        return reports
+
+        latest_period = "Chưa xác định"
+        for report_name in report_names:
+            try:
+                report_func = getattr(equity, report_name, None)
+                if not callable(report_func): continue
+                
+                print(f"    ⏳ Đang lấy {report_name}...", flush=True)
+                df = fetch_with_retry(report_func)
+                time.sleep(1.5) 
+                
+                if df is not None and not df.empty:
+                    clean_df = df.astype(object).where(pd.notna(df), None)
+                    records = clean_df.to_dict(orient="records")
+                    
+                    # VCI v6 trả về long format (period, id, value), không cần parse year/quarter
+                    if records and latest_period == "Chưa xác định":
+                        for r in records:
+                            p = r.get("period")
+                            if p:
+                                latest_period = p
+                                break
+                            
+                    reports[report_name] = json.loads(json.dumps(records, ensure_ascii=False, default=str))
+                    print(f"    ✓ Đã lấy {report_name} ({len(records)} dòng)", flush=True)
+            except Exception: pass
+            
+        if reports: 
+            print(f"  ✅ [BCTC] Đã lấy xong {symbol} | Kỳ mới nhất: {latest_period}", flush=True)
+            reports["latest_period"] = latest_period 
+        return reports if reports else None
     except Exception as e:
-        print(f"  ❌ [BCTC-VCI] {symbol}: {e}", flush=True)
+        print(f"  ❌ [BCTC] Lỗi khi cào {symbol}: {e}", flush=True)
         return None
+
+# ===================== CÀO SỐ LƯỢNG CỔ PHIẾU & METADATA (FHSC v6) =====================
+def fetch_total_shares_fhsc(symbol):
+    """Lấy SLCP từ FHSC qua vnstock v6."""
+    fhsc_key = get_current_fhsc_key()
+    if not fhsc_key: return 0
+    
+    os.environ["FHSC_API_KEY"] = fhsc_key
+    try:
+        ref = Reference(source="fhsc")
+        df = ref.company(symbol).info()
+        if df is not None and not df.empty:
+            return int(float(df.iloc[0].get("issue_share", 0) or 0))
+    except Exception as e:
+        print(f"  ⚠️ [SHARES] {symbol}: {e}", flush=True)
+    return 0
 
 # ===================== CÀO RATIO TỪ VNDIRECT =====================
 VNDIRECT_RATIOS = {
@@ -455,8 +451,8 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
     if is_crawling: return
     is_crawling = True
-    stop_crawl_requested = False
-
+    stop_crawl_requested = False 
+    
     print(f"\n[CRAWL] 🚀 [{'CÀO BÙ' if is_retry else ('CÀO TAY' if is_manual else 'REAL-TIME')}] Bắt đầu xử lý {len(symbols)} mã...", flush=True)
     try:
         vn_now = datetime.utcnow() + timedelta(hours=7)
@@ -473,25 +469,28 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
             chunk = symbols[chunk_idx:chunk_idx+5]
             for sym in chunk:
                 if stop_crawl_requested: break
-
+                
                 doc = collection.find_one({"symbol": sym})
                 data = _fetch_one(sym)
-
+                
                 if data:
                     hist_doc = history_col.find_one({"symbol": sym})
                     prev_close = 0.0
                     avg_vol_20 = 0.0
-
+                    latest_history_date = None 
+                    
                     if hist_doc and hist_doc.get("history_d1"):
                         bars = hist_doc["history_d1"]
                         bars_sorted = sorted(bars, key=lambda x: x.get("time", ""))
-
+                        
                         if bars_sorted and bars_sorted[-1]["time"] == real_today:
                             if len(bars_sorted) >= 2:
                                 prev_close = float(bars_sorted[-2]["close"])
+                                latest_history_date = bars_sorted[-2]["time"]
                         else:
                             prev_close = float(bars_sorted[-1]["close"])
-
+                            latest_history_date = bars_sorted[-1]["time"]
+                        
                         valid_vols = [b.get("volume", 0) for b in bars_sorted[-20:] if b.get("volume", 0) > 0]
                         if valid_vols: avg_vol_20 = sum(valid_vols) / len(valid_vols)
 
@@ -500,7 +499,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
 
                     vol_pct = round(data["volume"] / avg_vol_20 * 100, 2) if avg_vol_20 > 0 else 0
                     pct_change = round(((data["close"] - prev_close) / prev_close) * 100, 2) if prev_close > 0 else 0
-
+                    
                     arrow, color = "—", "slate"
                     if pct_change > 0: arrow, color = "▲", "emerald"
                     elif pct_change < 0: arrow, color = "▼", "rose"
@@ -509,9 +508,11 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     if current_hour >= 9 and is_locked:
                         if data["close"] != prev_close:
                             is_locked = False
+                            print(f"  🔓 [MỞ SỔ] {sym}: Giá biến động từ {prev_close} -> {data['close']}", flush=True)
 
+                    # === TÍNH TOÁN OPEN, HIGH, LOW TÍCH LŨY ===
                     today_record = collection.find_one({"symbol": sym, "trading_date": real_today})
-
+                    
                     if today_record and today_record.get("trading_date") == real_today:
                         final_open = today_record.get("open", data["open"])
                         final_high = max(today_record.get("high", data["high"]), data["high"])
@@ -520,9 +521,10 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         final_open = data["open"]
                         final_high = data["high"]
                         final_low = data["low"]
+                    # ========================================================
 
                     collection.update_one({"symbol": sym}, {"$set": {
-                        "close": data["close"], "prev_close": prev_close,
+                        "close": data["close"], "prev_close": prev_close, 
                         "open": final_open,
                         "high": final_high,
                         "low": final_low,
@@ -531,27 +533,35 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "price_change_percent": pct_change,
                         "price_change_available": prev_close > 0,
                         "price_arrow": arrow, "price_color": color,
-                        "trading_date": real_today,
+                        "trading_date": real_today, 
                         "updated_at": _now_str(), "is_locked": is_locked, "is_incomplete": False
                     }}, upsert=True)
-
-                    print(f"  ✅ [OK] {sym}: Giá {data['close']:,} | KL: {data['volume']:,} | Vol%: {vol_pct}%", flush=True)
-
+                    
+                    print(f"  ✅ [OK] {sym}: Giá {data['close']:,} (O:{final_open} H:{final_high} L:{final_low}) | KL: {data['volume']:,} | Vol%: {vol_pct}%", flush=True)
+                    
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
-
+                        
                     if current_hour >= 15:
                         has_traded_today = (not is_locked) or (data.get("volume", 0) > 0)
+                        
                         if has_traded_today:
                             d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
                             d1_bars = [b for b in d1_bars if b.get("time") != real_today]
+                            
                             d1_bars.append({
-                                "time": real_today, "open": final_open, "high": final_high,
-                                "low": final_low, "close": data["close"], "volume": data["volume"]
+                                "time": real_today, 
+                                "open": final_open, 
+                                "high": final_high, 
+                                "low": final_low, 
+                                "close": data["close"], 
+                                "volume": data["volume"]
                             })
                             d1_bars.sort(key=lambda x: x["time"])
+                            
                             history_col.update_one({"symbol": sym}, {"$set": {"history_d1": d1_bars}}, upsert=True)
                             collection.update_one({"symbol": sym}, {"$set": {"is_locked": True, "chot_so_today": real_today}})
+                            
                             if hist_doc is None: hist_doc = {"symbol": sym}
                             hist_doc["history_d1"] = d1_bars
                             pending_history_files[f"history/{sym}.json"] = hist_doc
@@ -581,6 +591,8 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                 send_telegram("\n".join(msg_lines))
                 print(f"[TELEGRAM] 🚀 Đã gửi cảnh báo {len(alert_batch)} mã.", flush=True)
                 LAST_TELEGRAM_TIME = now_ts
+            else:
+                print(f"[TELEGRAM] ⏳ Có {len(alert_batch)} mã đột biến nhưng chưa đủ 2 tiếng, bỏ qua gửi tin.", flush=True)
     finally:
         is_crawling = False
         stop_crawl_requested = False
@@ -624,7 +636,7 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
         except Exception: time.sleep(2)
     return False
 
-# ===================== CHẤM ĐIỂM =====================
+# ===================== CHẤM ĐIỂM (FULL LOGIC) =====================
 FALLBACK_SECTOR_MAPPING = {
     "NGAN_HANG": ["ACB","BID","CTG","TCB","MBB","STB","VPB","HDB","VIB","TPB","SHB","SSB","LPB","MSB","OCB","EIB","VCB"],
     "CHUNG_KHOAN": ["SSI","VCI","HCM","VIX","MBS","FTS","BSI","CTS","ORS"],
@@ -670,33 +682,20 @@ def normalize_stock_data(symbol, data):
     close_price = float(data.get("close", data.get("close_price", 0)) or 0)
     pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
-
+    
+    # BỔ SUNG: Nếu EPS trong DB vẫn đang là VND (vd: 3000), tự động chia 1000
     if eps >= 1000:
         eps = eps / 1000.0
-
+        
     bctc = data.get("bctc_history", [])
     profit_growth_yoy = float(bctc[0].get("profit_growth_yoy", 0)) if bctc else 0.0
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
     bvps = (close_price / pb) if pb > 0 and close_price > 0 else 0
     if eps == 0 and pe > 0 and close_price > 0: eps = close_price / pe
-
-    net_profit_ttm = float(data.get("net_profit_ttm", 0) or 0)
-    if net_profit_ttm == 0 and eps > 0:
-        total_shares = float(data.get("total_shares", 0) or 0)
-        if total_shares > 0:
-            net_profit_ttm = round((eps * 1000 * total_shares) / 1e9, 2)
-
-    return {
-        "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
-        "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
-        "dividend_yield": float(data.get("dividend_yield", 0)),
-        "cfo_latest": float(data.get("cfo_latest", 0)),
-        "net_profit_ttm": net_profit_ttm,
-        "debt_to_equity": float(data.get("debt_to_equity", 0)),
-        "gross_margin": float(data.get("gross_margin", 0)),
-        "profit_growth_yoy": profit_growth_yoy,
-        "credit_growth_yoy": credit_growth_yoy
-    }
+    return {"close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
+            "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
+            "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
+            "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy}
 
 def compute_sector_medians(normalized_db):
     buckets = {}
@@ -728,25 +727,26 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     med_pe, med_pb, med_ps, med_roe = sector_median.get("pe") or 12.0, sector_median.get("pb") or 2.0, sector_median.get("ps") or 0.0, sector_median.get("roe") or 0.0
     cap_pe, cap_pb, mos = config["cap_pe"], config["cap_pb"], config["mos"]
     is_financial = group_label in ("NGAN_HANG", "CHUNG_KHOAN", "INSURANCE")
-
-    if eps > 0 and med_pe > 0:
+    
+    if eps > 0 and med_pe > 0: 
         roe_bonus = 1.15 if (roe > 0 and roe > med_roe) else 1.0
         methods["PE_method"] = round(eps * min(med_pe * roe_bonus, cap_pe), 0)
-    if bvps > 0 and med_pb > 0:
+    if bvps > 0 and med_pb > 0: 
         methods["PB_method"] = round(bvps * min(med_pb, cap_pb), 0)
-    if not is_financial and eps > 0 and bvps > 0:
+    if not is_financial and eps > 0 and bvps > 0: 
         methods["Graham"] = round((22.5 * eps * bvps) ** 0.5, 0)
-    if not is_financial and npat > 0 and cfo > 0 and (cfo / npat) >= 0.8 and eps > 0 and med_pe > 0:
+    if not is_financial and npat > 0 and cfo > 0 and (cfo / npat) >= 0.8 and eps > 0 and med_pe > 0: 
         methods["CFO_boost"] = round(eps * min(med_pe, cap_pe) * 1.10, 0)
-
+    
+    # PS_METHOD (Bổ sung từ script cũ)
     if config.get("primary_metric") == "PB" and ps > 0 and med_ps > 0:
         sales_per_share = close / ps if ps > 0 else 0
         target_ps = min(med_ps, 2.5)
         if sales_per_share > 0:
             methods["PS_method"] = round(sales_per_share * target_ps, 0)
-
+    
     if not methods: return {"fair_low": 0, "fair_high": 0, "graham": 0, "methods": {}, "mos_pct": round(mos * 100, 1), "rationale": "Không đủ DL.", "discount_to_fair_pct": 0, "verdict": "KHÔNG ĐỦ DỮ LIỆU"}
-
+    
     weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1, "PS_method": 1}
     weighted = []
     for k, v in methods.items(): weighted.extend([v] * int(weights.get(k, 1) * 2))
@@ -761,7 +761,7 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
 def compute_final_decision(fund_score, tech_score, val_score, total_score, verdict, cfo, npat, roe, debt_to_equity, discount_to_fair_pct=0.0, close_price=0.0, fair_high=0.0, fair_low=0.0):
     is_bank_or_sec = roe > 0 and debt_to_equity > 3.0
     if fund_score < 20: return ("❌ TRÁNH", "rose", f"PTCB yếu")
-    if not is_bank_or_sec and npat > 0 and cfo < 0 and fund_score < 25: return ("⚠️ CẢNH BÁO LỢI NHUẬN ẢO", "amber", f"CFO âm.")
+    if not is_bank_or_sec and cfo < 0 and npat > 0 and fund_score < 25: return ("⚠️ CẢNH BÁO LỢI NHUẬN ẢO", "amber", f"CFO âm.")
     if close_price > 0 and fair_high > 0 and close_price > fair_high * 1.2: return ("❌ TRÁNH", "rose", f"Giá vượt xa fair_high.")
     if close_price > 0 and fair_high > 0 and close_price > fair_high: return ("⚠️ CHỜ VỀ VÙNG MUA", "amber", f"Giá cao hơn fair_high.")
     if (verdict == "RẺ - TRONG VÙNG MUA" and fund_score >= 40 and tech_score >= 15 and val_score >= 24 and total_score >= 75 and discount_to_fair_pct >= 5): return ("🎯 MUA MẠNH", "emerald", "ĐỦ 4 YẾU TỐ.")
@@ -776,7 +776,7 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     pe, pb, ps, roe, roa = nd["pe"], nd["pb"], nd["ps"], nd["roe"], nd["roa"]
     close_price, cfo_latest, net_profit_ttm = nd["close_price"], nd["cfo_latest"], nd["net_profit_ttm"]
     debt_to_equity, profit_growth_yoy, credit_growth_yoy = nd["debt_to_equity"], nd["profit_growth_yoy"], nd["credit_growth_yoy"]
-
+    
     data_warnings = []
     if close_price <= 0: data_warnings.append("Thiếu Giá")
     if pe <= 0 and sector not in ["NGAN_HANG", "CHUNG_KHOAN"]: data_warnings.append("Thiếu P/E")
@@ -786,7 +786,7 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
 
     fund_score = 0
     fund_notes = []
-
+    
     if sector == "NGAN_HANG":
         if credit_growth_yoy >= 12: fund_score += 18; fund_notes.append("Tín dụng mạnh")
         elif credit_growth_yoy >= 8: fund_score += 10
@@ -823,7 +823,7 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         else: fund_score -= 10
         if roe >= 14: fund_score += 20; fund_notes.append("ROE cao")
         elif roe >= 10: fund_score += 10
-
+        
     if roa >= 5.0: fund_score += 5
     elif roa >= 2.5: fund_score += 3
 
@@ -864,44 +864,48 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         hist_data = history_col.find_one({"symbol": symbol})
         if hist_data and hist_data.get("history_d1"):
             try:
-                analyzer = ProfessionalTechnicalAnalyzer(hist_data["history_d1"])
+                analyzer = ProfessionalTechnicalAnalyzer(hist_data["history_d1"]) 
                 ptkt_res = analyzer.analyze()
                 tech_score_raw = ptkt_res.get("technical_score", 50)
                 tech_status = ptkt_res.get("technical_status", "Tích lũy")
                 pattern = ptkt_res.get("pattern", "Tích lũy")
-            except Exception:
-                pass
+            except Exception as e: pass
 
     tech_score = int(np.clip(int(round((tech_score_raw / 100.0) * 20)), 0, 20))
     total_score = fund_score + val_score + tech_score
     potential_zone = "VÙNG TÍCH SẢN TỐI ƯU (A+)" if total_score >= 75 else ("VÙNG MUA AN TOÀN (B)" if total_score >= 60 else "THEO DÕI THÊM")
-
+    
     fv = compute_fair_value_zone(symbol, nd, sector_median, config, group_label)
     decision, color, reason = compute_final_decision(fund_score, tech_score, val_score, total_score, fv["verdict"], cfo_latest, net_profit_ttm, roe, debt_to_equity, fv["discount_to_fair_pct"], close_price, fv["fair_high"], fv["fair_low"])
 
     sim_data = get_historical_return_rate_with_details(symbol)
-
+    
+    # Bổ sung metadata
     meta = VN100_METADATA.get(symbol, {})
 
+    # === BỔ SUNG: BỐC BÀI VIẾT AI TỪ STOCKS SANG VÀ TỰ TÍNH LẠI PRICE_ZONE ===
     ai_data = {
-        "bctc": "", "catalyst": "", "risks": "", "outlook": "",
-        "recommendation": "", "price_zone": "", "macro_view": "",
+        "bctc": "", "catalyst": "", "risks": "", "outlook": "", 
+        "recommendation": "", "price_zone": "", "macro_view": "", 
         "ai_updated_at": "Chưa phân tích", "ai_source": ""
     }
-
+    
+    # 1. Tìm trong bảng stocks xem mã này đã có bài AI chưa
     stock_doc = collection.find_one({"symbol": symbol}, {
-        "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1,
+        "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1, 
         "ai_updated_at": 1, "ai_source": 1
     })
-
+    
     if stock_doc and stock_doc.get("ai_bctc"):
+        # Nếu có, bốc toàn bộ văn bản AI sang
         ai_data["bctc"] = stock_doc.get("ai_bctc", "")
         ai_data["catalyst"] = stock_doc.get("ai_catalyst", "")
         ai_data["risks"] = stock_doc.get("ai_risks", "")
         ai_data["macro_view"] = stock_doc.get("ai_macro_view", "")
         ai_data["ai_updated_at"] = stock_doc.get("ai_updated_at", "Chưa phân tích")
         ai_data["ai_source"] = stock_doc.get("ai_source", "AI")
-
+        
+        # 2. TỰ TÍNH LẠI VÙNG MUA VÀ KHUYẾN NGHỊ (Không cho AI tự tính)
         metrics_for_template = {
             **nd,
             "fair_value_low": fv["fair_low"],
@@ -910,18 +914,19 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
             "discount_to_fair_pct": fv["discount_to_fair_pct"],
             "margin_of_safety_pct": fv["mos_pct"]
         }
-
+        
         temp_template = build_fallback_narrative(symbol, metrics_for_template, {
-            "fundamental_score": fund_score,
-            "valuation_score": val_score,
+            "fundamental_score": fund_score, 
+            "valuation_score": val_score, 
             "total_score": total_score,
-            "profit_growth_yoy": profit_growth_yoy,
+            "profit_growth_yoy": profit_growth_yoy, 
             "final_decision": decision
         }, sector)
-
+        
         ai_data["outlook"] = temp_template.get("outlook", "")
         ai_data["recommendation"] = temp_template.get("recommendation", "")
         ai_data["price_zone"] = temp_template.get("price_zone", "")
+    # =======================================================================
 
     return {
         "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
@@ -933,20 +938,20 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "margin_of_safety_pct": fv["mos_pct"], "fair_value_methods": fv["methods"], "fair_value_rationale": fv["rationale"],
         "discount_to_fair_pct": fv["discount_to_fair_pct"], "valuation_verdict": fv["verdict"], "final_decision": decision,
         "final_decision_color": color, "final_decision_reason": reason,
-
+        
         "sim_annual_rate": sim_data["annual_rate_percent"] if sim_data else 15.0,
         "sim_start_quarter": sim_data["start_quarter"] if sim_data else "",
         "sim_start_price": sim_data["start_price_mean"] if sim_data else 0,
         "sim_end_quarter": sim_data["end_quarter"] if sim_data else "",
         "sim_end_price": sim_data["end_price_mean"] if sim_data else 0,
-
+        
         "company_name": meta.get("company_name", ""),
         "market_cap": meta.get("market_cap", 0),
         "total_shares": meta.get("total_shares", 0),
-
+        
         "data_warnings": data_warnings,
         "is_data_incomplete": is_data_incomplete,
-
+        
         "bctc_evaluation": ai_data["bctc"],
         "outlook": ai_data["outlook"],
         "ai_recommendation": ai_data["recommendation"],
@@ -997,6 +1002,7 @@ def build_verified_facts(symbol, sm, si, sector):
     return "\n".join(lines)
 
 def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
+    """Tạo báo cáo Template khi chưa có AI."""
     close = float(stock_metrics.get("close", stock_metrics.get("close_price", 0)) or 0)
     pe = float(stock_metrics.get("pe", 0) or 0)
     pb = float(stock_metrics.get("pb", 0) or 0)
@@ -1014,19 +1020,18 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     discount_pct = float(stock_metrics.get("discount_to_fair_pct", 0) or 0)
     verdict = stock_metrics.get("valuation_verdict", "CHƯA TÍNH")
     mos_pct = float(stock_metrics.get("margin_of_safety_pct", 0) or 0)
-
+    
+    fund_score = screener_item.get("fundamental_score", 0)
+    val_score = screener_item.get("valuation_score", 0)
+    tech_score = screener_item.get("technical_score", 0)
+    total_score = screener_item.get("total_score", 0)
     growth_yoy = float(screener_item.get("profit_growth_yoy", 0) or 0)
     final_decision = screener_item.get("final_decision", "CHƯA XÁC ĐỊNH")
 
     sector_name = SECTOR_NAMES.get(sector, sector)
     is_bank_or_sec = sector in ("NGAN_HANG", "CHUNG_KHOAN")
 
-    display_npat = npat
-    if display_npat == 0 and eps > 0:
-        total_shares = float(stock_metrics.get("total_shares", 0) or 0)
-        if total_shares > 0:
-            display_npat = round((eps * 1000 * total_shares) / 1e9, 2)
-
+    # --- Phần BCTC ---
     bctc_parts = [f"Chỉ số sinh lời: ROE đạt {roe:.1f}%, ROA {roa:.1f}%."]
     if is_bank_or_sec:
         bctc_parts.append(f"P/E {pe:.2f}x và P/B {pb:.2f}x phản ánh mức định giá của định chế tài chính. D/E {de:.2f} là bản chất ngân hàng.")
@@ -1034,21 +1039,20 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
         bctc_parts.append(f"Định giá P/E {pe:.2f}x và P/B {pb:.2f}x.")
         if gm > 0: bctc_parts.append(f"Biên lợi nhuận gộp {gm:.1f}%.")
 
-    if display_npat > 0 and cfo != 0:
-        cfo_ratio = cfo / display_npat
+    if npat > 0 and cfo != 0:
+        cfo_ratio = cfo / npat
         if cfo_ratio >= 1.0:
-            bctc_parts.append(f"Chất lượng lợi nhuận tốt với CFO {cfo:,.0f} tỷ ≥ LNST (ước tính) {display_npat:,.0f} tỷ.")
+            bctc_parts.append(f"Chất lượng lợi nhuận tốt với CFO {cfo:,.0f} tỷ ≥ LNST {npat:,.0f} tỷ.")
         elif cfo_ratio >= 0.5:
-            bctc_parts.append(f"CFO {cfo:,.0f} tỷ so với LNST (ước tính) {display_npat:,.0f} tỷ — chấp nhận được.")
+            bctc_parts.append(f"CFO {cfo:,.0f} tỷ so với LNST {npat:,.0f} tỷ — chấp nhận được.")
         else:
             bctc_parts.append(f"⚠️ Cảnh báo: CFO/LNST chỉ {cfo_ratio:.2f}x.")
-    elif eps > 0:
-        bctc_parts.append(f"Lợi nhuận trên mỗi cổ phiếu (EPS) đạt {eps:,.0f} VNĐ. (Dữ liệu BCTC gốc bị thiếu dòng LNST, số liệu đang tính toán dựa trên EPS).")
 
     bctc_parts.append(f"EPS đạt {eps:,.0f} VNĐ.")
     if div_yield > 0: bctc_parts.append(f"Cổ tức {div_yield}%/năm.")
     bctc = " ".join(bctc_parts)
 
+    # --- Phần Catalyst & Risks ---
     moat_map = {
         "NGAN_HANG": "tệp khách hàng bán lẻ trung thành và chi phí vốn thấp",
         "CHUNG_KHOAN": "thị phần môi giới ổn định và quan hệ với nhà đầu tư tổ chức",
@@ -1072,6 +1076,7 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     }
     risks = risk_map.get(sector, f"Rủi ro chung của ngành {sector_name}.")
 
+    # --- Phần Outlook ---
     if verdict == "RẺ - TRONG VÙNG MUA":
         outlook = f"Giá {close:,.0f} VNĐ nằm dưới vùng mua an toàn {fair_low:,.0f} VNĐ, biên an toàn {discount_pct:.1f}% (MoS {mos_pct:.0f}%). Đây là vùng định giá hấp dẫn cho tích sản dài hạn. Quyết định: {final_decision}."
     elif verdict == "HỢP LÝ - CHỜ ĐIỀU CHỈNH":
@@ -1081,8 +1086,10 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     else:
         outlook = f"Chưa đủ dữ liệu định giá. Verdict: {verdict}."
 
+    # --- Recommendation ---
     rec_text, rec_weight = DECISION_TO_RECOMMENDATION.get(final_decision, ("NẮM GIỮ / THEO DÕI", "Tỷ trọng 0%"))
     recommendation = f"{rec_text} — {rec_weight}"
+
     price_zone = f"Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | Giá: {close:,.0f} | Verdict: {verdict}"
 
     macro_map = {
@@ -1107,28 +1114,20 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
         "macro_view": macro_view,
         "_source": "TEMPLATE",
     }
-
 def _call_ai_for_symbol(symbol, sm, si, sector):
     try:
         verified_facts = build_verified_facts(symbol, sm, si, sector)
         sector_guidance = get_sector_guidance(sector)
-
+        
         final_decision = si.get("final_decision", "CHƯA XÁC ĐỊNH")
         rec_text, rec_weight = DECISION_TO_RECOMMENDATION.get(final_decision, ("NẮM GIỮ / THEO DÕI", "Tỷ trọng 0%"))
-
+        
         fair_low = float(sm.get("fair_value_low", 0) or 0)
         fair_high = float(sm.get("fair_value_high", 0) or 0)
         verdict = sm.get("valuation_verdict", "CHƯA TÍNH")
         discount_pct = float(sm.get("discount_to_fair_pct", 0) or 0)
         close_price = float(sm.get("close", sm.get("close_price", 0)) or 0)
-
-        net_profit_for_ai = si.get("net_profit_ttm", 0)
-        eps_for_ai = sm.get("eps", 0)
-        if net_profit_for_ai == 0 and eps_for_ai > 0:
-            ai_note = f"LƯU Ý ĐẶC BIỆT: Dữ liệu BCTC gốc bị thiếu dòng Lợi nhuận sau thuế (LNST). Hãy đánh giá doanh nghiệp dựa trên chỉ số EPS = {eps_for_ai:,.0f} VNĐ và P/E = {sm.get('pe',0)}. TUYỆT ĐỐI KHÔNG kết luận doanh nghiệp lỗ hay LNST bằng 0. Không dùng từ 'LNST' nếu không có số liệu, hãy nói về EPS."
-        else:
-            ai_note = "Dữ liệu BCTC đầy đủ. Hãy phân tích dựa trên LNST và CFO."
-
+        
         prompt = f"""Bạn là Chuyên gia Phân tích Đầu tư Giá trị (Value Investing) với 20 năm kinh nghiệm tại các quỹ lớn ở Việt Nam.
 
 NHIỆM VỤ: Diễn giải dữ liệu đã tính sẵn cho mã {symbol}. KHÔNG được bịa số liệu. Mọi con số phải TRÍCH DẪN TRỰC TIẾP từ khối DỮ KIỆN bên dưới.
@@ -1139,19 +1138,17 @@ NHIỆM VỤ: Diễn giải dữ liệu đã tính sẵn cho mã {symbol}. KHÔN
 --- HƯỚNG DẪN THEO NGÀNH ---
 {sector_guidance}
 
---- {ai_note} ---
-
 --- QUY TẮC BẮT BUỘC ---
 1. MỌI nhận định phải có SỐ CỤ THỂ từ dữ kiện.
 2. VỀ VÙNG MUA: PHẢI dùng đúng 2 con số: fair value {fair_high:,.0f}, vùng mua {fair_low:,.0f}.
-3. VỀ KHUYẾN NGHỊ: Hệ thống đã tính → "{final_decision}". BẠN PHẢI trả về recommendation = "{rec_text}" và weight = "{rec_weight}".
+3. VỀ KHUYẾN NGHỊ: Hệ thống đã tính → "{final_decision}". BẠN PHẢI trả về recommendation = "{rec_text}" và weight = "{rec_weight}". 
 TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ TỪ NÀO KHÁC.
 4. VỀ "ĐỊNH GIÁ & HÀNH ĐỘNG GIÁ" (outlook): Phải làm nổi bật "Biên an toàn" (Margin of Safety). Nếu giá đang trong vùng mua, phải kết luận rõ đây là cơ hội. Nếu giá đắt, phải nói rõ rủi ro.
 5. VỀ "VĨ MÔ & SÓNG NGÀNH" (macro_view): Phân tích dựa trên chu kỳ giá hàng hóa (đối với ngành Vật liệu/Phân bón/Hóa chất/Thép) hoặc chính sách vĩ mô (đối với Ngân hàng/BĐS). KHÔNG nói chung chung về VN-Index.
 
 --- ĐỊNH DẠNG: JSON THUẦN TÚY (KHÔNG ```json) ---
 {{
-  "bctc": "6-8 câu phân tích BCTC, trích số: ROE={sm.get('roe',0)}%, ROA={sm.get('roa',0)}%, P/E={sm.get('pe',0)}, P/B={sm.get('pb',0)}, D/E={sm.get('debt_to_equity',0)}. Nếu có EPS hãy nói về EPS. Kết luận lợi nhuận thật/ảo dựa trên CFO.",
+  "bctc": "6-8 câu phân tích BCTC, trích số: ROE={sm.get('roe',0)}%, ROA={sm.get('roa',0)}%, P/E={sm.get('pe',0)}, P/B={sm.get('pb',0)}, CFO/LNST, D/E={sm.get('debt_to_equity',0)}. Kết luận lợi nhuận thật/ảo.",
   "catalyst": "3-4 câu. Economic Moat cụ thể + động lực tăng trưởng 2-3 năm.",
   "risks": "3 câu. Rủi ro trọng yếu nhất phù hợp ngành.",
   "valuation_verdict": "Copy nguyên văn: '{verdict}'",
@@ -1171,15 +1168,15 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
         for attempt in range(3):
             try:
                 res = requests.post(AI_API_URL, headers=headers, json=payload, timeout=60)
-
+                
                 if res.status_code == 200:
                     content = res.json()["choices"][0]["message"]["content"].strip()
                     content = re.sub(r"^```json\s*", "", content)
                     content = re.sub(r"^```\s*", "", content)
                     content = re.sub(r"\s*```$", "", content)
-
+                    
                     parsed = json.loads(content)
-
+                    
                     raw_pz = parsed.get("price_zone", "")
                     if isinstance(raw_pz, dict):
                         parsed["price_zone"] = " | ".join([f"{k}: {v}" for k, v in raw_pz.items()])
@@ -1212,7 +1209,7 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                 else:
                     print(f"  ❌ [{symbol}] AI trả về HTTP {res.status_code} (Lần {attempt + 1}/3)", flush=True)
                     time.sleep(3)
-
+                    
             except requests.exceptions.Timeout:
                 print(f"  ⏳ [{symbol}] AI Timeout (Lần {attempt + 1}/3), thử lại...", flush=True)
                 time.sleep(3)
@@ -1222,7 +1219,7 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
 
         print(f"  ⚠️ [{symbol}] AI lỗi hoàn toàn (sau 3 lần thử). Bỏ qua mã này.", flush=True)
         return None
-
+        
     except Exception as e:
         print(f"  ❌ Lỗi nghiêm trọng ở _call_ai_for_symbol cho {symbol}: {e}", flush=True)
         return None
@@ -1267,7 +1264,7 @@ def auto_crawler_worker():
                         wake_up_time += timedelta(days=1)
                     while wake_up_time.weekday() >= 5:
                         wake_up_time += timedelta(days=1)
-
+                        
                 sleep_seconds = (wake_up_time - vn_now).total_seconds()
                 if sleep_seconds > 0:
                     print(f"🌙 [AUTO] Ngoài giờ giao dịch. Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
@@ -1277,9 +1274,9 @@ def auto_crawler_worker():
             if current_hour == 10 and current_minute == 0:
                 all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
                 any_changed = False
-
+                
                 print(f"🔍 [AUTO] Kiểm tra toàn bộ {len(all_symbols)} mã (Ngày lễ hay ngày làm việc?)...", flush=True)
-
+                
                 for sym in all_symbols:
                     doc = collection.find_one({"symbol": sym})
                     if doc:
@@ -1287,7 +1284,7 @@ def auto_crawler_worker():
                             any_changed = True
                             print(f"  ✅ [AUTO] Thị trường đang giao dịch (Mã {sym} đã biến động).", flush=True)
                             break
-
+                
                 if not any_changed:
                     print(f"🌙 [AUTO] Toàn bộ {len(all_symbols)} mã đều đứng giá. Kết luận: Hôm nay là NGÀY NGHỈ.", flush=True)
                     tomorrow = vn_now + timedelta(days=1)
@@ -1311,16 +1308,16 @@ def auto_crawler_worker():
                 symbols_to_crawl = []
                 for sym in all_symbols:
                     doc = collection.find_one({"symbol": sym}, {"chot_so_today": 1})
-                    if not doc or doc.get("chot_so_today") != today_str:
+                    if not doc or doc.get("chot_so_today") != today_str: 
                         symbols_to_crawl.append(sym)
-
-                if not symbols_to_crawl:
-                    symbols_to_crawl = all_symbols
-
+                
+                if not symbols_to_crawl: 
+                    symbols_to_crawl = all_symbols 
+                    
                 _execute_crawl(symbols_to_crawl, is_manual=False)
-
+                
             time.sleep(15)
-
+            
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
@@ -1346,18 +1343,20 @@ def full_data_crawler_worker():
                         if res:
                             res.update({"symbol": symbol, "updated_at": _now_str()})
                             bctc_col.update_one({"symbol": symbol}, {"$set": res}, upsert=True)
-
+                            
+                            # BỔ SUNG: Tự động bóc tách dữ liệu tài chính lưu vào stocks
                             extracted = extract_metrics_from_bctc_data(res)
                             if extracted:
                                 collection.update_one({"symbol": symbol}, {"$set": extracted})
-
+                                
+                        # Bổ sung: tự động lấy SLCP nếu bị thiếu
                         total_shares = collection.find_one({"symbol": symbol}, {"total_shares": 1})
                         if not total_shares or total_shares.get("total_shares", 0) == 0:
-                            shares = fetch_total_shares_vci(symbol)
+                            shares = fetch_total_shares_fhsc(symbol)
                             if shares > 0:
                                 collection.update_one({"symbol": symbol}, {"$set": {"total_shares": shares}})
                         time.sleep(3.0)
-                time.sleep(3600)
+                time.sleep(3600) 
             else: time.sleep(30)
         except Exception: time.sleep(60)
 
@@ -1367,10 +1366,10 @@ def screener_worker():
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
             current_hour = vn_now.hour
-
+            
             all_symbols_count = collection.count_documents({})
             crawled_count = collection.count_documents({"chot_so_today": today_str})
-
+            
             is_1630 = (current_hour == 16 and vn_now.minute == 30 and vn_now.second < 10)
             is_just_closed = (current_hour >= 15 and crawled_count >= all_symbols_count and all_symbols_count > 0)
 
@@ -1381,41 +1380,44 @@ def screener_worker():
                     continue
 
                 print(f"\n[SCREENER] ⏰ Kích hoạt chấm điểm (Lý do: {'16h30' if is_1630 else 'Vừa chốt sổ xong'})", flush=True)
-
+                
                 stock_db = {}
                 print("[SCREENER] 📥 Đang nạp dữ liệu BCTC để tính toán các chỉ số...", flush=True)
                 for doc in collection.find({}):
                     sym = doc["symbol"]
                     bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
                     doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
-
+                    
+                    # === BỔ SUNG: TỰ ĐỘNG TRÍCH XUẤT CFO, LN_TTM, D/E, GM TỪ BCTC ===
                     if bctc:
                         extracted = extract_metrics_from_bctc_data(bctc)
                         if extracted:
-                            doc.update(extracted)
+                            doc.update(extracted) 
                             collection.update_one({"symbol": sym}, {"$set": extracted})
-
+                    # ================================================================
+                    
                     stock_db[sym] = doc
-
+                
                 normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
                 sector_medians = compute_sector_medians(normalized_db)
                 results = []
-
+                
                 for symbol, nd in normalized_db.items():
                     grp = get_sub_sector(symbol)
                     cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(symbol))
                     med, _ = get_median_for_symbol(symbol, sector_medians)
                     res = evaluate_stock_from_db(symbol, nd, med, grp, cfg)
-                    if res:
+                    if res: 
                         res["date"] = today_str
                         results.append(res)
-
+                
+                # === BỔ SUNG: TÍNH LẠI FINAL_DECISION LẦN 2 (Đảm bảo tính nhất quán) ===
                 if results:
                     print(f"[SCREENER] 🔄 Đang tính lại final_decision lần 2 để đảm bảo tính nhất quán...", flush=True)
                     for r in results:
                         sym = r["symbol"]
                         nd_final = normalized_db.get(sym, {})
-
+                        
                         fd_label, fd_color, fd_reason = compute_final_decision(
                             fund_score=r.get("fundamental_score", 0),
                             tech_score=r.get("technical_score", 0),
@@ -1435,19 +1437,22 @@ def screener_worker():
                         r["final_decision_color"] = fd_color
                         r["final_decision_reason"] = fd_reason
                     print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
+                # === KẾT THÚC BỔ SUNG ===
 
+                # === BỔ SUNG: TỰ ĐỘNG TẠO TEMPLATE CHO CÁC MÃ CHƯA CÓ AI THẬT ===
                 if results:
                     print(f"[SCREENER] 📝 Đang tạo/cập nhật Template cho các mã chưa có AI thật...", flush=True)
                     template_count = 0
                     for r in results:
                         sym = r["symbol"]
+                        # SỬA: Chỉ bỏ qua nếu đã có AI THẬT (ai_source == "AI"). Template sẽ được cập nhật lại.
                         existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
                         if existing and existing.get("ai_bctc") and existing.get("ai_source") == "AI":
-                            continue
-
+                            continue  # Đã có AI thật, không ghi đè
+                        
                         nd_for_template = normalized_db.get(sym, {})
                         template_data = build_fallback_narrative(sym, nd_for_template, r, get_sector(sym))
-
+                        
                         if template_data:
                             collection.update_one({"symbol": sym}, {"$set": {
                                 "ai_bctc": template_data.get("bctc", ""),
@@ -1462,11 +1467,12 @@ def screener_worker():
                             }})
                             template_count += 1
                     print(f"[SCREENER] ✅ Đã tạo/cập nhật Template cho {template_count} mã (chưa có AI thật).", flush=True)
-
+                # === KẾT THÚC BỔ SUNG ===
+                        
                 if results:
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
-                    screener_col.delete_many({})
-                    screener_col.insert_many(results)
+                    screener_col.delete_many({}) 
+                    screener_col.insert_many(results) 
                     commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Update Screener {_now_str()}")
                     print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã.", flush=True)
 
@@ -1481,7 +1487,7 @@ def screener_worker():
                             decision = r.get("final_decision", "")
                             if "MUA MẠNH" in decision: buy_strong += 1
                             elif "MUA TÍCH SẢN" in decision: buy_accumulate += 1
-                            elif "TRÁNH" in decision:
+                            elif "TRÁNH" in decision: 
                                 avoid += 1
                                 if len(danger_stocks) < 3:
                                     danger_stocks.append(f"  • {r['symbol']} (Điểm: {r.get('total_score', 0)})")
@@ -1502,18 +1508,18 @@ def screener_worker():
                             if "RẺ" in r.get("valuation_verdict", "") and r.get("fundamental_score", 0) >= 30:
                                 if len(value_stocks) < 3:
                                     value_stocks.append(f"  • <b>{r['symbol']}</b> ({r.get('sector')}): Giá {close_price:,.0f} - Vùng mua ≤ {r.get('fair_value_low',0):,.0f}")
-
+                            
                             warnings = r.get("data_warnings", [])
-                            if "Thiếu Giá" in warnings:
+                            if "Thiếu Giá" in warnings: 
                                 missing_price_count += 1
                                 if len(missing_price_symbols) < 5: missing_price_symbols.append(r['symbol'])
-                            if "Thiếu P/E" in warnings:
+                            if "Thiếu P/E" in warnings: 
                                 missing_pe_count += 1
                                 if len(missing_pe_symbols) < 5: missing_pe_symbols.append(r['symbol'])
-                            if "Thiếu P/B" in warnings:
+                            if "Thiếu P/B" in warnings: 
                                 missing_pb_count += 1
                                 if len(missing_pb_symbols) < 5: missing_pb_symbols.append(r['symbol'])
-                            if "Thiếu ROE" in warnings:
+                            if "Thiếu ROE" in warnings: 
                                 missing_roe_count += 1
                                 if len(missing_roe_symbols) < 5: missing_roe_symbols.append(r['symbol'])
 
@@ -1562,7 +1568,7 @@ def screener_worker():
                             f"━━━━━━━━━━━━━━━━━━",
                             f"<b>2️⃣ DÒNG TIỀN ĐỘT BIẾN (Hot Money)</b>"
                         ])
-
+                        
                         if strong_movers:
                             msg_lines.extend(strong_movers)
                         else:
@@ -1579,7 +1585,7 @@ def screener_worker():
                         msg_lines.append(f"<b>4️⃣ CẢNH BÁO RỦI RO</b>")
                         msg_lines.append(f"  ❌ Có <b>{avoid}</b> mã bị đánh giá TRÁNH (Giá đắt, nền tảng yếu).")
                         if danger_stocks:
-                            msg_lines.append(f"  ⚠️ <i>Điển hình: {', '.join(danger_stocks).replace('  • ', '')}</i>")
+                             msg_lines.append(f"  ⚠️ <i>Điển hình: {', '.join(danger_stocks).replace('  • ', '')}</i>")
 
                         send_telegram("\n".join(msg_lines))
                         print("[SCREENER] 🚀 Đã gửi báo cáo thị trường qua Telegram.", flush=True)
@@ -1588,17 +1594,17 @@ def screener_worker():
 
                 time.sleep(120)
             time.sleep(30)
-        except Exception as e:
+        except Exception as e: 
             print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
             time.sleep(60)
+
 
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
 threading.Thread(target=full_data_crawler_worker, daemon=True).start()
 threading.Thread(target=screener_worker, daemon=True).start()
-
 # ===================== ROUTES =====================
 @app.get("/")
-def home():
+def home(): 
     print("[API] 🏠 Gọi API trang chủ (/)", flush=True)
     return "API is running!", 200
 
@@ -1622,6 +1628,15 @@ def resume_crawl():
     stop_crawl_requested = False
     print("\n[API] ▶️ Đã TIẾP TỤC tiến trình cào tự động!", flush=True)
     return jsonify({"status": "success", "message": "Đã tiếp tục cào tự động."})
+
+@app.post("/api/set-fhsc-key")
+def api_set_fhsc_key():
+    print("[API] 🔑 Gọi API /api/set-fhsc-key", flush=True)
+    data = request.json
+    new_key = data.get("key", "").strip()
+    if not new_key: return jsonify({"status": "error", "message": "Key không được để trống"}), 400
+    settings_col.update_one({"_id": "fhsc_key"}, {"$set": {"value": new_key, "updated_at": _now_str()}}, upsert=True)
+    return jsonify({"status": "success", "message": "Đã lưu API Key mới thành công!"})
 
 @app.get("/api/data")
 def api_get_data():
@@ -1649,11 +1664,11 @@ def api_get_data():
                     doc["price_change_available"] = avail
                     doc["price_arrow"] = arrow
                     doc["price_color"] = color
-
+                
                 doc["volume_percent"] = doc.get("volume_percent", 0.0)
                 data[sym] = doc
         return jsonify({"status": "success", "count": len(data), "data": data})
-    except Exception as e:
+    except Exception as e: 
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.get("/api/sync")
@@ -1662,12 +1677,12 @@ def api_sync():
     print(f"[API] 🔄 Gọi API /api/sync | Mã: {raw}", flush=True)
     if not raw: abort(400)
     symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
-
+    
     if is_crawling or _is_after_15h():
         updated_data = {}
         for sym in symbols:
             doc = collection.find_one({"symbol": sym})
-            if doc and "close" in doc:
+            if doc and "close" in doc: 
                 close_price = doc.get("close", 0)
                 prev_close = doc.get("prev_close", 0)
                 pct = 0.0
@@ -1688,15 +1703,15 @@ def api_sync():
                     "price_color": color, "updated_at": doc.get("updated_at", _now_str())
                 }
         return jsonify({
-            "status": "success",
-            "updated_at": _now_str() + " (Lấy từ DB)",
+            "status": "success", 
+            "updated_at": _now_str() + " (Lấy từ DB)", 
             "updated_data": updated_data
         })
 
     threading.Thread(target=_execute_crawl, args=(symbols, False, True)).start()
     return jsonify({
-        "status": "success",
-        "updated_at": _now_str() + " (Bắt đầu cào)",
+        "status": "success", 
+        "updated_at": _now_str() + " (Bắt đầu cào)", 
         "updated_data": {}
     })
 
@@ -1710,17 +1725,17 @@ def api_get_screener():
 def api_ai_analyze():
     symbol = request.args.get("symbol", "").upper().strip()
     print(f"[API] 🤖 Gọi API /api/ai-analyze | Mã: {symbol}", flush=True)
-    if not symbol:
+    if not symbol: 
         return jsonify({"status": "error", "message": "Thiếu mã"}), 400
-
+        
     try:
         sm = collection.find_one({"symbol": symbol}, {"_id": 0})
         si = screener_col.find_one({"symbol": symbol}, {"_id": 0})
         bctc_doc = bctc_col.find_one({"symbol": symbol}, {"_id": 0})
-
-        if not sm or not si:
+        
+        if not sm or not si: 
             return jsonify({"status": "error", "message": "Chưa đủ dữ liệu"}), 404
-
+        
         ai_data = {
             "bctc": sm.get("ai_bctc", ""),
             "catalyst": sm.get("ai_catalyst", ""),
@@ -1746,17 +1761,17 @@ def api_ai_analyze():
                     bctc_warning = f"⚠️ CẢNH BÁO: BCTC đã cũ, kỳ mới nhất là {bctc_period}, cào lúc {bctc_updated_at}."
             except:
                 pass
-
+        
         if not ai_data["bctc"] or not ai_data["outlook"]:
             return jsonify({
-                "status": "warning",
+                "status": "warning", 
                 "message": "Mã này chưa có phân tích AI. Vui lòng đợi hệ thống chạy ngầm hoặc liên hệ Admin!",
                 "data": None
             }), 200
 
         return jsonify({
-            "status": "success",
-            "data": ai_data,
+            "status": "success", 
+            "data": ai_data, 
             "bctc_period": bctc_period,
             "bctc_updated_at": bctc_updated_at,
             "warning": bctc_warning
@@ -1768,40 +1783,44 @@ def api_ai_analyze():
 def admin_force_ai_single():
     if request.args.get("key") != ADMIN_SECRET_KEY:
         return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
-
+        
     global is_ai_running
-
+    
+    # Lấy mã từ URL, ví dụ: /api/admin/force-ai-single?symbol=HCM
     symbol = request.args.get("symbol", "").upper().strip()
-
+    
     if not symbol:
         return jsonify({"status": "error", "message": "Vui lòng truyền tham số ?symbol=XXX"}), 400
-
+        
     if is_ai_running:
         return jsonify({"status": "error", "message": "Hệ thống đang chạy AI hàng loạt, vui lòng đợi!"}), 400
-
+    
     if not ALIBABA_API_KEY:
         return jsonify({"status": "error", "message": "Thiếu ALIBABA_API_KEY trong biến môi trường!"}), 500
-
+    
+    # Kiểm tra xem mã này có dữ liệu trong Database chưa
     sm = collection.find_one({"symbol": symbol}, {"_id": 0})
     si = screener_col.find_one({"symbol": symbol}, {"_id": 0})
-
+    
     if not sm or not si:
         return jsonify({
-            "status": "error",
+            "status": "error", 
             "message": f"Mã {symbol} chưa đủ dữ liệu nền (chưa có trong bảng giá hoặc chưa được chấm điểm). Hãy chạy /api/force-screener trước."
         }), 404
 
     is_ai_running = True
     print(f"\n[ADMIN-AI-SINGLE] 🚀 Bắt đầu chạy AI cho mã {symbol}...", flush=True)
-
+    
     def _run():
         global is_ai_running
         try:
             sector = si.get("sector", "SAN_XUAT_TIEU_DUNG_PHONG_THU")
-
+            
+            # Gọi AI
             ai_result = _call_ai_for_symbol(symbol, sm, si, sector)
-
+            
             if ai_result:
+                # 1. Lưu vào bảng stocks (collection)
                 collection.update_one({"symbol": symbol}, {"$set": {
                     "ai_bctc": ai_result.get("bctc", ""),
                     "ai_catalyst": ai_result.get("catalyst", ""),
@@ -1811,9 +1830,10 @@ def admin_force_ai_single():
                     "ai_price_zone": ai_result.get("price_zone", ""),
                     "ai_macro_view": ai_result.get("macro_view", ""),
                     "ai_updated_at": _now_str(),
-                    "ai_source": "AI"
+                    "ai_source": "AI"  # Đánh dấu nguồn là AI
                 }})
-
+                
+                # 2. BỔ SUNG: Lưu vào bảng screener_results (screener_col) để giao diện web đọc được ngay
                 screener_col.update_one({"symbol": symbol}, {"$set": {
                     "bctc_evaluation": ai_result.get("bctc", ""),
                     "outlook": ai_result.get("outlook", ""),
@@ -1821,9 +1841,9 @@ def admin_force_ai_single():
                     "ai_price_zone": ai_result.get("price_zone", ""),
                     "macro_view": ai_result.get("macro_view", ""),
                     "ai_updated_at": _now_str(),
-                    "ai_source": "AI"
+                    "ai_source": "AI"  # Đánh dấu nguồn là AI
                 }})
-
+                
                 print(f"[ADMIN-AI-SINGLE] ✅ {symbol} - Đã lưu phân tích AI thành công vào cả 2 bảng!", flush=True)
             else:
                 print(f"[ADMIN-AI-SINGLE] ❌ {symbol} - Gọi AI thất bại. Xem log lỗi ở trên.", flush=True)
@@ -1831,9 +1851,9 @@ def admin_force_ai_single():
             is_ai_running = False
 
     threading.Thread(target=_run, daemon=True).start()
-
+    
     return jsonify({
-        "status": "success",
+        "status": "success", 
         "message": f"Đã bắt đầu chạy AI cho mã {symbol}. Hãy theo dõi log trên Render!"
     })
 
@@ -1842,32 +1862,32 @@ def admin_force_ai():
     global is_ai_running
     if is_ai_running:
         return jsonify({"status": "error", "message": "Đang chạy AI cho toàn bộ mã, vui lòng đợi!"}), 400
-
+    
     if not ALIBABA_API_KEY:
         return jsonify({"status": "error", "message": "Thiếu ALIBABA_API_KEY!"}), 500
-
+    
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-
+    
     is_ai_running = True
     print(f"\n[ADMIN-AI] 🚀 Bắt đầu chạy AI cho toàn bộ {len(all_symbols)} mã...", flush=True)
-
+    
     def _run():
         global is_ai_running
         try:
             total = len(all_symbols)
             count = 0
-
+            
             for i, sym in enumerate(all_symbols, 1):
                 sm = collection.find_one({"symbol": sym}, {"_id": 0})
                 si = screener_col.find_one({"symbol": sym}, {"_id": 0})
-
+                
                 if not sm or not si:
                     print(f"[ADMIN-AI] [{i}/{total}] ⚠️ {sym} - Thiếu dữ liệu, bỏ qua.", flush=True)
                     continue
-
+                
                 sector = si.get("sector", "SAN_XUAT_TIEU_DUNG_PHONG_THU")
                 ai_result = _call_ai_for_symbol(sym, sm, si, sector)
-
+                
                 if ai_result:
                     collection.update_one({"symbol": sym}, {"$set": {
                         "ai_bctc": ai_result.get("bctc", ""),
@@ -1883,11 +1903,11 @@ def admin_force_ai():
                     print(f"[ADMIN-AI] [{i}/{total}] ✅ {sym} - OK", flush=True)
                 else:
                     print(f"[ADMIN-AI] [{i}/{total}] ❌ {sym} - Lỗi", flush=True)
-
+                
                 time.sleep(3.0)
-
+            
             print(f"[ADMIN-AI] 🏁 Hoàn thành: {count}/{total} mã.", flush=True)
-
+            
             gh_data, _ = get_github_file_data(SCREENER_JSON_FILE)
             if gh_data:
                 for item in gh_data:
@@ -1907,10 +1927,10 @@ def admin_force_ai():
                 print(f"[ADMIN-AI] 🚀 Đã đồng bộ AI lên Github.", flush=True)
         finally:
             is_ai_running = False
-
+    
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({
-        "status": "success",
+        "status": "success", 
         "message": f"Đã bắt đầu chạy AI cho {len(all_symbols)} mã. Xem log Render để theo dõi tiến trình!"
     })
 
@@ -1970,11 +1990,11 @@ def force_bctc():
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
-
+    
     symbols_str = request.args.get("symbols", "").upper().strip()
     start_idx, limit_idx = int(request.args.get("start", 0)), int(request.args.get("limit", 15))
     specific = request.args.get("symbol", "").upper().strip()
-
+    
     print(f"\n[API] 📥 Gọi API /api/force-bctc | Symbols: {symbols_str} | Specific: {specific}", flush=True)
 
     def _run():
@@ -1986,38 +2006,32 @@ def force_bctc():
                 target = [specific]
             else:
                 target = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})][start_idx:start_idx+limit_idx]
-
+                
             print(f"[BCTC-CRAWL] 🚀 Bắt đầu cào BCTC cho {len(target)} mã...", flush=True)
-
+            
             for i, sym in enumerate(target):
                 print(f"\n[BCTC-CRAWL] [{i+1}/{len(target)}] Đang xử lý {sym}...", flush=True)
                 res = _fetch_bctc_vci(sym)
-
-                if res:
+                
+                if res: 
                     bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
                     period = res.get("latest_period", "Không rõ")
                     print(f"  ✅ [THÀNH CÔNG] {sym} | Kỳ BCTC: {period}", flush=True)
-
+                    
+                    # BỔ SUNG: Tự động trích xuất số liệu tài chính lưu vào stocks ngay lập tức
                     extracted = extract_metrics_from_bctc_data(res)
                     if extracted:
                         collection.update_one({"symbol": sym}, {"$set": extracted})
                         print(f"  ✅ [FINANCIALS] {sym}: Đã trích xuất thành công (CFO, LNST, D/E, GM)", flush=True)
                 else:
                     print(f"  ❌ [THẤT BẠI] {sym} | Không lấy được dữ liệu", flush=True)
-
-                total_shares = collection.find_one({"symbol": sym}, {"total_shares": 1})
-                if not total_shares or total_shares.get("total_shares", 0) == 0:
-                    shares = fetch_total_shares_vci(sym)
-                    if shares > 0:
-                        collection.update_one({"symbol": sym}, {"$set": {"total_shares": shares}})
-                        print(f"  ✅ [SHARES] {sym}: Đã lấy {shares:,} CP", flush=True)
-
+                    
                 time.sleep(3.0)
-
+                
             print(f"\n[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ {len(target)} mã.", flush=True)
-        finally:
+        finally: 
             is_full_data_running = False
-
+            
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": f"Đang cào BCTC cho {len(symbols_str.split(',')) if symbols_str else limit_idx} mã..."})
 
@@ -2060,18 +2074,11 @@ def crawl_full_bctc():
             for i, sym in enumerate(target):
                 print(f"[BCTC-CRAWL] [{i+1}/{len(target)}] Đang xử lý {sym}...", flush=True)
                 res = _fetch_bctc_vci(sym)
-                if res:
+                if res: 
                     bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
                     extracted = extract_metrics_from_bctc_data(res)
                     if extracted:
                         collection.update_one({"symbol": sym}, {"$set": extracted})
-
-                total_shares = collection.find_one({"symbol": sym}, {"total_shares": 1})
-                if not total_shares or total_shares.get("total_shares", 0) == 0:
-                    shares = fetch_total_shares_vci(sym)
-                    if shares > 0:
-                        collection.update_one({"symbol": sym}, {"$set": {"total_shares": shares}})
-
                 time.sleep(3.0)
             print(f"[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ BCTC.", flush=True)
         finally: is_full_data_running = False
@@ -2090,10 +2097,10 @@ def crawl_ratios():
         try:
             target = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             print(f"[RATIO-CRAWL] 🚀 Bắt đầu cào bảng Ratio cho {len(target)} mã...", flush=True)
-
+            
             for i, sym in enumerate(target):
                 print(f"[RATIO-CRAWL] [{i+1}/{len(target)}] Đang lấy ratio cho {sym}...", flush=True)
-
+                
                 ratios = {}
                 for key, code in VNDIRECT_RATIOS.items():
                     val = get_vndirect_ratio(sym, code)
@@ -2102,10 +2109,10 @@ def crawl_ratios():
 
                 roe_val = ratios.get("roe", 0)
                 if roe_val and roe_val <= 1: roe_val *= 100
-
+                
                 roa_val = ratios.get("roa", 0)
                 if roa_val and roa_val <= 1: roa_val *= 100
-
+                
                 div_val = ratios.get("dividend_yield", 0)
                 if div_val and div_val <= 1: div_val *= 100
 
@@ -2118,18 +2125,18 @@ def crawl_ratios():
                     "pe": round(ratios.get("pe", 0), 2),
                     "pb": round(ratios.get("pb", 0), 2),
                     "ps": round(ratios.get("ps", 0), 2),
-                    "eps": eps_final,
+                    "eps": eps_final, 
                     "roe": round(roe_val, 1),
                     "roa": round(roa_val, 1),
                     "dividend_yield": round(div_val, 2),
                     "ratio_updated_at": _now_str()
                 }}, upsert=True)
-
+                
                 print(f"  ✅ [RATIO] {sym} thành công (P/E: {ratios.get('pe', 0)}, EPS: {eps_final}, ROE: {round(roe_val, 1)}%)", flush=True)
                 time.sleep(0.5)
 
             print(f"[RATIO-CRAWL] 🏁 Đã cào xong toàn bộ bảng Ratio.", flush=True)
-        finally:
+        finally: 
             is_full_data_running = False
 
     threading.Thread(target=_run, daemon=True).start()
@@ -2139,16 +2146,16 @@ def crawl_ratios():
 def force_screener():
     if request.args.get("key") != ADMIN_SECRET_KEY:
         return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
-
+        
     print(f"\n[API] 📥 Gọi API /api/force-screener (Ép chấm điểm lại)", flush=True)
     global is_screener_running
-    if is_screener_running:
+    if is_screener_running: 
         print("[SCREENER] ⚠️ Đang có tiến trình chấm điểm chạy, bỏ qua lệnh mới.", flush=True)
         return jsonify({"status": "error", "message": "Đang chạy"}), 400
-
+        
     is_screener_running = True
     print(f"[SCREENER] 🚀 Bắt đầu chấm điểm lại toàn bộ...", flush=True)
-
+    
     def _run():
         global is_screener_running
         try:
@@ -2158,21 +2165,23 @@ def force_screener():
                 sym = doc["symbol"]
                 bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
                 doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
-
+                
+                # === BỔ SUNG: TỰ ĐỘNG TRÍCH XUẤT SỐ LIỆU ===
                 if bctc:
                     extracted = extract_metrics_from_bctc_data(bctc)
                     if extracted:
                         doc.update(extracted)
                         collection.update_one({"symbol": sym}, {"$set": extracted})
-
+                # =============================================
+                
                 stock_db[sym] = doc
-
+            
             print(f"[SCREENER] 📊 Đã tải dữ liệu của {len(stock_db)} mã từ Database.", flush=True)
-
+            
             norm_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
             medians = compute_sector_medians(norm_db)
             results = []
-
+            
             count = 0
             for sym, nd in norm_db.items():
                 grp = get_sub_sector(sym)
@@ -2183,21 +2192,21 @@ def force_screener():
                 count += 1
                 if count % 20 == 0:
                     print(f"[SCREENER] ⏳ Đã xử lý {count}/{len(norm_db)} mã...", flush=True)
-
+            
             if results:
                 results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
-                screener_col.delete_many({})
-                screener_col.insert_many(results)
+                screener_col.delete_many({}) 
+                screener_col.insert_many(results) 
                 print(f"[SCREENER] 💾 Đã lưu {len(results)} mã vào MongoDB.", flush=True)
-
+                
                 commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Force Screener {_now_str()}")
                 print(f"[SCREENER] ✅ Đã đẩy file JSON lên Github thành công!", flush=True)
         except Exception as e:
             print(f"[SCREENER] ❌ Lỗi trong quá trình chấm điểm: {e}", flush=True)
-        finally:
+        finally: 
             is_screener_running = False
             print(f"[SCREENER] 🏁 Đã kết thúc tiến trình chấm điểm.\n", flush=True)
-
+            
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
 
@@ -2205,15 +2214,15 @@ def force_screener():
 def force_realtime():
     print(f"\n[API] ⚡ Gọi API /api/force-realtime (Ép cào giá Realtime ngay lập tức)", flush=True)
     global is_crawling
-
+    
     if is_crawling:
         return jsonify({"status": "error", "message": "Hệ thống đang trong quá trình cào, vui lòng đợi vài giây!"}), 400
-
+        
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
-
+    
     return jsonify({
-        "status": "success",
+        "status": "success", 
         "message": f"Đã kích hoạt ép cào realtime cho toàn bộ {len(all_symbols)} mã. Vui lòng đợi 1-2 phút rồi F5 trang web!"
     })
 
@@ -2243,21 +2252,22 @@ def retry_now():
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
 
+# ===================== API LỊCH SỬ =====================
 @app.get("/api/history")
 def api_get_history():
     symbol = request.args.get("symbol", "").upper().strip()
     if not symbol:
         return jsonify({"status": "error", "message": "Thiếu mã"}), 400
-
+        
     print(f"[API] 📊 Gọi API /api/history | Mã: {symbol}", flush=True)
-
+    
     try:
         hist_doc = history_col.find_one({"symbol": symbol}, {"_id": 0})
         if not hist_doc:
             return jsonify({"status": "error", "message": "Không có dữ liệu lịch sử"}), 404
-
+            
         return jsonify({
-            "status": "success",
+            "status": "success", 
             "symbol": symbol,
             "history_d1": hist_doc.get("history_d1", []),
             "history_w1": hist_doc.get("history_w1", []),
