@@ -201,6 +201,70 @@ def get_historical_return_rate_with_details(symbol):
         }
     except Exception as e: return None
 
+# ===================== HÀM BỔ SUNG: BÓC TÁCH DỮ LIỆU TÀI CHÍNH TỪ BCTC =====================
+def _safe_float(v):
+    try: return float(v) if v is not None else 0.0
+    except: return 0.0
+
+def _get_bctc_value(report_array, target_ids, period=None):
+    """Tìm giá trị của một chỉ tiêu BCTC theo ID (hỗ trợ nhiều ID)"""
+    if not report_array: return 0.0
+    if isinstance(target_ids, str): target_ids = [target_ids]
+    for item in report_array:
+        if item.get("id") in target_ids:
+            if period is None or item.get("period") == period:
+                return _safe_float(item.get("value"))
+    return 0.0
+
+def extract_metrics_from_bctc_data(bctc_doc):
+    """Trích xuất CFO, LNST TTM, D/E, Biên gộp từ document BCTC"""
+    if not bctc_doc: return {}
+    
+    metrics = {}
+    income = bctc_doc.get("income_statement", [])
+    cashflow = bctc_doc.get("cash_flow", [])
+    balance = bctc_doc.get("balance_sheet", [])
+    
+    # 1. LNST TTM (4 quý)
+    periods = sorted(list(set([item.get("period") for item in income if item.get("period")])), reverse=True)
+    npat_ttm = 0
+    for p in periods[:4]:
+        npat_ttm += _get_bctc_value(income, ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX", "IS_NET_PROFIT"], p)
+    metrics["net_profit_ttm"] = round(npat_ttm / 1e9, 2)
+    
+    # 2. CFO TTM (4 quý)
+    cf_periods = sorted(list(set([item.get("period") for item in cashflow if item.get("period")])), reverse=True)
+    cfo_ttm = 0
+    for p in cf_periods[:4]:
+        cfo_ttm += _get_bctc_value(cashflow, "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES", p)
+    metrics["cfo_latest"] = round(cfo_ttm / 1e9, 2)
+    
+    # 3. Biên gộp (Quý mới nhất)
+    latest_period = periods[0] if periods else None
+    if latest_period:
+        rev = _get_bctc_value(income, "IS_NET_REVENUE", latest_period)
+        cogs = _get_bctc_value(income, "IS_COST_OF_GOODS_SOLD", latest_period)
+        if rev > 0:
+            metrics["gross_margin"] = round((rev + cogs) / rev * 100, 1)
+            
+    # 4. D/E (Quý mới nhất)
+    bs_periods = sorted(list(set([item.get("period") for item in balance if item.get("period")])), reverse=True)
+    latest_bs_period = bs_periods[0] if bs_periods else None
+    if latest_bs_period:
+        eq = _get_bctc_value(balance, ["BS_OWNERS_EQUITY", "BS_EQUITY"], latest_bs_period)
+        total_assets = _get_bctc_value(balance, "BS_TOTAL_ASSETS", latest_bs_period)
+        if total_assets == 0:
+            total_assets = _get_bctc_value(balance, "BS_SHORT_TERM_ASSETS", latest_bs_period) + _get_bctc_value(balance, "BS_LONG_TERM_ASSETS", latest_bs_period)
+            
+        liab = _get_bctc_value(balance, "BS_LIABILITIES", latest_bs_period)
+        if liab == 0 and total_assets > 0 and eq > 0:
+            liab = total_assets - eq
+            
+        if eq > 0:
+            metrics["debt_to_equity"] = round(liab / eq, 2)
+            
+    return metrics
+
 # ===================== CÀO GIÁ =====================
 def _fetch_one(symbol: str) -> Optional[dict]:
     print(f"    [FETCH] Đang lấy giá {symbol}...", flush=True)
@@ -366,7 +430,6 @@ def get_vndirect_ratio(symbol, ratio_code):
     return None
 
 # ===================== CORE LOGIC CÀO =====================
-# ===================== CORE LOGIC CÀO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
     global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
     if is_crawling: return
@@ -430,17 +493,14 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             is_locked = False
                             print(f"  🔓 [MỞ SỔ] {sym}: Giá biến động từ {prev_close} -> {data['close']}", flush=True)
 
-                    # === SỬA TẠI ĐÂY: TÍNH TOÁN OPEN, HIGH, LOW TÍCH LŨY ===
-                    # Kiểm tra xem hôm nay đã có dữ liệu trong Database chưa
+                    # === TÍNH TOÁN OPEN, HIGH, LOW TÍCH LŨY ===
                     today_record = collection.find_one({"symbol": sym, "trading_date": real_today})
                     
                     if today_record and today_record.get("trading_date") == real_today:
-                        # Nếu đã có: Open giữ nguyên, High/Low lấy max/min
                         final_open = today_record.get("open", data["open"])
                         final_high = max(today_record.get("high", data["high"]), data["high"])
                         final_low = min(today_record.get("low", data["low"]), data["low"])
                     else:
-                        # Nếu là lần đầu trong ngày: Lấy từ API
                         final_open = data["open"]
                         final_high = data["high"]
                         final_low = data["low"]
@@ -448,9 +508,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
 
                     collection.update_one({"symbol": sym}, {"$set": {
                         "close": data["close"], "prev_close": prev_close, 
-                        "open": final_open,    # Dùng giá trị tích lũy
-                        "high": final_high,    # Dùng giá trị tích lũy
-                        "low": final_low,      # Dùng giá trị tích lũy
+                        "open": final_open,
+                        "high": final_high,
+                        "low": final_low,
                         "volume": data["volume"],
                         "volume_percent": vol_pct, "avg_volume_20": round(avg_vol_20, 2),
                         "price_change_percent": pct_change,
@@ -472,7 +532,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             d1_bars = hist_doc.get("history_d1", []) if hist_doc else []
                             d1_bars = [b for b in d1_bars if b.get("time") != real_today]
                             
-                            # Khi chốt sổ, dùng dữ liệu tích lũy cuối ngày
                             d1_bars.append({
                                 "time": real_today, 
                                 "open": final_open, 
@@ -830,7 +889,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         ai_data["ai_source"] = stock_doc.get("ai_source", "AI")
         
         # 2. TỰ TÍNH LẠI VÙNG MUA VÀ KHUYẾN NGHỊ (Không cho AI tự tính)
-        # Gộp dữ liệu thô (nd) với kết quả định giá (fv) để truyền vào hàm tạo Template
         metrics_for_template = {
             **nd,
             "fair_value_low": fv["fair_low"],
@@ -856,7 +914,7 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     return {
         "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
         "roe": roe, "roa": roa, "eps": round(nd["eps"], 0), "bvps": round(nd["bvps"], 0), "dividend_yield": nd["dividend_yield"], "profit_growth_yoy": profit_growth_yoy,
-        "cfo_latest": cfo_latest, "debt_to_equity": debt_to_equity, "gross_margin": nd["gross_margin"],
+        "cfo_latest": cfo_latest, "net_profit_ttm": net_profit_ttm, "debt_to_equity": debt_to_equity, "gross_margin": nd["gross_margin"],
         "fundamental_score": fund_score, "valuation_score": val_score, "technical_score": tech_score, "total_score": total_score,
         "potential_zone": potential_zone, "pattern": pattern, "technical_status": tech_status,
         "fundamental_notes": " | ".join(fund_notes), "fair_value_high": fv["fair_high"], "fair_value_low": fv["fair_low"], "graham_number": fv["graham"],
@@ -877,7 +935,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "data_warnings": data_warnings,
         "is_data_incomplete": is_data_incomplete,
         
-        # Các trường trả về cho bảng screener_results
         "bctc_evaluation": ai_data["bctc"],
         "outlook": ai_data["outlook"],
         "ai_recommendation": ai_data["recommendation"],
@@ -926,6 +983,7 @@ def build_verified_facts(symbol, sm, si, sector):
         f"ĐIỂM: Tổng {si.get('total_score')}/100"
     ]
     return "\n".join(lines)
+
 def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     """Tạo báo cáo Template khi chưa có AI."""
     close = float(stock_metrics.get("close", stock_metrics.get("close_price", 0)) or 0)
@@ -1246,6 +1304,7 @@ def auto_crawler_worker():
         except Exception as e:
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
+
 def full_data_crawler_worker():
     while True:
         try:
@@ -1267,6 +1326,12 @@ def full_data_crawler_worker():
                         if res:
                             res.update({"symbol": symbol, "updated_at": _now_str()})
                             bctc_col.update_one({"symbol": symbol}, {"$set": res}, upsert=True)
+                            
+                            # BỔ SUNG: Tự động bóc tách dữ liệu tài chính lưu vào stocks
+                            extracted = extract_metrics_from_bctc_data(res)
+                            if extracted:
+                                collection.update_one({"symbol": symbol}, {"$set": extracted})
+                                
                         time.sleep(3.0)
                 time.sleep(3600) 
             else: time.sleep(30)
@@ -1294,10 +1359,21 @@ def screener_worker():
                 print(f"\n[SCREENER] ⏰ Kích hoạt chấm điểm (Lý do: {'16h30' if is_1630 else 'Vừa chốt sổ xong'})", flush=True)
                 
                 stock_db = {}
+                print("[SCREENER] 📥 Đang nạp dữ liệu BCTC để tính toán các chỉ số...", flush=True)
                 for doc in collection.find({}):
-                    bctc = bctc_col.find_one({"symbol": doc["symbol"]}, {"_id": 0})
+                    sym = doc["symbol"]
+                    bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
                     doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
-                    stock_db[doc["symbol"]] = doc
+                    
+                    # === BỔ SUNG: TỰ ĐỘNG TRÍCH XUẤT CFO, LN_TTM, D/E, GM TỪ BCTC ===
+                    if bctc:
+                        extracted = extract_metrics_from_bctc_data(bctc)
+                        if extracted:
+                            doc.update(extracted) 
+                            collection.update_one({"symbol": sym}, {"$set": extracted})
+                    # ================================================================
+                    
+                    stock_db[sym] = doc
                 
                 normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
                 sector_medians = compute_sector_medians(normalized_db)
@@ -1918,6 +1994,12 @@ def force_bctc():
                     bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
                     period = res.get("latest_period", "Không rõ")
                     print(f"  ✅ [THÀNH CÔNG] {sym} | Kỳ BCTC: {period}", flush=True)
+                    
+                    # BỔ SUNG: Tự động trích xuất số liệu tài chính lưu vào stocks ngay lập tức
+                    extracted = extract_metrics_from_bctc_data(res)
+                    if extracted:
+                        collection.update_one({"symbol": sym}, {"$set": extracted})
+                        print(f"  ✅ [FINANCIALS] {sym}: Đã trích xuất thành công (CFO, LNST, D/E, GM)", flush=True)
                 else:
                     print(f"  ❌ [THẤT BẠI] {sym} | Không lấy được dữ liệu", flush=True)
                     
@@ -1969,7 +2051,11 @@ def crawl_full_bctc():
             for i, sym in enumerate(target):
                 print(f"[BCTC-CRAWL] [{i+1}/{len(target)}] Đang xử lý {sym}...", flush=True)
                 res = _fetch_bctc_ssi(sym)
-                if res: bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
+                if res: 
+                    bctc_col.update_one({"symbol": sym}, {"$set": {**res, "symbol": sym, "updated_at": _now_str()}}, upsert=True)
+                    extracted = extract_metrics_from_bctc_data(res)
+                    if extracted:
+                        collection.update_one({"symbol": sym}, {"$set": extracted})
                 time.sleep(3.0)
             print(f"[BCTC-CRAWL] 🏁 Đã cào xong toàn bộ BCTC.", flush=True)
         finally: is_full_data_running = False
@@ -2007,19 +2093,16 @@ def crawl_ratios():
                 div_val = ratios.get("dividend_yield", 0)
                 if div_val and div_val <= 1: div_val *= 100
 
-                # ================= SỬA TẠI ĐÂY =================
                 eps_raw = ratios.get("eps", 0)
-                # Nếu EPS >= 1000 (tức là đang ở đơn vị VNĐ), chia cho 1000 để đưa về Nghìn VNĐ
                 if eps_raw >= 1000:
                     eps_raw = eps_raw / 1000.0
                 eps_final = round(eps_raw, 2)
-                # ================================================
 
                 collection.update_one({"symbol": sym}, {"$set": {
                     "pe": round(ratios.get("pe", 0), 2),
                     "pb": round(ratios.get("pb", 0), 2),
                     "ps": round(ratios.get("ps", 0), 2),
-                    "eps": eps_final, # Đã dùng biến đã xử lý đơn vị
+                    "eps": eps_final, 
                     "roe": round(roe_val, 1),
                     "roa": round(roa_val, 1),
                     "dividend_yield": round(div_val, 2),
@@ -2054,10 +2137,21 @@ def force_screener():
         global is_screener_running
         try:
             stock_db = {}
+            print(f"[SCREENER] 📥 Đang nạp dữ liệu BCTC để tính toán...", flush=True)
             for doc in collection.find({}):
-                bctc = bctc_col.find_one({"symbol": doc["symbol"]}, {"_id": 0})
+                sym = doc["symbol"]
+                bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
                 doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
-                stock_db[doc["symbol"]] = doc
+                
+                # === BỔ SUNG: TỰ ĐỘNG TRÍCH XUẤT SỐ LIỆU ===
+                if bctc:
+                    extracted = extract_metrics_from_bctc_data(bctc)
+                    if extracted:
+                        doc.update(extracted)
+                        collection.update_one({"symbol": sym}, {"$set": extracted})
+                # =============================================
+                
+                stock_db[sym] = doc
             
             print(f"[SCREENER] 📊 Đã tải dữ liệu của {len(stock_db)} mã từ Database.", flush=True)
             
