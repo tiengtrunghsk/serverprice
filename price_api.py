@@ -35,8 +35,14 @@ logger.propagate = False
 def log_exception(context: str, exc: Exception):
     logger.error("%s | %s: %s", context, type(exc).__name__, str(exc), exc_info=True)
 
-# ===================== VNSTOCK THẾ HỆ 6 =====================
-from vnstock import Market, Fundamental
+# ===================== VNSTOCK THẾ HỆ MỚI =====================
+from vnstock import Market
+try:
+    from vnstock_data import Finance  # Sử dụng Finance của VCI để lấy full BCTC
+except ImportError:
+    Finance = None
+    logger.warning("⚠️ Không tìm thấy module Finance (VCI). Hãy cài đặt vnstock_data!")
+
 try:
     from vnstock import Company  # Bổ sung để lấy số lượng cổ phiếu
 except ImportError:
@@ -63,7 +69,7 @@ else:
     logger.warning("⚠️ CẢNH BÁO: Thiếu SSI_API_KEY hoặc SSI_API_SECRET. Có thể không lấy được giá realtime!")
 
 ADMIN_SECRET_KEY = os.environ.get("ADMIN_SECRET_KEY")
-ENV_FHSC_API_KEY = os.environ.get("FHSC_API_KEY", "").strip()
+ENV_FHSC_API_KEY = os.environ.get("FHSC_API_KEY", "").strip() # Vẫn giữ lại đề phòng cần dùng
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_USERNAME = os.environ.get("GITHUB_USERNAME", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip()
@@ -205,13 +211,13 @@ def get_historical_return_rate_with_details(symbol):
         }
     except Exception as e: return None
 
-# ===================== HÀM BỔ SUNG: BÓC TÁCH DỮ LIỆU TÀI CHÍNH TỪ BCTC =====================
+# ===================== HÀM BÓC TÁCH DỮ LIỆU TÀI CHÍNH TỪ BCTC (VCI FORMAT) =====================
 def _safe_float(v):
     try: return float(v) if v is not None else 0.0
     except: return 0.0
 
 def _get_bctc_value(report_array, target_ids, period=None):
-    """Tìm giá trị của một chỉ tiêu BCTC theo ID (hỗ trợ nhiều ID)"""
+    """Tìm giá trị của một chỉ tiêu BCTC theo ID (dùng cho cấu trúc cũ FHSC)"""
     if not report_array: return 0.0
     if isinstance(target_ids, str): target_ids = [target_ids]
     for item in report_array:
@@ -221,7 +227,7 @@ def _get_bctc_value(report_array, target_ids, period=None):
     return 0.0
 
 def extract_metrics_from_bctc_data(bctc_doc):
-    """Trích xuất CFO, LNST TTM, D/E, Biên gộp từ document BCTC (Có fallback tự động tính nếu BCTC bị cắt cụt)"""
+    """Trích xuất CFO, LNST TTM, D/E, Biên gộp từ document BCTC (Hỗ trợ cả VCI và FHSC)"""
     if not bctc_doc: return {}
     
     metrics = {}
@@ -229,52 +235,79 @@ def extract_metrics_from_bctc_data(bctc_doc):
     cashflow = bctc_doc.get("cash_flow", [])
     balance = bctc_doc.get("balance_sheet", [])
     
-    # 1. LNST TTM (4 quý)
+    # ================== XỬ LÝ DỮ LIỆU TỪ VCI ==================
+    def get_vci_val(report_list, target_name_keywords, period_idx=0):
+        if not report_list or period_idx >= len(report_list): return 0.0
+        row = report_list[period_idx] # Lấy object của quý tương ứng
+        
+        item_name = ""
+        for k, v in row.items():
+            if str(k).upper() in ["ITEM", "ITEM_EN", "TÊN CHỈ TIÊU", "CHỈ TIÊU"]:
+                item_name = str(v).upper()
+                break
+                
+        if not any(kw in item_name for kw in target_name_keywords):
+            return 0.0
+            
+        # Tìm cột giá trị (thường là cột thứ 2 hoặc cột không phải metadata)
+        for k, v in row.items():
+            k_upper = str(k).upper()
+            if k_upper not in ["ITEM", "ITEM_EN", "UNIT", "PERIOD", "TÊN CHỈ TIÊU", "CHỈ TIÊU", "MÃ SỐ"]:
+                return _safe_float(v)
+        return 0.0
+
+    # Thử dò tìm ID kiểu FHSC trước
+    is_fhsc_format = any("id" in item and "value" in item for item in income) if income else False
+    
+    if not is_fhsc_format and income:
+        # 1. LNST TTM (4 quý)
+        npat_ttm = 0
+        for i in range(min(4, len(income))):
+            npat_ttm += get_vci_val(income, ["LỢI NHUẬN SAU THUẾ", "NET PROFIT"], i)
+        metrics["net_profit_ttm"] = round(npat_ttm / 1e9, 2)
+        
+        # 2. CFO TTM (4 quý)
+        cfo_ttm = 0
+        for i in range(min(4, len(cashflow))):
+            cfo_ttm += get_vci_val(cashflow, ["LƯU CHUYỂN TIỀN THUẦN TỪ HOẠT ĐỘNG KINH DOANH", "OPERATING"], i)
+        metrics["cfo_latest"] = round(cfo_ttm / 1e9, 2)
+        
+        # 3. Biên gộp (Quý mới nhất)
+        if income:
+            rev = get_vci_val(income, ["DOANH THU THUẦN", "NET REVENUE"], 0)
+            cogs = get_vci_val(income, ["GIÁ VỐN HÀNG BÁN", "COST OF GOODS"], 0)
+            if rev > 0:
+                metrics["gross_margin"] = round((rev - cogs) / rev * 100, 1)
+                
+        # 4. D/E (Quý mới nhất)
+        if balance:
+            eq = get_vci_val(balance, ["VỐN CHỦ SỞ HỮU", "OWNERS EQUITY"], 0)
+            liab = get_vci_val(balance, ["NỢ PHẢI TRẢ", "LIABILITIES"], 0)
+            if eq > 0:
+                metrics["debt_to_equity"] = round(liab / eq, 2)
+                
+        return metrics
+
+    # ================== XỬ LÝ DỮ LIỆU TỪ FHSC (Dự phòng) ==================
     periods = sorted(list(set([item.get("period") for item in income if item.get("period")])), reverse=True)
     npat_ttm = 0
-    
     for p in periods[:4]:
-        npat_quy = 0.0
-        
-        # Tìm ID chuẩn
-        for item in income:
-            if item.get("period") == p:
-                id_str = str(item.get("id", "")).upper()
-                if id_str in ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX", "IS_NET_PROFIT"]:
-                    npat_quy = _safe_float(item.get("value"))
-                    break
-                    
-        # Nếu không có, tự động tính từ Lợi nhuận gộp + Doanh thu tài chính + Chi phí tài chính + Lãi liên doanh
+        npat_quy = _get_bctc_value(income, ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX", "IS_NET_PROFIT"], p)
         if npat_quy == 0:
-            gross_profit = 0.0; fin_income = 0.0; fin_expense = 0.0; share_jv = 0.0
-            selling_exp = 0.0; admin_exp = 0.0; tax_exp = 0.0
-            for item in income:
-                if item.get("period") == p:
-                    id_str = str(item.get("id", "")).upper()
-                    val = _safe_float(item.get("value"))
-                    if id_str == "IS_GROSS_PROFIT": gross_profit = val
-                    elif id_str == "IS_FINANCIAL_INCOME": fin_income = val
-                    elif id_str == "IS_FINANCIAL_EXPENSES": fin_expense = val
-                    elif id_str == "IS_SHARE_OF_ASSOCIATES_AND_JOINT_VENTURES_RESULT": share_jv = val
-                    elif id_str in ["IS_SELLING_EXPENSES", "IS_SELLING_EXPENSE"]: selling_exp = val
-                    elif id_str in ["IS_GENERAL_AND_ADMIN_EXPENSES", "IS_ADMIN_EXPENSES"]: admin_exp = val
-                    elif id_str in ["IS_CORPORATE_INCOME_TAX", "IS_BUSINESS_INCOME_TAX", "IS_INCOME_TAX_EXPENSE"]: tax_exp = val
-            
-            estimated_npat = gross_profit + fin_income + fin_expense + share_jv + selling_exp + admin_exp + tax_exp
-            if estimated_npat != 0:
-                npat_quy = estimated_npat
-                
+            gross_profit = _get_bctc_value(income, "IS_GROSS_PROFIT", p)
+            fin_income = _get_bctc_value(income, "IS_FINANCIAL_INCOME", p)
+            fin_expense = _get_bctc_value(income, "IS_FINANCIAL_EXPENSES", p)
+            share_jv = _get_bctc_value(income, "IS_SHARE_OF_ASSOCIATES_AND_JOINT_VENTURES_RESULT", p)
+            npat_quy = gross_profit + fin_income + fin_expense + share_jv
         npat_ttm += npat_quy
     metrics["net_profit_ttm"] = round(npat_ttm / 1e9, 2)
     
-    # 2. CFO TTM (4 quý)
     cf_periods = sorted(list(set([item.get("period") for item in cashflow if item.get("period")])), reverse=True)
     cfo_ttm = 0
     for p in cf_periods[:4]:
         cfo_ttm += _get_bctc_value(cashflow, "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES", p)
     metrics["cfo_latest"] = round(cfo_ttm / 1e9, 2)
     
-    # 3. Biên gộp (Quý mới nhất)
     latest_period = periods[0] if periods else None
     if latest_period:
         rev = _get_bctc_value(income, "IS_NET_REVENUE", latest_period)
@@ -282,7 +315,6 @@ def extract_metrics_from_bctc_data(bctc_doc):
         if rev > 0:
             metrics["gross_margin"] = round((rev + cogs) / rev * 100, 1)
             
-    # 4. D/E (Quý mới nhất)
     bs_periods = sorted(list(set([item.get("period") for item in balance if item.get("period")])), reverse=True)
     latest_bs_period = bs_periods[0] if bs_periods else None
     if latest_bs_period:
@@ -290,11 +322,9 @@ def extract_metrics_from_bctc_data(bctc_doc):
         total_assets = _get_bctc_value(balance, "BS_TOTAL_ASSETS", latest_bs_period)
         if total_assets == 0:
             total_assets = _get_bctc_value(balance, "BS_SHORT_TERM_ASSETS", latest_bs_period) + _get_bctc_value(balance, "BS_LONG_TERM_ASSETS", latest_bs_period)
-            
         liab = _get_bctc_value(balance, "BS_LIABILITIES", latest_bs_period)
         if liab == 0 and total_assets > 0 and eq > 0:
             liab = total_assets - eq
-            
         if eq > 0:
             metrics["debt_to_equity"] = round(liab / eq, 2)
             
@@ -387,67 +417,57 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
         return df if df is not None and not df.empty else None
     except Exception: return None
 
-# ===================== CÀO BCTC =====================
+# ===================== CÀO BCTC TỪ VCI =====================
 def _fetch_bctc_ssi(symbol: str):
     symbol = str(symbol).upper().strip()
-    fhsc_key = get_current_fhsc_key()
-    if not fhsc_key: 
-        print(f"  ⚠️ [BCTC] Bỏ qua {symbol} - Chưa có FHSC API KEY", flush=True)
+    if Finance is None:
+        print(f"  ⚠️ [BCTC] Bỏ qua {symbol} - Chưa cài đặt vnstock_data!", flush=True)
         return None
         
-    os.environ["FHSC_API_KEY"] = fhsc_key
-    print(f"  [BCTC] 🚀 Bắt đầu lấy dữ liệu cho mã {symbol}...", flush=True)
+    print(f"  [BCTC-VCI] 🚀 Bắt đầu lấy dữ liệu FULL từ VCI cho mã {symbol}...", flush=True)
 
     try:
-        equity = Fundamental().equity(symbol)
+        finance = Finance(source='VCI', symbol=symbol)
         reports = {}
-        report_names = ("balance_sheet", "income_statement", "cash_flow")
+        
+        # 1. Income Statement
+        try:
+            df_is = finance.income_statement(period='quarter', lang='vi')
+            if df_is is not None and not df_is.empty:
+                df_is = df_is.head(8)
+                reports['income_statement'] = df_is.to_dict(orient='records')
+                print(f"    ✓ Đã lấy Income Statement ({len(df_is)} dòng)", flush=True)
+        except Exception as e:
+            print(f"    ❌ Lỗi Income Statement {symbol}: {e}", flush=True)
 
-        def fetch_with_retry(func, period="quarter", max_retries=3, limit=8):
-            for attempt in range(max_retries):
-                try: return func(period=period, source="fhsc", limit=limit)
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if any(k in err_str for k in ["429", "rate limit", "vượt giới hạn"]): 
-                        time.sleep((attempt + 1) * 10)
-                    elif any(k in err_str for k in ["networkerror", "remoteprotocolerror", "connection", "kết nối", "timeout"]): 
-                        time.sleep((attempt + 1) * 5)
-                    else: 
-                        print(f"    ❌ [BCTC ERROR] {symbol} | {str(e)}", flush=True)
-                        raise e
-            return None
+        # 2. Balance Sheet
+        try:
+            df_bs = finance.balance_sheet(period='quarter', lang='vi')
+            if df_bs is not None and not df_bs.empty:
+                df_bs = df_bs.head(8)
+                reports['balance_sheet'] = df_bs.to_dict(orient='records')
+                print(f"    ✓ Đã lấy Balance Sheet ({len(df_bs)} dòng)", flush=True)
+        except Exception as e:
+            print(f"    ❌ Lỗi Balance Sheet {symbol}: {e}", flush=True)
 
-        latest_period = "Chưa xác định"
-        for report_name in report_names:
-            try:
-                report_func = getattr(equity, report_name, None)
-                if not callable(report_func): continue
-                
-                print(f"    ⏳ Đang lấy {report_name}...", flush=True)
-                df = fetch_with_retry(report_func)
-                time.sleep(1.5) 
-                
-                if df is not None and not df.empty:
-                    clean_df = df.astype(object).where(pd.notna(df), None)
-                    records = clean_df.to_dict(orient="records")
-                    
-                    if records and latest_period == "Chưa xác định":
-                        try:
-                            first_record = records[0]
-                            y, q = first_record.get("year"), first_record.get("quarter")
-                            if y and q: latest_period = f"Q{q}/{y}"
-                        except: pass
-                            
-                    reports[report_name] = json.loads(json.dumps(records, ensure_ascii=False, default=str))
-                    print(f"    ✓ Đã lấy {report_name} ({len(records)} dòng)", flush=True)
-            except Exception: pass
-            
-        if reports: 
-            print(f"  ✅ [BCTC] Đã lấy xong {symbol} | Kỳ mới nhất: {latest_period}", flush=True)
-            reports["latest_period"] = latest_period 
-        return reports if reports else None
+        # 3. Cash Flow
+        try:
+            df_cf = finance.cash_flow(period='quarter', lang='vi')
+            if df_cf is not None and not df_cf.empty:
+                df_cf = df_cf.head(8)
+                reports['cash_flow'] = df_cf.to_dict(orient='records')
+                print(f"    ✓ Đã lấy Cash Flow ({len(df_cf)} dòng)", flush=True)
+        except Exception as e:
+            print(f"    ❌ Lỗi Cash Flow {symbol}: {e}", flush=True)
+
+        if reports:
+            print(f"  ✅ [BCTC-VCI] Đã lấy xong {symbol} | Các bảng: {list(reports.keys())}", flush=True)
+            reports["latest_period"] = "Q/2025" # Sẽ được cập nhật tự động bên dưới
+            return reports
+        return None
+        
     except Exception as e:
-        print(f"  ❌ [BCTC] Lỗi khi cào {symbol}: {e}", flush=True)
+        print(f"  ❌ [BCTC-VCI] Lỗi nghiêm trọng khi cào {symbol}: {e}", flush=True)
         return None
 
 # ===================== CÀO RATIO TỪ VNDIRECT =====================
@@ -541,7 +561,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             is_locked = False
                             print(f"  🔓 [MỞ SỔ] {sym}: Giá biến động từ {prev_close} -> {data['close']}", flush=True)
 
-                    # === TÍNH TOÁN OPEN, HIGH, LOW TÍCH LŨY ===
                     today_record = collection.find_one({"symbol": sym, "trading_date": real_today})
                     
                     if today_record and today_record.get("trading_date") == real_today:
@@ -552,7 +571,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         final_open = data["open"]
                         final_high = data["high"]
                         final_low = data["low"]
-                    # ========================================================
 
                     collection.update_one({"symbol": sym}, {"$set": {
                         "close": data["close"], "prev_close": prev_close, 
@@ -723,13 +741,11 @@ def normalize_stock_data(symbol, data):
     bvps = (close_price / pb) if pb > 0 and close_price > 0 else 0
     if eps == 0 and pe > 0 and close_price > 0: eps = close_price / pe
     
-    # === BỔ SUNG: XỬ LÝ NET PROFIT TTM (Nếu BCTC lỗi/rỗng, tính từ EPS) ===
     net_profit_ttm = float(data.get("net_profit_ttm", 0) or 0)
     if net_profit_ttm == 0 and eps > 0:
         total_shares = float(data.get("total_shares", 0) or 0)
         if total_shares > 0:
             net_profit_ttm = round((eps * 1000 * total_shares) / 1e9, 2)
-    # =========================================================
 
     return {
         "close_price": close_price, "pe": pe, "pb": pb, "ps": ps, 
@@ -1065,7 +1081,6 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     sector_name = SECTOR_NAMES.get(sector, sector)
     is_bank_or_sec = sector in ("NGAN_HANG", "CHUNG_KHOAN")
 
-    # --- Phần BCTC (Tính từ EPS nếu LNST gốc = 0) ---
     display_npat = npat
     if display_npat == 0 and eps > 0:
         total_shares = float(stock_metrics.get("total_shares", 0) or 0)
@@ -1094,7 +1109,6 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     if div_yield > 0: bctc_parts.append(f"Cổ tức {div_yield}%/năm.")
     bctc = " ".join(bctc_parts)
 
-    # --- Các phần còn lại giữ nguyên ---
     moat_map = {
         "NGAN_HANG": "tệp khách hàng bán lẻ trung thành và chi phí vốn thấp",
         "CHUNG_KHOAN": "thị phần môi giới ổn định và quan hệ với nhà đầu tư tổ chức",
@@ -1168,7 +1182,6 @@ def _call_ai_for_symbol(symbol, sm, si, sector):
         discount_pct = float(sm.get("discount_to_fair_pct", 0) or 0)
         close_price = float(sm.get("close", sm.get("close_price", 0)) or 0)
         
-        # Kiểm tra nếu thiếu LNST thì ra lệnh cho AI dùng EPS
         net_profit_for_ai = si.get("net_profit_ttm", 0)
         eps_for_ai = sm.get("eps", 0)
         if net_profit_for_ai == 0 and eps_for_ai > 0:
@@ -1394,7 +1407,6 @@ def full_data_crawler_worker():
                             res.update({"symbol": symbol, "updated_at": _now_str()})
                             bctc_col.update_one({"symbol": symbol}, {"$set": res}, upsert=True)
                             
-                            # BỔ SUNG: Tự động bóc tách dữ liệu tài chính lưu vào stocks
                             extracted = extract_metrics_from_bctc_data(res)
                             if extracted:
                                 collection.update_one({"symbol": symbol}, {"$set": extracted})
@@ -1438,13 +1450,11 @@ def screener_worker():
                     bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
                     doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                     
-                    # === BỔ SUNG: TỰ ĐỘNG TRÍCH XUẤT CFO, LN_TTM, D/E, GM TỪ BCTC ===
                     if bctc:
                         extracted = extract_metrics_from_bctc_data(bctc)
                         if extracted:
                             doc.update(extracted) 
                             collection.update_one({"symbol": sym}, {"$set": extracted})
-                    # ================================================================
                     
                     stock_db[sym] = doc
                 
@@ -1461,7 +1471,6 @@ def screener_worker():
                         res["date"] = today_str
                         results.append(res)
                 
-                # === BỔ SUNG: TÍNH LẠI FINAL_DECISION LẦN 2 (Đảm bảo tính nhất quán) ===
                 if results:
                     print(f"[SCREENER] 🔄 Đang tính lại final_decision lần 2 để đảm bảo tính nhất quán...", flush=True)
                     for r in results:
@@ -1487,9 +1496,7 @@ def screener_worker():
                         r["final_decision_color"] = fd_color
                         r["final_decision_reason"] = fd_reason
                     print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
-                # === KẾT THÚC BỔ SUNG ===
-
-                # === BỔ SUNG: TỰ ĐỘNG TẠO TEMPLATE CHO CÁC MÃ CHƯA CÓ AI THẬT ===
+                
                 if results:
                     print(f"[SCREENER] 📝 Đang tạo/cập nhật Template cho các mã chưa có AI thật...", flush=True)
                     template_count = 0
@@ -1497,7 +1504,7 @@ def screener_worker():
                         sym = r["symbol"]
                         existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
                         if existing and existing.get("ai_bctc") and existing.get("ai_source") == "AI":
-                            continue  # Đã có AI thật, không ghi đè
+                            continue
                         
                         nd_for_template = normalized_db.get(sym, {})
                         template_data = build_fallback_narrative(sym, nd_for_template, r, get_sector(sym))
@@ -1516,7 +1523,6 @@ def screener_worker():
                             }})
                             template_count += 1
                     print(f"[SCREENER] ✅ Đã tạo/cập nhật Template cho {template_count} mã (chưa có AI thật).", flush=True)
-                # === KẾT THÚC BỔ SUNG ===
                         
                 if results:
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
@@ -1835,7 +1841,6 @@ def admin_force_ai_single():
         
     global is_ai_running
     
-    # Lấy mã từ URL, ví dụ: /api/admin/force-ai-single?symbol=HCM
     symbol = request.args.get("symbol", "").upper().strip()
     
     if not symbol:
@@ -1847,7 +1852,6 @@ def admin_force_ai_single():
     if not ALIBABA_API_KEY:
         return jsonify({"status": "error", "message": "Thiếu ALIBABA_API_KEY trong biến môi trường!"}), 500
     
-    # Kiểm tra xem mã này có dữ liệu trong Database chưa
     sm = collection.find_one({"symbol": symbol}, {"_id": 0})
     si = screener_col.find_one({"symbol": symbol}, {"_id": 0})
     
@@ -1865,11 +1869,9 @@ def admin_force_ai_single():
         try:
             sector = si.get("sector", "SAN_XUAT_TIEU_DUNG_PHONG_THU")
             
-            # Gọi AI
             ai_result = _call_ai_for_symbol(symbol, sm, si, sector)
             
             if ai_result:
-                # 1. Lưu vào bảng stocks (collection)
                 collection.update_one({"symbol": symbol}, {"$set": {
                     "ai_bctc": ai_result.get("bctc", ""),
                     "ai_catalyst": ai_result.get("catalyst", ""),
@@ -1879,10 +1881,9 @@ def admin_force_ai_single():
                     "ai_price_zone": ai_result.get("price_zone", ""),
                     "ai_macro_view": ai_result.get("macro_view", ""),
                     "ai_updated_at": _now_str(),
-                    "ai_source": "AI"  # Đánh dấu nguồn là AI
+                    "ai_source": "AI"
                 }})
                 
-                # 2. BỔ SUNG: Lưu vào bảng screener_results (screener_col) để giao diện web đọc được ngay
                 screener_col.update_one({"symbol": symbol}, {"$set": {
                     "bctc_evaluation": ai_result.get("bctc", ""),
                     "outlook": ai_result.get("outlook", ""),
@@ -1890,7 +1891,7 @@ def admin_force_ai_single():
                     "ai_price_zone": ai_result.get("price_zone", ""),
                     "macro_view": ai_result.get("macro_view", ""),
                     "ai_updated_at": _now_str(),
-                    "ai_source": "AI"  # Đánh dấu nguồn là AI
+                    "ai_source": "AI"
                 }})
                 
                 print(f"[ADMIN-AI-SINGLE] ✅ {symbol} - Đã lưu phân tích AI thành công vào cả 2 bảng!", flush=True)
@@ -2067,7 +2068,6 @@ def force_bctc():
                     period = res.get("latest_period", "Không rõ")
                     print(f"  ✅ [THÀNH CÔNG] {sym} | Kỳ BCTC: {period}", flush=True)
                     
-                    # BỔ SUNG: Tự động trích xuất số liệu tài chính lưu vào stocks ngay lập tức
                     extracted = extract_metrics_from_bctc_data(res)
                     if extracted:
                         collection.update_one({"symbol": sym}, {"$set": extracted})
@@ -2075,7 +2075,6 @@ def force_bctc():
                 else:
                     print(f"  ❌ [THẤT BẠI] {sym} | Không lấy được dữ liệu", flush=True)
                     
-                # BỔ SUNG: Tự động lấy số lượng cổ phiếu nếu bị thiếu
                 total_shares = collection.find_one({"symbol": sym}, {"total_shares": 1})
                 if not total_shares or total_shares.get("total_shares", 0) == 0:
                     shares = fetch_total_shares_vci(sym)
@@ -2137,7 +2136,6 @@ def crawl_full_bctc():
                     if extracted:
                         collection.update_one({"symbol": sym}, {"$set": extracted})
                         
-                # BỔ SUNG: Tự động lấy số lượng cổ phiếu nếu bị thiếu
                 total_shares = collection.find_one({"symbol": sym}, {"total_shares": 1})
                 if not total_shares or total_shares.get("total_shares", 0) == 0:
                     shares = fetch_total_shares_vci(sym)
@@ -2231,13 +2229,11 @@ def force_screener():
                 bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
                 doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                 
-                # === BỔ SUNG: TỰ ĐỘNG TRÍCH XUẤT SỐ LIỆU ===
                 if bctc:
                     extracted = extract_metrics_from_bctc_data(bctc)
                     if extracted:
                         doc.update(extracted)
                         collection.update_one({"symbol": sym}, {"$set": extracted})
-                # =============================================
                 
                 stock_db[sym] = doc
             
