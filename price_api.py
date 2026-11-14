@@ -1358,6 +1358,15 @@ def _call_ai_for_symbol(symbol, sm, si, sector):
         discount_pct = float(sm.get("discount_to_fair_pct", 0) or 0)
         close_price = float(sm.get("close", sm.get("close_price", 0)) or 0)
         
+        # === BỔ SUNG: QUY ĐỔI RA VNĐ ĐỂ AI HIỂU ĐÚNG ĐƠN VỊ ===
+        # Nếu giá < 1000 (tức là đang ở đơn vị Nghìn VNĐ), tự động nhân 1000
+        if close_price > 0 and close_price < 1000:
+            close_price *= 1000
+        if fair_low > 0 and fair_low < 1000:
+            fair_low *= 1000
+        if fair_high > 0 and fair_high < 1000:
+            fair_high *= 1000
+
         prompt = f"""Bạn là Chuyên gia Phân tích Đầu tư Giá trị (Value Investing) với 20 năm kinh nghiệm tại các quỹ lớn ở Việt Nam.
 
 NHIỆM VỤ: Diễn giải dữ liệu đã tính sẵn cho mã {symbol}. KHÔNG được bịa số liệu. Mọi con số phải TRÍCH DẪN TRỰC TIẾP từ khối DỮ KIỆN bên dưới.
@@ -1374,6 +1383,7 @@ NHIỆM VỤ: Diễn giải dữ liệu đã tính sẵn cho mã {symbol}. KHÔN
 TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ TỪ NÀO KHÁC.
 3. VỀ "ĐỊNH GIÁ & HÀNH ĐỘNG GIÁ" (outlook): Phải làm nổi bật "Biên an toàn" (Margin of Safety). Nếu giá đang trong vùng mua, phải kết luận rõ đây là cơ hội. Nếu giá đắt, phải nói rõ rủi ro.
 4. VỀ "VĨ MÔ & SÓNG NGÀNH" (macro_view): Phân tích dựa trên chu kỳ giá hàng hóa (đối với ngành Vật liệu/Phân bón/Hóa chất/Thép) hoặc chính sách vĩ mô (đối với Ngân hàng/BĐS). KHÔNG nói chung chung về VN-Index.
+5. VỀ ĐƠN VỊ: Giá cổ phiếu phải ghi rõ đơn vị là "VNĐ" (Ví dụ: 24.000 VNĐ, chứ không phải 24 VNĐ).
 
 --- ĐỊNH DẠNG: JSON THUẦN TÚY (KHÔNG ```json) ---
 {{
@@ -1381,7 +1391,7 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
   "catalyst": "3-4 câu. Economic Moat cụ thể + động lực tăng trưởng 2-3 năm.",
   "risks": "3 câu. Rủi ro trọng yếu nhất phù hợp ngành.",
   "valuation_verdict": "Copy nguyên văn: '{verdict}'",
-  "outlook": "4-5 câu. So sánh giá {close_price:,.0f} với vùng mua {fair_low:,.0f}-{fair_high:,.0f}. Giải thích quyết định '{final_decision}'. Nhấn mạnh biên an toàn {discount_pct:.1f}%.",
+  "outlook": "4-5 câu. So sánh giá {close_price:,.0f} VNĐ với vùng mua {fair_low:,.0f} VNĐ - {fair_high:,.0f} VNĐ. Giải thích quyết định '{final_decision}'. Nhấn mạnh biên an toàn {discount_pct:.1f}%.",
   "recommendation": "BẮT BUỘC: '{rec_text}' — {rec_weight}",
   "macro_view": "4-5 câu. Phân tích chu kỳ hàng hóa hoặc vĩ mô tác động trực tiếp đến doanh nghiệp."
 }}"""
@@ -1405,16 +1415,16 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                     
                     parsed = json.loads(content)
                     
-                    # === SỬA TẠI ĐÂY: KHÔNG QUAN TÂM AI TRẢ VỀ GÌ, LUÔN GHI ĐÈ ===
+                    # === SỬA TẠI ĐÂY: LUÔN GHI ĐÈ PRICE_ZONE BẰNG SỐ CHUẨN TỪ HỆ THỐNG (ĐÃ NHÂN 1000) ===
                     if fair_low > 0 and fair_high > 0:
                         parsed["price_zone"] = (
-                            f"Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | "
-                            f"Giá hiện tại: {close_price:,.0f} | Verdict: {verdict}"
+                            f"Vùng mua: {fair_low:,.0f} VNĐ — {fair_high:,.0f} VNĐ | "
+                            f"Giá hiện tại: {close_price:,.0f} VNĐ | Verdict: {verdict}"
                         )
                     else:
                         parsed["price_zone"] = "Chưa đủ dữ liệu định giá (Cần cào lại BCTC/Chỉ số)"
 
-                    # Tương tự với khuyến nghị, đảm bảo nó luôn khớp với hệ thống
+                    # Kiểm tra khuyến nghị AI xem có tự đổi chữ không
                     ai_rec = parsed.get("recommendation", "").upper()
                     expected_rec = rec_text.upper()
                     if expected_rec not in ai_rec:
