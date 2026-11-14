@@ -889,20 +889,24 @@ def normalize_stock_data(symbol, data):
     pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
     
-    # BỔ SUNG: Nếu EPS trong DB vẫn đang là VND (vd: 3000), tự động chia 1000
+    # BỔ SUNG: Chuẩn hóa EPS về đơn vị Nghìn VNĐ
     if eps >= 1000:
         eps = eps / 1000.0
-        
+    # Nếu EPS quá lớn so với giá (VD: PDR eps=538 nhưng giá=11.5), tự động chia 1000
+    if close_price > 0 and eps > (close_price * 5): 
+        eps = eps / 1000.0
+        print(f"    [CẢNH BÁO] Đã sửa lỗi EPS cho {symbol} (chia 1000): {eps}", flush=True)
+
     bctc = data.get("bctc_history", [])
     profit_growth_yoy = float(bctc[0].get("profit_growth_yoy", 0)) if bctc else 0.0
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
     bvps = (close_price / pb) if pb > 0 and close_price > 0 else 0
     if eps == 0 and pe > 0 and close_price > 0: eps = close_price / pe
+    
     return {"close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
             "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
             "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
             "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy}
-
 def compute_sector_medians(normalized_db):
     buckets = {}
     for symbol, nd in normalized_db.items():
@@ -944,30 +948,31 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     if not is_financial and npat > 0 and cfo > 0 and (cfo / npat) >= 0.8 and eps > 0 and med_pe > 0: 
         methods["CFO_boost"] = round(eps * min(med_pe, cap_pe) * 1.10, 0)
     
-    # PS_METHOD (Bổ sung từ script cũ)
     if config.get("primary_metric") == "PB" and ps > 0 and med_ps > 0:
         sales_per_share = close / ps if ps > 0 else 0
         target_ps = min(med_ps, 2.5)
         if sales_per_share > 0:
             methods["PS_method"] = round(sales_per_share * target_ps, 0)
-    
-    # IN LOG RA ĐỂ KIỂM TRA (Bạn xem log Render sẽ thấy)
-    print(f"    [DEBUG FAIR VALUE] {symbol}: Giá={close}, EPS={eps}, BVPS={bvps}, Các PP={methods}", flush=True)
+            
+    # BỔ SUNG: LỌC BỎ CÁC PHƯƠNG PHÁP VÔ LÝ (Cao hơn 3 lần hoặc thấp hơn 0.2 lần giá hiện tại)
+    valid_methods = {}
+    for k, v in methods.items():
+        if v > 0 and close > 0:
+            if (v / close) >= 0.2 and (v / close) <= 3.0:
+                valid_methods[k] = v
+            else:
+                print(f"    [CẢNH BÁO] Loại bỏ PP {k} của {symbol} do lệch quá lớn: {v} (Giá hiện tại: {close})", flush=True)
 
-    if not methods: 
+    if not valid_methods: 
         return {"fair_low": 0, "fair_high": 0, "graham": 0, "methods": {}, "mos_pct": round(mos * 100, 1), "rationale": "Không đủ DL.", "discount_to_fair_pct": 0, "verdict": "KHÔNG ĐỦ DỮ LIỆU"}
     
     weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1.5, "PS_method": 1}
     weighted = []
-    for k, v in methods.items(): weighted.extend([v] * int(weights.get(k, 1) * 2))
+    for k, v in valid_methods.items(): weighted.extend([v] * int(weights.get(k, 1) * 2))
     weighted.sort()
     n = len(weighted)
     fair_high = weighted[n // 2] if n % 2 else (weighted[n // 2 - 1] + weighted[n // 2]) / 2
     
-    # Đảm bảo fair_high và fair_low không bị âm hoặc bằng 0
-    if fair_high <= 0:
-        fair_high = close * 1.2
-
     fair_low = fair_high * (1 - mos)
     discount_to_fair = ((fair_low - close) / close * 100) if close > 0 else 0.0
     verdict = "KHÔNG CÓ GIÁ" if close <= 0 else ("RẺ - TRONG VÙNG MUA" if close <= fair_low else ("HỢP LÝ - CHỜ ĐIỀU CHỈNH" if close <= fair_high else ("HƠI ĐẮT - KHÔNG MUA" if close <= fair_high * 1.2 else "ĐẮT - TRÁNH")))
@@ -975,8 +980,8 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     return {
         "fair_low": round(fair_low, 0), 
         "fair_high": round(fair_high, 0), 
-        "graham": round(methods.get("Graham", 0), 0), 
-        "methods": {k: round(v, 0) for k, v in methods.items()}, 
+        "graham": round(valid_methods.get("Graham", 0), 0), 
+        "methods": {k: round(v, 0) for k, v in valid_methods.items()}, 
         "mos_pct": round(mos * 100, 1), 
         "rationale": f"[{group_label}]", 
         "discount_to_fair_pct": round(discount_to_fair, 1), 
