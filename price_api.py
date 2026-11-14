@@ -1264,54 +1264,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config, tech_
         "margin_of_safety_pct": fv["mos_pct"], "fair_value_methods": fv["methods"], "fair_value_rationale": fv["rationale"],
         "discount_to_fair_pct": fv["discount_to_fair_pct"], "valuation_verdict": fv["verdict"], "final_decision": decision,
         "final_decision_color": color, "final_decision_reason": reason,
-        "sim_annual_rate": sim_data["annual_rate_percent"] if sim_data else 15.0,
-        "sim_start_quarter": sim_data["start_quarter"] if sim_data else "", "sim_start_price": sim_data["start_price_mean"] if sim_data else 0,
-        "sim_end_quarter": sim_data["end_quarter"] if sim_data else "", "sim_end_price": sim_data["end_price_mean"] if sim_data else 0,
-        "company_name": meta.get("company_name", ""), "market_cap": meta.get("market_cap", 0), "total_shares": meta.get("total_shares", 0),
-        "data_warnings": data_warnings, "is_data_incomplete": is_data_incomplete,
-        "bctc_evaluation": ai_data["bctc"], "outlook": ai_data["outlook"],
-        "ai_recommendation": ai_data["recommendation"], "ai_price_zone": ai_data["price_zone"],
-        "macro_view": ai_data["macro_view"], "ai_updated_at": ai_data["ai_updated_at"], "ai_source": ai_data["ai_source"]
-    }
-    
-    if not has_real_ai:
-        metrics_for_template = {
-            **nd,
-            "fair_value_low": fv["fair_low"],
-            "fair_value_high": fv["fair_high"],
-            "valuation_verdict": fv["verdict"],
-            "discount_to_fair_pct": fv["discount_to_fair_pct"],
-            "margin_of_safety_pct": fv["mos_pct"]
-        }
-        
-        temp_template = build_fallback_narrative(symbol, metrics_for_template, {
-            "fundamental_score": fund_score, 
-            "valuation_score": val_score, 
-            "total_score": total_score,
-            "profit_growth_yoy": profit_growth_yoy, 
-            "final_decision": decision
-        }, sector)
-        
-        ai_data["bctc"] = temp_template.get("bctc", "")
-        ai_data["catalyst"] = temp_template.get("catalyst", "")
-        ai_data["risks"] = temp_template.get("risks", "")
-        ai_data["outlook"] = temp_template.get("outlook", "")
-        ai_data["recommendation"] = temp_template.get("recommendation", "")
-        ai_data["price_zone"] = temp_template.get("price_zone", "")
-        ai_data["macro_view"] = temp_template.get("macro_view", "")
-        ai_data["ai_source"] = "TEMPLATE"
-
-    return {
-        # ĐÃ BỎ "ps": ps KHỎI RETURN
-        "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb,
-        "roe": roe, "roa": roa, "eps": round(nd["eps"], 0), "bvps": round(nd["bvps"], 0), "dividend_yield": nd["dividend_yield"], "profit_growth_yoy": profit_growth_yoy,
-        "cfo_latest": cfo_latest, "net_profit_ttm": net_profit_ttm, "debt_to_equity": debt_to_equity, "gross_margin": nd["gross_margin"],
-        "fundamental_score": fund_score, "valuation_score": val_score, "technical_score": tech_score, "total_score": total_score,
-        "potential_zone": potential_zone, "pattern": pattern, "technical_status": tech_status,
-        "fundamental_notes": " | ".join(fund_notes), "fair_value_high": fv["fair_high"], "fair_value_low": fv["fair_low"], "graham_number": fv["graham"],
-        "margin_of_safety_pct": fv["mos_pct"], "fair_value_methods": fv["methods"], "fair_value_rationale": fv["rationale"],
-        "discount_to_fair_pct": fv["discount_to_fair_pct"], "valuation_verdict": fv["verdict"], "final_decision": decision,
-        "final_decision_color": color, "final_decision_reason": reason,
         
         "sim_annual_rate": sim_data["annual_rate_percent"] if sim_data else 15.0,
         "sim_start_quarter": sim_data["start_quarter"] if sim_data else "",
