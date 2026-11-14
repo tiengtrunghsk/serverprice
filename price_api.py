@@ -1628,6 +1628,9 @@ def auto_crawler_worker():
     Có timeout fallback: nếu quá 10h mà holiday_checker chưa check xong 
     (VD: thread bị chết) → tự check lấy để tránh treo.
     
+    Có auto-reset is_holiday_paused khi sang ngày mới — tránh treo vĩnh viễn
+    nếu holiday_checker_worker crash giữa chừng sau khi set is_holiday_paused = True.
+    
     Logic:
     - Cuối tuần: ngủ
     - Ngoài 9h-15h05: ngủ
@@ -1643,6 +1646,23 @@ def auto_crawler_worker():
     while True:
         try:
             global is_auto_crawl_paused
+            
+            # ══════════════════════════════════════════════════════════════
+            # FIX BUG 1: Auto-reset is_holiday_paused khi sang ngày mới
+            # Tránh trường hợp holiday_checker_worker crash sau khi set
+            # is_holiday_paused = True → auto_crawler_worker treo vĩnh viễn
+            # ══════════════════════════════════════════════════════════════
+            vn_now_check = datetime.utcnow() + timedelta(hours=7)
+            today_check = vn_now_check.strftime("%Y-%m-%d")
+            with holiday_check_lock:
+                if holiday_detected_date and holiday_detected_date != today_check:
+                    if is_holiday_paused:
+                        print(f"🔧 [AUTO] Auto-reset is_holiday_paused (đã sang ngày {today_check}, tránh treo nếu holiday_checker crash)", flush=True)
+                        is_holiday_paused = False
+                    # Reset cả state holiday để check lại ngày mới
+                    holiday_status = None
+                    holiday_checked_today = None
+                    holiday_detected_date = None
             
             # User pause HOẶC holiday pause → đều tạm dừng
             if is_auto_crawl_paused or is_holiday_paused:
@@ -2060,7 +2080,14 @@ def home():
 @app.get("/api/status")
 def api_status():
     print("[API] 📊 Gọi API /api/status", flush=True)
-    return jsonify({"status": "success", "is_crawling": is_crawling, "is_paused": is_auto_crawl_paused, "message": "Đang cào real-time" if is_crawling else "Sẵn sàng"})
+    return jsonify({
+        "status": "success", 
+        "is_crawling": is_crawling, 
+        "is_paused": is_auto_crawl_paused,
+        "is_holiday_paused": is_holiday_paused,
+        "holiday_status": holiday_status,
+        "message": "Đang cào real-time" if is_crawling else "Sẵn sàng"
+    })
 
 @app.get("/api/pause-crawl")
 def pause_crawl():
