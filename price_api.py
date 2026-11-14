@@ -16,7 +16,7 @@ import requests
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
 from flask_compress import Compress
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from pymongo.errors import PyMongoError
 
 # ===================== LOGGING CHẨN ĐOÁN =====================
@@ -1131,9 +1131,8 @@ def compute_final_decision(fund_score, tech_score, val_score, total_score, verdi
     if (verdict == "RẺ - TRONG VÙNG MUA" and fund_score >= 30 and val_score < 18): return ("⏳ CHỜ ĐỊNH GIÁ TỐT HƠN", "amber", "Định giá chưa hấp dẫn.")
     return ("👀 THEO DÕI", "slate", "Chưa đủ ĐK.")
 
-def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
+def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config, tech_score_raw=50, tech_status="Tích lũy", pattern="Tích lũy", existing_ai_data=None):
     sector = get_sector(symbol)
-    # ĐÃ BỎ PS Ở ĐÂY
     pe, pb, roe, roa = nd["pe"], nd["pb"], nd["roe"], nd["roa"]
     close_price, cfo_latest, net_profit_ttm = nd["close_price"], nd["cfo_latest"], nd["net_profit_ttm"]
     debt_to_equity, profit_growth_yoy, credit_growth_yoy = nd["debt_to_equity"], nd["profit_growth_yoy"], nd["credit_growth_yoy"]
@@ -1197,7 +1196,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         fund_score += 5
     fund_score = int(np.clip(fund_score, 0, 50))
 
-    # ĐÃ BỎ PS TRONG PHẦN TÍNH ĐIỂM ĐỊNH GIÁ
     val_score = 0
     if sector == "BAT_DONG_SAN":
         if 0 < pb < 1.5: val_score = 30
@@ -1221,18 +1219,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         else: val_score = 8
     val_score = int(np.clip(val_score, 0, 30))
 
-    tech_score_raw, tech_status, pattern = 50, "Tích lũy", "Tích lũy"
-    if ProfessionalTechnicalAnalyzer:
-        hist_data = history_col.find_one({"symbol": symbol})
-        if hist_data and hist_data.get("history_d1"):
-            try:
-                analyzer = ProfessionalTechnicalAnalyzer(hist_data["history_d1"]) 
-                ptkt_res = analyzer.analyze()
-                tech_score_raw = ptkt_res.get("technical_score", 50)
-                tech_status = ptkt_res.get("technical_status", "Tích lũy")
-                pattern = ptkt_res.get("pattern", "Tích lũy")
-            except Exception as e: pass
-
     tech_score = int(np.clip(int(round((tech_score_raw / 100.0) * 20)), 0, 20))
     total_score = fund_score + val_score + tech_score
     potential_zone = "VÙNG TÍCH SẢN TỐI ƯU (A+)" if total_score >= 75 else ("VÙNG MUA AN TOÀN (B)" if total_score >= 60 else "THEO DÕI THÊM")
@@ -1241,34 +1227,52 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     decision, color, reason = compute_final_decision(fund_score, tech_score, val_score, total_score, fv["verdict"], cfo_latest, net_profit_ttm, roe, debt_to_equity, fv["discount_to_fair_pct"], close_price, fv["fair_high"], fv["fair_low"])
 
     sim_data = get_historical_return_rate_with_details(symbol)
-    
     meta = VN100_METADATA.get(symbol, {})
 
-    # Chỉ dùng template nếu chưa có AI thật
-    stock_doc = collection.find_one({"symbol": symbol}, {
-        "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1, 
-        "ai_outlook": 1, "ai_recommendation": 1, "ai_price_zone": 1,
-        "ai_updated_at": 1, "ai_source": 1
-    })
-    
-    ai_data = {
-        "bctc": "", "catalyst": "", "risks": "", "outlook": "", 
-        "recommendation": "", "price_zone": "", "macro_view": "", 
-        "ai_updated_at": "Chưa phân tích", "ai_source": ""
+    ai_data = existing_ai_data or {
+        "bctc": "", "catalyst": "", "risks": "", "outlook": "", "recommendation": "", 
+        "price_zone": "", "macro_view": "", "ai_updated_at": "Chưa phân tích", "ai_source": ""
     }
     
-    has_real_ai = bool(stock_doc and stock_doc.get("ai_bctc") and len(stock_doc.get("ai_bctc", "")) > 100)
+    has_real_ai = bool(ai_data.get("bctc") and len(ai_data.get("bctc", "")) > 100)
     
-    if has_real_ai:
-        ai_data["bctc"] = stock_doc.get("ai_bctc", "")
-        ai_data["catalyst"] = stock_doc.get("ai_catalyst", "")
-        ai_data["risks"] = stock_doc.get("ai_risks", "")
-        ai_data["macro_view"] = stock_doc.get("ai_macro_view", "")
-        ai_data["outlook"] = stock_doc.get("ai_outlook", "")
-        ai_data["recommendation"] = stock_doc.get("ai_recommendation", "")
-        ai_data["price_zone"] = stock_doc.get("ai_price_zone", "")
-        ai_data["ai_updated_at"] = stock_doc.get("ai_updated_at", "Chưa phân tích")
-        ai_data["ai_source"] = stock_doc.get("ai_source", "AI")
+    if not has_real_ai:
+        metrics_for_template = {
+            **nd, "fair_value_low": fv["fair_low"], "fair_value_high": fv["fair_high"],
+            "valuation_verdict": fv["verdict"], "discount_to_fair_pct": fv["discount_to_fair_pct"],
+            "margin_of_safety_pct": fv["mos_pct"]
+        }
+        temp_template = build_fallback_narrative(symbol, metrics_for_template, {
+            "fundamental_score": fund_score, "valuation_score": val_score, "total_score": total_score,
+            "profit_growth_yoy": profit_growth_yoy, "final_decision": decision
+        }, sector)
+        
+        ai_data.update({
+            "bctc": temp_template.get("bctc", ""), "catalyst": temp_template.get("catalyst", ""),
+            "risks": temp_template.get("risks", ""), "outlook": temp_template.get("outlook", ""),
+            "recommendation": temp_template.get("recommendation", ""), "price_zone": temp_template.get("price_zone", ""),
+            "macro_view": temp_template.get("macro_view", ""), "ai_source": "TEMPLATE"
+        })
+
+    return {
+        "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb,
+        "roe": roe, "roa": roa, "eps": round(nd["eps"], 0), "bvps": round(nd["bvps"], 0), "dividend_yield": nd["dividend_yield"], "profit_growth_yoy": profit_growth_yoy,
+        "cfo_latest": cfo_latest, "net_profit_ttm": net_profit_ttm, "debt_to_equity": debt_to_equity, "gross_margin": nd["gross_margin"],
+        "fundamental_score": fund_score, "valuation_score": val_score, "technical_score": tech_score, "total_score": total_score,
+        "potential_zone": potential_zone, "pattern": pattern, "technical_status": tech_status,
+        "fundamental_notes": " | ".join(fund_notes), "fair_value_high": fv["fair_high"], "fair_value_low": fv["fair_low"], "graham_number": fv["graham"],
+        "margin_of_safety_pct": fv["mos_pct"], "fair_value_methods": fv["methods"], "fair_value_rationale": fv["rationale"],
+        "discount_to_fair_pct": fv["discount_to_fair_pct"], "valuation_verdict": fv["verdict"], "final_decision": decision,
+        "final_decision_color": color, "final_decision_reason": reason,
+        "sim_annual_rate": sim_data["annual_rate_percent"] if sim_data else 15.0,
+        "sim_start_quarter": sim_data["start_quarter"] if sim_data else "", "sim_start_price": sim_data["start_price_mean"] if sim_data else 0,
+        "sim_end_quarter": sim_data["end_quarter"] if sim_data else "", "sim_end_price": sim_data["end_price_mean"] if sim_data else 0,
+        "company_name": meta.get("company_name", ""), "market_cap": meta.get("market_cap", 0), "total_shares": meta.get("total_shares", 0),
+        "data_warnings": data_warnings, "is_data_incomplete": is_data_incomplete,
+        "bctc_evaluation": ai_data["bctc"], "outlook": ai_data["outlook"],
+        "ai_recommendation": ai_data["recommendation"], "ai_price_zone": ai_data["price_zone"],
+        "macro_view": ai_data["macro_view"], "ai_updated_at": ai_data["ai_updated_at"], "ai_source": ai_data["ai_source"]
+    }
     
     if not has_real_ai:
         metrics_for_template = {
@@ -1892,7 +1896,6 @@ def full_data_crawler_worker():
 def screener_worker():
     while True:
         try:
-            # FIX BUG #1 + #4: Nếu API force-screener đang chạy → nhường
             if is_screener_running:
                 time.sleep(30)
                 continue
@@ -1906,7 +1909,6 @@ def screener_worker():
             crawled_count = collection.count_documents({"chot_so_today": today_str})
             
             is_1630 = (current_hour == 16 and vn_now.minute == 30 and vn_now.second < 10)
-            
             is_after_close = (current_hour > 15) or (current_hour == 15 and current_minute >= 5)
             is_just_closed = (is_after_close and crawled_count >= all_symbols_count and all_symbols_count > 0)
 
@@ -1918,33 +1920,45 @@ def screener_worker():
 
                 print(f"\n[SCREENER] ⏰ Kích hoạt chấm điểm (Lý do: {'16h30' if is_1630 else 'Vừa chốt sổ sau 15h05'})", flush=True)
                 
+                # TỐI ƯU: Preload toàn bộ dữ liệu vào RAM
+                print("[SCREENER] ⚡ Đang tải trước toàn bộ dữ liệu (Stocks, BCTC, History)...", flush=True)
+                all_stocks = list(collection.find({}))
+                all_bctc = {doc["symbol"]: doc for doc in bctc_col.find({})}
+                all_hist = {doc["symbol"]: doc for doc in history_col.find({}, {"symbol": 1, "history_d1": 1})}
+                
                 stock_db = {}
-                print("[SCREENER] 📥 Đang nạp dữ liệu BCTC để tính toán các chỉ số...", flush=True)
-                for doc in collection.find({}):
+                bulk_updates = []
+                
+                print("[SCREENER] 🧠 Đang xử lý dữ liệu trong RAM...", flush=True)
+                for doc in all_stocks:
                     sym = doc["symbol"]
-                    bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
+                    bctc = all_bctc.get(sym)
                     doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                     
                     if bctc:
                         extracted = extract_metrics_from_bctc_data(bctc)
                         if extracted:
-                            doc.update(extracted) 
-                            collection.update_one({"symbol": sym}, {"$set": extracted})
+                            doc.update(extracted)
+                            bulk_updates.append(UpdateOne({"symbol": sym}, {"$set": extracted}))
                     
                     stock_db[sym] = doc
-                
-                # FIX BUG #5: Ghi update_fields từ normalize (tách khỏi hàm normalize)
+
+                if bulk_updates:
+                    collection.bulk_write(bulk_updates)
+                    print(f"[SCREENER] ✅ Đã bulk update metrics cho {len(bulk_updates)} mã.", flush=True)
+
                 normalized_db = {}
+                norm_bulk_updates = []
                 for s, r in stock_db.items():
                     nd = normalize_stock_data(s, r)
                     update_fields = nd.pop("_update_fields", {})
                     if update_fields:
-                        try:
-                            collection.update_one({"symbol": s}, {"$set": update_fields})
-                        except Exception:
-                            pass
+                        norm_bulk_updates.append(UpdateOne({"symbol": s}, {"$set": update_fields}))
                     normalized_db[s] = nd
                 
+                if norm_bulk_updates:
+                    collection.bulk_write(norm_bulk_updates)
+
                 sector_medians = compute_sector_medians(normalized_db)
                 results = []
                 
@@ -1952,7 +1966,32 @@ def screener_worker():
                     grp = get_sub_sector(symbol)
                     cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(symbol))
                     med, _ = get_median_for_symbol(symbol, sector_medians)
-                    res = evaluate_stock_from_db(symbol, nd, med, grp, cfg)
+                    
+                    hist_doc = all_hist.get(symbol)
+                    tech_score_raw, tech_status, pattern = 50, "Tích lũy", "Tích lũy"
+                    if ProfessionalTechnicalAnalyzer and hist_doc and hist_doc.get("history_d1"):
+                        try:
+                            analyzer = ProfessionalTechnicalAnalyzer(hist_doc["history_d1"]) 
+                            ptkt_res = analyzer.analyze()
+                            tech_score_raw = ptkt_res.get("technical_score", 50)
+                            tech_status = ptkt_res.get("technical_status", "Tích lũy")
+                            pattern = ptkt_res.get("pattern", "Tích lũy")
+                        except Exception: pass
+                        
+                    stock_doc = stock_db.get(symbol, {})
+                    existing_ai = {
+                        "bctc": stock_doc.get("ai_bctc", ""), "catalyst": stock_doc.get("ai_catalyst", ""),
+                        "risks": stock_doc.get("ai_risks", ""), "macro_view": stock_doc.get("ai_macro_view", ""),
+                        "outlook": stock_doc.get("ai_outlook", ""), "recommendation": stock_doc.get("ai_recommendation", ""),
+                        "price_zone": stock_doc.get("ai_price_zone", ""), "ai_updated_at": stock_doc.get("ai_updated_at", "Chưa phân tích"),
+                        "ai_source": stock_doc.get("ai_source", "AI")
+                    }
+
+                    res = evaluate_stock_from_db(
+                        symbol, nd, med, grp, cfg, 
+                        tech_score_raw=tech_score_raw, tech_status=tech_status, pattern=pattern, 
+                        existing_ai_data=existing_ai
+                    )
                     if res: 
                         res["date"] = today_str
                         results.append(res)
@@ -1988,7 +2027,7 @@ def screener_worker():
                     template_count = 0
                     for r in results:
                         sym = r["symbol"]
-                        existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
+                        existing = stock_db.get(sym, {})
                         
                         if existing and existing.get("ai_bctc") and len(existing.get("ai_bctc")) > 100:
                             continue
@@ -2017,7 +2056,7 @@ def screener_worker():
                     protected_count = 0
                     for r in results:
                         sym = r["symbol"]
-                        existing_stock = collection.find_one({"symbol": sym})
+                        existing_stock = stock_db.get(sym, {})
                         if existing_stock and existing_stock.get("ai_bctc") and len(existing_stock.get("ai_bctc")) > 100:
                             r["bctc_evaluation"] = existing_stock.get("ai_bctc", "")
                             r["outlook"] = existing_stock.get("ai_outlook", "")
@@ -2028,7 +2067,6 @@ def screener_worker():
                             r["ai_source"] = existing_stock.get("ai_source", "AI")
                             protected_count += 1
                     
-                    # FIX BUG #1: Ghi AN TOÀN qua lock + collection tạm
                     if _safe_replace_screener_results(results, tag="worker"):
                         commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Update Screener {_now_str()}")
                         print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã (Bảo vệ AI cho {protected_count} mã).", flush=True)
@@ -2037,17 +2075,13 @@ def screener_worker():
 
                     try:
                         up_count = 0; down_count = 0; ref_count = 0
-                        buy_strong = 0; buy_accumulate = 0; avoid = 0
                         strong_movers = []; value_stocks = []; danger_stocks = []
                         missing_price_count = 0; missing_pe_count = 0; missing_pb_count = 0; missing_roe_count = 0
                         missing_pe_symbols = []; missing_pb_symbols = []; missing_roe_symbols = []; missing_price_symbols = []
 
                         for r in results:
                             decision = r.get("final_decision", "")
-                            if "MUA MẠNH" in decision: buy_strong += 1
-                            elif "MUA TÍCH SẢN" in decision: buy_accumulate += 1
-                            elif "TRÁNH" in decision: 
-                                avoid += 1
+                            if "TRÁNH" in decision: 
                                 if len(danger_stocks) < 3:
                                     danger_stocks.append(f"  • {r['symbol']} (Điểm: {r.get('total_score', 0)})")
 
@@ -2097,10 +2131,7 @@ def screener_worker():
                             data_alert_lines.append(f"  • <b>{missing_price_count} mã</b> bị thiếu Giá (Lỗi cào giá){sample}")
 
                         total_up_down = up_count + down_count
-                        if total_up_down > 0:
-                            ratio_up = (up_count / total_up_down) * 100
-                        else:
-                            ratio_up = 50
+                        ratio_up = (up_count / total_up_down) * 100 if total_up_down > 0 else 50
 
                         if ratio_up >= 65:
                             market_view = "🟢 <b>TÂM LÝ HƯNG PHẤN:</b> Dòng tiền lan tỏa mạnh, ưu tiên nắm giữ cổ phiếu."
@@ -2142,7 +2173,7 @@ def screener_worker():
 
                         msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
                         msg_lines.append(f"<b>4️⃣ CẢNH BÁO RỦI RO</b>")
-                        msg_lines.append(f"  ❌ Có <b>{avoid}</b> mã bị đánh giá TRÁNH (Giá đắt, nền tảng yếu).")
+                        msg_lines.append(f"  ❌ Có <b>{len(danger_stocks)}</b> mã bị đánh giá TRÁNH (Giá đắt, nền tảng yếu).")
                         if danger_stocks:
                              msg_lines.append(f"  ⚠️ <i>Điển hình: {', '.join(danger_stocks).replace('  • ', '')}</i>")
 
@@ -2156,7 +2187,6 @@ def screener_worker():
         except Exception as e: 
             print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
             time.sleep(60)
-
 
 # ===================== START WORKERS =====================
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
@@ -2781,36 +2811,49 @@ def force_screener():
         return jsonify({"status": "error", "message": "Screener đang chạy (worker hoặc API khác), vui lòng đợi!"}), 400
         
     is_screener_running = True
-    print(f"[SCREENER] 🚀 Bắt đầu chấm điểm lại toàn bộ...", flush=True)
+    print(f"[SCREENER] 🚀 Bắt đầu chấm điểm lại toàn bộ (Chế độ tối ưu)...", flush=True)
     
     def _run():
         global is_screener_running
         try:
+            today_str = _vn_now().strftime("%Y-%m-%d")
+            
+            # TỐI ƯU: Preload dữ liệu
+            print("[SCREENER] ⚡ Đang tải trước toàn bộ dữ liệu...", flush=True)
+            all_stocks = list(collection.find({}))
+            all_bctc = {doc["symbol"]: doc for doc in bctc_col.find({})}
+            all_hist = {doc["symbol"]: doc for doc in history_col.find({}, {"symbol": 1, "history_d1": 1})}
+            
             stock_db = {}
-            for doc in collection.find({}):
+            bulk_updates = []
+            
+            for doc in all_stocks:
                 sym = doc["symbol"]
-                bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
+                bctc = all_bctc.get(sym)
                 doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                 
                 if bctc:
                     extracted = extract_metrics_from_bctc_data(bctc)
                     if extracted:
                         doc.update(extracted)
-                        collection.update_one({"symbol": sym}, {"$set": extracted})
+                        bulk_updates.append(UpdateOne({"symbol": sym}, {"$set": extracted}))
                 
                 stock_db[sym] = doc
-            
-            # FIX BUG #5: Ghi update_fields riêng
+
+            if bulk_updates:
+                collection.bulk_write(bulk_updates)
+
             norm_db = {}
+            norm_bulk_updates = []
             for s, r in stock_db.items():
                 nd = normalize_stock_data(s, r)
                 update_fields = nd.pop("_update_fields", {})
                 if update_fields:
-                    try:
-                        collection.update_one({"symbol": s}, {"$set": update_fields})
-                    except Exception:
-                        pass
+                    norm_bulk_updates.append(UpdateOne({"symbol": s}, {"$set": update_fields}))
                 norm_db[s] = nd
+            
+            if norm_bulk_updates:
+                collection.bulk_write(norm_bulk_updates)
             
             medians = compute_sector_medians(norm_db)
             results = []
@@ -2819,14 +2862,41 @@ def force_screener():
                 grp = get_sub_sector(sym)
                 cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(sym))
                 med, _ = get_median_for_symbol(sym, medians)
-                res = evaluate_stock_from_db(sym, nd, med, grp, cfg)
-                if res: results.append(res)
+                
+                hist_doc = all_hist.get(sym)
+                tech_score_raw, tech_status, pattern = 50, "Tích lũy", "Tích lũy"
+                if ProfessionalTechnicalAnalyzer and hist_doc and hist_doc.get("history_d1"):
+                    try:
+                        analyzer = ProfessionalTechnicalAnalyzer(hist_doc["history_d1"]) 
+                        ptkt_res = analyzer.analyze()
+                        tech_score_raw = ptkt_res.get("technical_score", 50)
+                        tech_status = ptkt_res.get("technical_status", "Tích lũy")
+                        pattern = ptkt_res.get("pattern", "Tích lũy")
+                    except Exception: pass
+                    
+                stock_doc = stock_db.get(sym, {})
+                existing_ai = {
+                    "bctc": stock_doc.get("ai_bctc", ""), "catalyst": stock_doc.get("ai_catalyst", ""),
+                    "risks": stock_doc.get("ai_risks", ""), "macro_view": stock_doc.get("ai_macro_view", ""),
+                    "outlook": stock_doc.get("ai_outlook", ""), "recommendation": stock_doc.get("ai_recommendation", ""),
+                    "price_zone": stock_doc.get("ai_price_zone", ""), "ai_updated_at": stock_doc.get("ai_updated_at", "Chưa phân tích"),
+                    "ai_source": stock_doc.get("ai_source", "AI")
+                }
+                
+                res = evaluate_stock_from_db(
+                    sym, nd, med, grp, cfg, 
+                    tech_score_raw=tech_score_raw, tech_status=tech_status, pattern=pattern, 
+                    existing_ai_data=existing_ai
+                )
+                if res: 
+                    res["date"] = today_str
+                    results.append(res)
             
             if results:
                 results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
                 
                 for r in results:
-                    existing_stock = collection.find_one({"symbol": r["symbol"]})
+                    existing_stock = stock_db.get(r["symbol"], {})
                     if existing_stock and existing_stock.get("ai_bctc") and len(existing_stock.get("ai_bctc")) > 100:
                         r["bctc_evaluation"] = existing_stock.get("ai_bctc", "")
                         r["outlook"] = existing_stock.get("ai_outlook", "")
@@ -2836,7 +2906,6 @@ def force_screener():
                         r["ai_updated_at"] = existing_stock.get("ai_updated_at", "")
                         r["ai_source"] = existing_stock.get("ai_source", "AI")
 
-                # FIX BUG #1: Ghi AN TOÀN qua lock + collection tạm
                 if _safe_replace_screener_results(results, tag="force-api"):
                     commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Force Screener {_now_str()}")
                     print(f"[SCREENER] ✅ Đã chấm điểm xong {len(results)} mã (Đã bảo vệ bài AI cũ).", flush=True)
@@ -2848,7 +2917,7 @@ def force_screener():
             is_screener_running = False
             
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
+    return jsonify({"status": "success", "message": "Đang chấm điểm lại (tối ưu)..."})
 
 
 @app.get("/api/force-realtime")
