@@ -9,13 +9,13 @@ import logging
 import numpy as np
 import pandas as pd
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Set
 
 import requests
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
-from flask_compress import Compress          # ← THÊM DÒNG NÀY
+from flask_compress import Compress
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
@@ -28,7 +28,7 @@ if not logger.handlers:
         "[%(asctime)s] %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
-    _formatter.converter = lambda ts: (datetime.utcfromtimestamp(ts) + timedelta(hours=7)).timetuple()
+    _formatter.converter = lambda ts: (datetime.fromtimestamp(ts, tz=timezone.utc) + timedelta(hours=7)).timetuple()
     _handler.setFormatter(_formatter)
     logger.addHandler(_handler)
 logger.propagate = False
@@ -36,7 +36,7 @@ logger.propagate = False
 def log_exception(context: str, exc: Exception):
     logger.error("%s | %s: %s", context, type(exc).__name__, str(exc), exc_info=True)
 
-# ===================== VNSTOCK THẾ HỆ 6 =====================
+# ===================== VNSTOCK =====================
 from vnstock import Market
 
 try:
@@ -81,15 +81,13 @@ ALIBABA_API_KEY = os.environ.get("ALIBABA_API_KEY", "").strip()
 AI_API_URL = "https://ws-8lcqaxwxdv0h9xzy.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
 AI_MODEL_NAME = os.environ.get("AI_MODEL_NAME", "qwen3.7-max-2026-06-08")
 AI_TEMPERATURE = 0.15
-# ===================== DANH SÁCH MÃ THANH KHOẢN (DÙNG ĐỂ CHECK NGÀY LỄ) =====================
-# Top 15 mã thanh khoản cao nhất VN — luôn khớp ATO ngay từ 9h15
+
 LIQUID_SYMBOLS_TOP = [
     "VNM", "VCB", "VIC", "VHM", "HPG", 
     "FPT", "MWG", "TCB", "VPB", "ACB",
     "BID", "CTG", "MSN", "GAS", "PLX"
 ]
 
-# Top 30 mã mid-cap thanh khoản tốt — dùng để verify nếu top 15 không khớp
 LIQUID_SYMBOLS_MID = [
     "SSI", "VND", "HCM", "VCI", "MBS",
     "STB", "SHB", "TPB", "MBB", "HDB",
@@ -99,7 +97,6 @@ LIQUID_SYMBOLS_MID = [
     "KDH", "NLG", "DXG", "CEO", "PDR"
 ]
 
-# ===================== ĐỌC METADATA TỪ FILE JSON =====================
 VN100_METADATA = {}
 if os.path.exists(VN100_INFO_FILE):
     try:
@@ -148,17 +145,14 @@ except Exception as e:
     sys.exit(1)
 
 # ===================== APP =====================
-# ===================== APP =====================
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
-# Bật nén GZIP (giảm 70-80% dung lượng truyền đi)
 Compress(app)
 app.config['COMPRESS_MIMETYPES'] = ['application/json', 'text/html', 'text/css', 'text/javascript']
 app.config['COMPRESS_LEVEL'] = 6
 app.config['COMPRESS_MIN_SIZE'] = 500
 
-# === BIẾN TRẠNG THÁI ===
 # === BIẾN TRẠNG THÁI ===
 is_crawling = False
 is_full_data_running = False
@@ -168,37 +162,42 @@ LAST_TELEGRAM_TIME = 0
 stop_crawl_requested = False
 is_auto_crawl_paused = False
 
-# === BIẾN CHO HOLIDAY CHECKER (THREAD RIÊNG) ===
+# FIX BUG #1: Lock chống race giữa screener_worker và /api/force-screener
+screener_lock = threading.Lock()
+
+# === BIẾN CHO HOLIDAY CHECKER ===
 holiday_checked_today = None
 holiday_status = None
 holiday_detected_date = None
 holiday_check_lock = threading.Lock()
 is_holiday_paused = False
 
-# === CACHE CHO /api/history-all (60 giây) ===
+# === CACHE CHO /api/history-all ===
 _history_cache = {"data": None, "timestamp": 0, "lock": threading.Lock()}
-HISTORY_CACHE_TTL = 60  # giây           # ← THÊM DÒNG NÀY
+HISTORY_CACHE_TTL = 60
+
 def get_current_fhsc_key():
     setting = settings_col.find_one({"_id": "fhsc_key"})
     if setting and setting.get("value"): return setting["value"]
     return ENV_FHSC_API_KEY
 
 # ===================== HELPERS =====================
+# FIX BUG #7: Dùng timezone-aware datetime thay vì utcnow() deprecated
+def _vn_now() -> datetime:
+    """Trả về datetime hiện tại theo giờ VN (UTC+7), timezone-aware."""
+    return datetime.now(timezone.utc) + timedelta(hours=7)
+
 def _now_str() -> str:
-    return (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
+    return _vn_now().strftime("%d/%m/%Y %H:%M:%S")
 
 def _get_trading_date_str() -> str:
-    vn_now = datetime.utcnow() + timedelta(hours=7)
+    vn_now = _vn_now()
     if vn_now.hour < 9: vn_now -= timedelta(days=1)
     while vn_now.weekday() >= 5: vn_now -= timedelta(days=1)
     return vn_now.strftime("%Y-%m-%d")
 
 def _is_after_15h() -> bool:
-    """
-    Trả về True nếu đã qua 15h05 — thời điểm an toàn để chốt sổ.
-    Đã dời từ 15h00 -> 15h05 để tránh delay dữ liệu ATC từ API.
-    """
-    vn_now = datetime.utcnow() + timedelta(hours=7)
+    vn_now = _vn_now()
     return vn_now.hour > 15 or (vn_now.hour == 15 and vn_now.minute >= 5)
 
 def send_telegram(message: str):
@@ -208,7 +207,70 @@ def send_telegram(message: str):
     try: requests.post(url, json=payload, timeout=10)
     except Exception as e: log_exception("[TELEGRAM]", e)
 
-# ===================== HÀM TÍNH CAGR & GIÁ TRUNG BÌNH QUÝ (5 NĂM) =====================
+# ═══════════════════════════════════════════════════════════════
+# FIX BUG #1 + #2: Helper ghi screener an toàn + invalidate cache
+# ═══════════════════════════════════════════════════════════════
+def _safe_replace_screener_results(results: list, tag: str = "") -> bool:
+    """
+    Ghi đè screener_col AN TOÀN (chống race condition).
+    - Acquire screener_lock
+    - Ghi vào collection tạm
+    - Delete collection chính (khoảng trống rất ngắn)
+    - Copy từ tạm sang chính
+    - Drop collection tạm
+    - Invalidate _history_cache (FIX BUG #2)
+    """
+    global _history_cache
+    
+    if not results:
+        logger.warning("[SAFE-SCREENER] Danh sách rỗng, bỏ qua ghi đè.")
+        return False
+    
+    acquired = screener_lock.acquire(timeout=120)
+    if not acquired:
+        logger.error("[SAFE-SCREENER] Không lấy được lock sau 120s, hủy ghi đè.")
+        return False
+    
+    tmp_col = None
+    try:
+        tmp_name = f"screener_results_tmp_{int(time.time())}"
+        tmp_col = db[tmp_name]
+        
+        tmp_col.insert_many(results)
+        logger.info("[SAFE-SCREENER] Đã ghi tạm %d mã vào %s", len(results), tmp_name)
+        
+        screener_col.delete_many({})
+        
+        tmp_docs = list(tmp_col.find({}, {"_id": 0}))
+        if tmp_docs:
+            screener_col.insert_many(tmp_docs)
+        
+        logger.info(
+            "[SAFE-SCREENER] Đã chuyển %d mã sang collection chính%s",
+            len(tmp_docs),
+            f" ({tag})" if tag else ""
+        )
+        
+        # FIX BUG #2: Invalidate history cache
+        with _history_cache["lock"]:
+            _history_cache["data"] = None
+            _history_cache["timestamp"] = 0
+        
+        return True
+        
+    except Exception as e:
+        log_exception("[SAFE-SCREENER] Lỗi ghi screener", e)
+        return False
+        
+    finally:
+        if tmp_col is not None:
+            try:
+                tmp_col.drop()
+            except Exception:
+                pass
+        screener_lock.release()
+
+# ===================== CAGR 5 NĂM =====================
 def get_historical_return_rate_with_details(symbol):
     try:
         hist_data = history_col.find_one({"symbol": symbol})
@@ -248,15 +310,29 @@ def get_historical_return_rate_with_details(symbol):
         }
     except Exception as e: return None
 
-# ===================== HÀM BỔ SUNG: BÓC TÁCH DỮ LIỆU TÀI CHÍNH TỪ BCTC =====================
+# ===================== BÓC TÁCH BCTC =====================
 def _safe_float(v):
     try: return float(v) if v is not None else 0.0
     except: return 0.0
 
+# FIX BUG #3: Không return item đầu tiên khi period=None; ưu tiên kỳ mới nhất
 def _get_bctc_value(report_array, target_ids, period=None):
-    """Tìm giá trị của một chỉ tiêu BCTC theo ID (hỗ trợ nhiều ID)"""
+    """
+    Tìm giá trị của một chỉ tiêu BCTC theo ID.
+    FIX BUG #3: Nếu period=None → tự động lấy kỳ MỚI NHẤT (không lấy item đầu tiên).
+    """
     if not report_array: return 0.0
     if isinstance(target_ids, str): target_ids = [target_ids]
+    
+    # Nếu không chỉ định kỳ → tìm kỳ mới nhất
+    if period is None:
+        candidate_periods = sorted(
+            set(item.get("period") for item in report_array if item.get("period")),
+            reverse=True
+        )
+        if candidate_periods:
+            period = candidate_periods[0]
+    
     for item in report_array:
         if item.get("id") in target_ids:
             if period is None or item.get("period") == period:
@@ -264,7 +340,6 @@ def _get_bctc_value(report_array, target_ids, period=None):
     return 0.0
 
 def extract_metrics_from_bctc_data(bctc_doc):
-    """Trích xuất CFO, LNST TTM, D/E, Biên gộp từ document BCTC"""
     if not bctc_doc: return {}
     
     metrics = {}
@@ -382,7 +457,7 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
         return df if df is not None and not df.empty else None
     except Exception: return None
 
-# ===================== CÀO BCTC TRỰC TIẾP TỪ VCI =====================
+# ===================== CÀO BCTC VCI =====================
 def _fetch_bctc_ssi(symbol: str):
     symbol = str(symbol).upper().strip()
     if not symbol or not re.fullmatch(r"[A-Z0-9]{2,10}", symbol):
@@ -649,7 +724,7 @@ def _fetch_bctc_ssi(symbol: str):
         session.close()
 
 
-# ===================== CÀO RATIO TỪ VNDIRECT =====================
+# ===================== RATIO VNDIRECT =====================
 VNDIRECT_RATIOS = {
     "pe": "PRICE_TO_EARNINGS",
     "pb": "PRICE_TO_BOOK",
@@ -676,13 +751,9 @@ def get_vndirect_ratio(symbol, ratio_code):
         pass
     return None
 
-# ===================== CORE LOGIC CÀO =====================
+# ===================== CORE CRAWL =====================
+# FIX BUG #8: Preload documents 1 lần thay vì find_one 2 lần/symbol
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
-    """
-    Cào giá realtime. Từ 15h05 trở đi sẽ chốt sổ (ghi nến vào history_d1).
-    Dời từ 15h00 -> 15h05 để tránh delay dữ liệu ATC.
-    Tự động xoá cache /api/history-all sau khi cào xong.
-    """
     global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested, _history_cache
     
     if is_crawling: return
@@ -691,15 +762,24 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     
     print(f"\n[CRAWL] 🚀 [{'CÀO BÙ' if is_retry else ('CÀO TAY' if is_manual else 'REAL-TIME')}] Bắt đầu xử lý {len(symbols)} mã...", flush=True)
     try:
-        vn_now = datetime.utcnow() + timedelta(hours=7)
+        vn_now = _vn_now()
         real_today = vn_now.strftime("%Y-%m-%d")
         current_hour = vn_now.hour
         current_minute = vn_now.minute
 
-        # === ĐIỀU KIỆN CHỐT SỔ: sau 15h05 (thay vì 15h00) ===
         is_closing_time = (current_hour > 15) or (current_hour == 15 and current_minute >= 5)
 
         alert_batch, pending_history_files = [], {}
+
+        # FIX BUG #8: Preload tất cả documents cần thiết 1 lần
+        preloaded_docs = {doc["symbol"]: doc for doc in collection.find(
+            {"symbol": {"$in": symbols}}, 
+            {"symbol": 1, "close": 1, "is_locked": 1, "trading_date": 1, "open": 1, "high": 1, "low": 1}
+        )}
+        preloaded_history = {doc["symbol"]: doc for doc in history_col.find(
+            {"symbol": {"$in": symbols}}, 
+            {"symbol": 1, "history_d1": 1}
+        )}
 
         for chunk_idx in range(0, len(symbols), 5):
             if stop_crawl_requested:
@@ -710,11 +790,11 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
             for sym in chunk:
                 if stop_crawl_requested: break
                 
-                doc = collection.find_one({"symbol": sym})
+                doc = preloaded_docs.get(sym)
                 data = _fetch_one(sym)
                 
                 if data:
-                    hist_doc = history_col.find_one({"symbol": sym})
+                    hist_doc = preloaded_history.get(sym)
                     prev_close = 0.0
                     avg_vol_20 = 0.0
                     latest_history_date = None 
@@ -750,10 +830,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                             is_locked = False
                             print(f"  🔓 [MỞ SỔ] {sym}: Giá biến động từ {prev_close} -> {data['close']}", flush=True)
 
-                    # === TÍNH TOÁN OPEN, HIGH, LOW TÍCH LŨY ===
-                    today_record = collection.find_one({"symbol": sym, "trading_date": real_today})
+                    today_record = doc if (doc and doc.get("trading_date") == real_today) else None
                     
-                    if today_record and today_record.get("trading_date") == real_today:
+                    if today_record:
                         final_open = today_record.get("open", data["open"])
                         final_high = max(today_record.get("high", data["high"]), data["high"])
                         final_low = min(today_record.get("low", data["low"]), data["low"])
@@ -761,7 +840,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         final_open = data["open"]
                         final_high = data["high"]
                         final_low = data["low"]
-                    # ========================================================
 
                     collection.update_one({"symbol": sym}, {"$set": {
                         "close": data["close"], "prev_close": prev_close, 
@@ -782,7 +860,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
-                    # === CHỐT SỔ SAU 15H05 ===
                     if is_closing_time:
                         has_traded_today = (not is_locked) or (data.get("volume", 0) > 0)
                         
@@ -813,7 +890,6 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": _now_str()}}, upsert=True)
             time.sleep(1)
 
-        # ✅ XOÁ CACHE HISTORY để lần tải sau có dữ liệu mới nhất
         with _history_cache["lock"]:
             _history_cache["data"] = None
             _history_cache["timestamp"] = 0
@@ -924,7 +1000,12 @@ def get_sub_sector(symbol):
         if symbol in symbols: return sub
     return get_sector(symbol)
 
+# FIX BUG #5: normalize_stock_data không ghi DB, trả update_fields cho caller
 def normalize_stock_data(symbol, data):
+    """
+    Chuẩn hóa dữ liệu. KHÔNG ghi DB (fix bug #5).
+    Trả về dict normalized. Caller tự quyết định ghi DB nếu cần.
+    """
     close_price = float(data.get("close", data.get("close_price", 0)) or 0)
     pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
@@ -933,9 +1014,6 @@ def normalize_stock_data(symbol, data):
     ps_need_update = False
     update_fields = {}
 
-    # =========================================================
-    # 1. KIỂM TRA VÀ SỬA EPS (Lỗi: đồng VNĐ thay vì nghìn VNĐ)
-    # =========================================================
     if eps >= 1000:
         eps = eps / 1000.0
         eps_need_update = True
@@ -945,40 +1023,30 @@ def normalize_stock_data(symbol, data):
     if eps_need_update: 
         update_fields["eps"] = round(eps, 2)
 
-    # =========================================================
-    # 2. KIỂM TRA VÀ SỬA PS (Lỗi: doanh thu bị nhân 1000 lần)
-    # Điều kiện mới: PS < 0.2 (bao phủ cả PS âm và PS quá nhỏ)
-    # =========================================================
     if close_price > 0 and (ps <= 0 or ps < 0.2):
-        # Nếu PS âm hoặc quá nhỏ (< 0.2) → Lỗi doanh thu bị nhân 1000
         ps = ps * 1000.0
         ps_need_update = True
     if ps_need_update: 
         update_fields["ps"] = round(ps, 2)
 
-    # Ghi đè tất cả các trường bị lỗi vào DB 1 lần duy nhất
     if update_fields:
         print(f"    [CHUẨN HÓA] {symbol}: Sửa lỗi đơn vị {list(update_fields.keys())} -> {update_fields}", flush=True)
-        try:
-            collection.update_one({"symbol": symbol}, {"$set": update_fields})
-        except Exception:
-            pass
 
-    # =========================================================
-    
     bctc = data.get("bctc_history", [])
     profit_growth_yoy = float(bctc[0].get("profit_growth_yoy", 0)) if bctc else 0.0
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
     bvps = (close_price / pb) if pb > 0 and close_price > 0 else 0
     
-    # Nếu eps bị = 0 thì mới tính lại từ PE
     if eps == 0 and pe > 0 and close_price > 0: 
         eps = close_price / pe
     
-    return {"close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
-            "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
-            "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
-            "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy}
+    return {
+        "close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
+        "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
+        "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
+        "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy,
+        "_update_fields": update_fields  # Caller dùng để ghi DB nếu cần
+    }
 
 def compute_sector_medians(normalized_db):
     buckets = {}
@@ -1184,25 +1252,33 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     
     meta = VN100_METADATA.get(symbol, {})
 
+    # FIX BUG #6: Chỉ dùng template nếu chưa có AI thật
+    stock_doc = collection.find_one({"symbol": symbol}, {
+        "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1, 
+        "ai_outlook": 1, "ai_recommendation": 1, "ai_price_zone": 1,
+        "ai_updated_at": 1, "ai_source": 1
+    })
+    
     ai_data = {
         "bctc": "", "catalyst": "", "risks": "", "outlook": "", 
         "recommendation": "", "price_zone": "", "macro_view": "", 
         "ai_updated_at": "Chưa phân tích", "ai_source": ""
     }
     
-    stock_doc = collection.find_one({"symbol": symbol}, {
-        "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1, 
-        "ai_updated_at": 1, "ai_source": 1
-    })
+    has_real_ai = bool(stock_doc and stock_doc.get("ai_bctc") and len(stock_doc.get("ai_bctc", "")) > 100)
     
-    if stock_doc and stock_doc.get("ai_bctc"):
+    if has_real_ai:
         ai_data["bctc"] = stock_doc.get("ai_bctc", "")
         ai_data["catalyst"] = stock_doc.get("ai_catalyst", "")
         ai_data["risks"] = stock_doc.get("ai_risks", "")
         ai_data["macro_view"] = stock_doc.get("ai_macro_view", "")
+        ai_data["outlook"] = stock_doc.get("ai_outlook", "")
+        ai_data["recommendation"] = stock_doc.get("ai_recommendation", "")
+        ai_data["price_zone"] = stock_doc.get("ai_price_zone", "")
         ai_data["ai_updated_at"] = stock_doc.get("ai_updated_at", "Chưa phân tích")
         ai_data["ai_source"] = stock_doc.get("ai_source", "AI")
-        
+    
+    if not has_real_ai:
         metrics_for_template = {
             **nd,
             "fair_value_low": fv["fair_low"],
@@ -1220,9 +1296,14 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
             "final_decision": decision
         }, sector)
         
+        ai_data["bctc"] = temp_template.get("bctc", "")
+        ai_data["catalyst"] = temp_template.get("catalyst", "")
+        ai_data["risks"] = temp_template.get("risks", "")
         ai_data["outlook"] = temp_template.get("outlook", "")
         ai_data["recommendation"] = temp_template.get("recommendation", "")
         ai_data["price_zone"] = temp_template.get("price_zone", "")
+        ai_data["macro_view"] = temp_template.get("macro_view", "")
+        ai_data["ai_source"] = "TEMPLATE"
 
     return {
         "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
@@ -1508,21 +1589,9 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
     except Exception as e:
         print(f"  ❌ Lỗi nghiêm trọng ở _call_ai_for_symbol cho {symbol}: {e}", flush=True)
         return None
-# ===================== HOLIDAY CHECKER (THREAD RIÊNG) =====================
 
+# ===================== HOLIDAY CHECKER =====================
 def _check_holiday_smart_standalone(vn_now):
-    """
-    Check ngày lễ thông minh đa tầng (standalone, không phụ thuộc closure).
-    
-    Chiến lược:
-    - Tầng 1: 15 mã top thanh khoản — nếu ≥3 mã có volume > 0 → Ngày làm việc (99.9%)
-    - Tầng 2: Nếu top 15 không có volume nhưng có ≥3 mã biến động giá → Ngày làm việc (99%)
-    - Tầng 3: Check thêm 30 mã mid-cap — nếu có giao dịch → Ngày làm việc (95%)
-    - Tầng 4: Cả 45 mã đều không giao dịch → Ngày lễ (99.99%)
-    
-    Returns: tuple (is_holiday: bool, confidence: str, details: str)
-    """
-    # === TẦNG 1: Check 15 mã thanh khoản cao nhất ===
     top_with_volume = 0
     top_with_change = 0
     top_total = 0
@@ -1546,7 +1615,6 @@ def _check_holiday_smart_standalone(vn_now):
     if top_with_change >= 3:
         return (False, "99%", f"TOP: {top_with_change}/{top_total} mã có biến động giá (volume=0)")
     
-    # === TẦNG 3: Check thêm 30 mã mid-cap ===
     mid_with_volume = 0
     mid_with_change = 0
     mid_total = 0
@@ -1567,7 +1635,6 @@ def _check_holiday_smart_standalone(vn_now):
     if mid_with_volume >= 2 or mid_with_change >= 5:
         return (False, "95%", f"MID: {mid_with_volume}/{mid_total} mã volume>0, {mid_with_change}/{mid_total} mã biến động")
     
-    # === TẦNG 4: Cả 45 mã đều không giao dịch ===
     return (
         True,
         "99.99%",
@@ -1576,69 +1643,44 @@ def _check_holiday_smart_standalone(vn_now):
 
 
 def holiday_checker_worker():
-    """
-    Thread riêng để check ngày lễ lúc 9h30.
-    Độc lập hoàn toàn với auto_crawler_worker → không bị trễ khi crawler bận.
-    
-    Sử dụng biến RIÊNG is_holiday_paused — KHÔNG đụng is_auto_crawl_paused của user.
-    
-    Logic:
-    - Thức dậy mỗi 30s
-    - Chỉ check vào ngày làm việc (T2-T6), từ 9h30 trở đi
-    - Chỉ check 1 lần/ngày
-    - Nếu phát hiện ngày lễ:
-        * Set holiday_status = True, holiday_checked_today = today
-        * Set is_holiday_paused = True (KHÔNG đụng is_auto_crawl_paused)
-        * Ngủ tới 8h55 hôm sau
-        * Sáng hôm sau: tự reset is_holiday_paused = False
-    - Nếu ngày làm việc:
-        * Set holiday_status = False, holiday_checked_today = today
-        * Tiếp tục ngủ 60s/lần (không check lại)
-    """
     global holiday_checked_today, holiday_status, holiday_detected_date, is_holiday_paused
     
     print("🗓️ [HOLIDAY] Đã bật thread check ngày lễ (9h30 hàng ngày)!", flush=True)
     
     while True:
         try:
-            # Nếu USER pause toàn bộ hệ thống → tạm dừng check
-            # (KHÔNG check is_holiday_paused ở đây vì thread này tự quản lý biến đó)
             if is_auto_crawl_paused:
                 time.sleep(30)
                 continue
             
-            vn_now = datetime.utcnow() + timedelta(hours=7)
+            vn_now = _vn_now()
             today_str = vn_now.strftime("%Y-%m-%d")
             current_hour = vn_now.hour
             current_minute = vn_now.minute
             weekday = vn_now.weekday()
             
-            # Cuối tuần: không cần check, auto_crawler_worker tự xử lý
             if weekday >= 5:
                 time.sleep(60)
                 continue
             
-            # Ngoài giờ check (trước 9h30 hoặc sau 15h): ngủ
             is_after_930 = (current_hour > 9) or (current_hour == 9 and current_minute >= 30)
             is_before_15h = current_hour < 15
             if not (is_after_930 and is_before_15h):
                 time.sleep(30)
                 continue
             
-            # Đã check hôm nay rồi → ngủ tiếp
             with holiday_check_lock:
                 already_checked = (holiday_checked_today == today_str)
             
             if already_checked:
-                time.sleep(60)
+                # FIX BUG #9: Sleep dài hơn sau khi đã check (tránh spam log)
+                time.sleep(1800)
                 continue
             
-            # Đã đến giờ check và chưa check → tiến hành
             print(f"\n🗓️ [HOLIDAY] Check ngày lễ lúc {vn_now.strftime('%H:%M:%S')} (thread riêng)...", flush=True)
             
             is_holiday, confidence, details = _check_holiday_smart_standalone(vn_now)
             
-            # Ghi kết quả (dùng lock để tránh race condition)
             with holiday_check_lock:
                 holiday_checked_today = today_str
                 holiday_status = is_holiday
@@ -1650,10 +1692,8 @@ def holiday_checker_worker():
                 print(f"   Chi tiết: {details}", flush=True)
                 print(f"🌙 [HOLIDAY] Tạm dừng crawl tới 8h55 hôm sau...", flush=True)
                 
-                # SỬA: Dùng biến RIÊNG is_holiday_paused (KHÔNG đụng is_auto_crawl_paused của user)
                 is_holiday_paused = True
                 
-                # Ngủ tới 8h55 hôm sau
                 tomorrow = vn_now + timedelta(days=1)
                 while tomorrow.weekday() >= 5:
                     tomorrow += timedelta(days=1)
@@ -1661,37 +1701,21 @@ def holiday_checker_worker():
                 sleep_seconds = (wake_up_time - vn_now).total_seconds()
                 time.sleep(min(sleep_seconds, 3600))
                 
-                # Sáng hôm sau: tự mở lại (CHỈ biến is_holiday_paused, giữ nguyên is_auto_crawl_paused)
                 is_holiday_paused = False
                 print(f"☀️ [HOLIDAY] Đã hết thời gian nghỉ, tự mở lại hệ thống.", flush=True)
             else:
                 print(f"✅ [HOLIDAY] KẾT LUẬN: NGÀY LÀM VIỆC (Độ tin cậy {confidence})", flush=True)
                 print(f"   Chi tiết: {details}", flush=True)
-                time.sleep(60)
+                # FIX BUG #9: Sleep 1800s thay vì 60s (đã check xong)
+                time.sleep(1800)
                 
         except Exception as e:
             print(f"❌ [HOLIDAY] Lỗi: {e}", flush=True)
             time.sleep(30)
-# ===================== BACKGROUND WORKERS =====================
+
+
+# ===================== AUTO CRAWLER WORKER =====================
 def auto_crawler_worker():
-    """
-    Auto crawler — KHÔNG tự check ngày lễ.
-    Đọc kết quả từ holiday_checker_worker qua biến global holiday_status.
-    
-    Có timeout fallback: nếu quá 10h mà holiday_checker chưa check xong 
-    (VD: thread bị chết) → tự check lấy để tránh treo.
-    
-    Có auto-reset is_holiday_paused khi sang ngày mới — tránh treo vĩnh viễn
-    nếu holiday_checker_worker crash giữa chừng sau khi set is_holiday_paused = True.
-    
-    Logic:
-    - Cuối tuần: ngủ
-    - Ngoài 9h-15h05: ngủ
-    - is_auto_crawl_paused (user pause) HOẶC is_holiday_paused (holiday tự pause): ngủ
-    - holiday_status == True (ngày lễ): ngủ tới mai
-    - holiday_status == None + đã 9h30: chờ holiday_checker_worker (fallback lúc 10h)
-    - holiday_status == False: crawl bình thường
-    """
     global holiday_status, holiday_checked_today, holiday_detected_date, is_holiday_paused
     
     print("⏰ [AUTO] Đã bật chế độ cào Real-time (Đọc kết quả check lễ từ thread riêng)!", flush=True)
@@ -1700,35 +1724,27 @@ def auto_crawler_worker():
         try:
             global is_auto_crawl_paused
             
-            # ══════════════════════════════════════════════════════════════
-            # FIX BUG 1: Auto-reset is_holiday_paused khi sang ngày mới
-            # Tránh trường hợp holiday_checker_worker crash sau khi set
-            # is_holiday_paused = True → auto_crawler_worker treo vĩnh viễn
-            # ══════════════════════════════════════════════════════════════
-            vn_now_check = datetime.utcnow() + timedelta(hours=7)
+            vn_now_check = _vn_now()
             today_check = vn_now_check.strftime("%Y-%m-%d")
             with holiday_check_lock:
                 if holiday_detected_date and holiday_detected_date != today_check:
                     if is_holiday_paused:
-                        print(f"🔧 [AUTO] Auto-reset is_holiday_paused (đã sang ngày {today_check}, tránh treo nếu holiday_checker crash)", flush=True)
+                        print(f"🔧 [AUTO] Auto-reset is_holiday_paused (đã sang ngày {today_check})", flush=True)
                         is_holiday_paused = False
-                    # Reset cả state holiday để check lại ngày mới
                     holiday_status = None
                     holiday_checked_today = None
                     holiday_detected_date = None
             
-            # User pause HOẶC holiday pause → đều tạm dừng
             if is_auto_crawl_paused or is_holiday_paused:
                 time.sleep(10)
                 continue
 
-            vn_now = datetime.utcnow() + timedelta(hours=7)
+            vn_now = _vn_now()
             today_str = vn_now.strftime("%Y-%m-%d")
             current_hour = vn_now.hour
             current_minute = vn_now.minute
             weekday = vn_now.weekday()
 
-            # === XỬ LÝ CUỐI TUẦN ===
             is_weekend = weekday >= 5
             if is_weekend:
                 tomorrow = vn_now + timedelta(days=1)
@@ -1765,18 +1781,13 @@ def auto_crawler_worker():
                     time.sleep(min(sleep_seconds, 3600))
                     continue
 
-            # ══════════════════════════════════════════════════════════════
-            # ĐỌC KẾT QUẢ CHECK NGÀY LỄ TỪ GLOBAL
-            # ══════════════════════════════════════════════════════════════
             with holiday_check_lock:
                 current_holiday_status = holiday_status
                 current_holiday_checked_date = holiday_checked_today
             
             is_after_930 = (current_hour > 9) or (current_hour == 9 and current_minute >= 30)
             
-            # Nếu đã qua 9h30 và chưa check xong → chờ holiday_checker_worker
             if is_after_930 and current_holiday_checked_date != today_str:
-                # === TIMEOUT FALLBACK: nếu quá 10h mà vẫn chưa check → tự check ===
                 is_after_10h = (current_hour >= 10)
                 if is_after_10h:
                     print(f"⚠️ [AUTO] Quá 10h mà chưa có kết quả check lễ → TỰ CHECK (fallback).", flush=True)
@@ -1791,7 +1802,6 @@ def auto_crawler_worker():
                         if is_holiday:
                             print(f"🌙 [AUTO] Fallback: NGÀY LỄ (Độ tin cậy {confidence}): {details}", flush=True)
                             is_holiday_paused = True
-                            # Ngủ tới mai
                             tomorrow = vn_now + timedelta(days=1)
                             while tomorrow.weekday() >= 5:
                                 tomorrow += timedelta(days=1)
@@ -1811,15 +1821,11 @@ def auto_crawler_worker():
                     time.sleep(15)
                     continue
             
-            # Nếu phát hiện ngày lễ → ngủ (holiday_checker_worker đã set is_holiday_paused = True)
             if current_holiday_checked_date == today_str and current_holiday_status == True:
                 print(f"🌙 [AUTO] Hôm nay là ngày lễ (theo holiday_checker). Tạm nghỉ...", flush=True)
                 time.sleep(60)
                 continue
 
-            # ══════════════════════════════════════════════════════════════
-            # CRAWL BÌNH THƯỜNG (chỉ chạy khi không phải ngày lễ)
-            # ══════════════════════════════════════════════════════════════
             collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             crawled_count = collection.count_documents({"chot_so_today": today_str})
@@ -1849,14 +1855,16 @@ def auto_crawler_worker():
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
 
+
+# ===================== FULL DATA CRAWLER =====================
 def full_data_crawler_worker():
     while True:
         try:
-            vn_now = datetime.utcnow() + timedelta(hours=7)
+            vn_now = _vn_now()
             is_bctc_time = (0 <= vn_now.hour < 6 and vn_now.minute == 0 and vn_now.second < 10)
             if is_bctc_time:
                 target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-                thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+                thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
                 for symbol in target_symbols:
                     bctc_doc = bctc_col.find_one({"symbol": symbol}, {"updated_at": 1})
                     need = False
@@ -1880,15 +1888,17 @@ def full_data_crawler_worker():
             else: time.sleep(30)
         except Exception: time.sleep(60)
 
+
+# ===================== SCREENER WORKER =====================
 def screener_worker():
-    """
-    Screener worker: chấm điểm sau khi chốt sổ (15h05+).
-    Có cơ chế BẢO VỆ AI: Không bao giờ ghi đè bài AI thật bằng Template.
-    Đảm bảo bài AI được giữ nguyên ở cả bảng stocks (collection) và screener_results (screener_col).
-    """
     while True:
         try:
-            vn_now = datetime.utcnow() + timedelta(hours=7)
+            # FIX BUG #1 + #4: Nếu API force-screener đang chạy → nhường
+            if is_screener_running:
+                time.sleep(30)
+                continue
+            
+            vn_now = _vn_now()
             today_str = vn_now.strftime("%Y-%m-%d")
             current_hour = vn_now.hour
             current_minute = vn_now.minute
@@ -1898,7 +1908,6 @@ def screener_worker():
             
             is_1630 = (current_hour == 16 and vn_now.minute == 30 and vn_now.second < 10)
             
-            # Chỉ chấm điểm sau 15h05
             is_after_close = (current_hour > 15) or (current_hour == 15 and current_minute >= 5)
             is_just_closed = (is_after_close and crawled_count >= all_symbols_count and all_symbols_count > 0)
 
@@ -1925,7 +1934,18 @@ def screener_worker():
                     
                     stock_db[sym] = doc
                 
-                normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
+                # FIX BUG #5: Ghi update_fields từ normalize (tách khỏi hàm normalize)
+                normalized_db = {}
+                for s, r in stock_db.items():
+                    nd = normalize_stock_data(s, r)
+                    update_fields = nd.pop("_update_fields", {})
+                    if update_fields:
+                        try:
+                            collection.update_one({"symbol": s}, {"$set": update_fields})
+                        except Exception:
+                            pass
+                    normalized_db[s] = nd
+                
                 sector_medians = compute_sector_medians(normalized_db)
                 results = []
                 
@@ -1964,7 +1984,6 @@ def screener_worker():
                         r["final_decision_reason"] = fd_reason
                     print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
 
-                # === BẢO VỆ AI (BẢNG STOCKS): CHỈ TẠO TEMPLATE NẾU CHƯA CÓ BÀI VIẾT NÀO ===
                 if results:
                     print(f"[SCREENER] 📝 Đang kiểm tra và tạo Template cho các mã chưa có AI...", flush=True)
                     template_count = 0
@@ -1972,7 +1991,6 @@ def screener_worker():
                         sym = r["symbol"]
                         existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
                         
-                        # BẢO VỆ AI: Nếu đã có bất kỳ văn bản AI nào (dù nguồn là gì), KHÔNG GHI ĐÈ
                         if existing and existing.get("ai_bctc") and len(existing.get("ai_bctc")) > 100:
                             continue
                         
@@ -1997,13 +2015,11 @@ def screener_worker():
                 if results:
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
                     
-                    # === BẢO VỆ AI (BẢNG SCREENER_COL): GIỮ NGUYÊN BÀI AI TRƯỚC KHI GHI ĐÈ ===
                     protected_count = 0
                     for r in results:
                         sym = r["symbol"]
                         existing_stock = collection.find_one({"symbol": sym})
                         if existing_stock and existing_stock.get("ai_bctc") and len(existing_stock.get("ai_bctc")) > 100:
-                            # Đã có AI thật → copy sang kết quả mới để không bị Template đè
                             r["bctc_evaluation"] = existing_stock.get("ai_bctc", "")
                             r["outlook"] = existing_stock.get("ai_outlook", "")
                             r["ai_recommendation"] = existing_stock.get("ai_recommendation", "")
@@ -2013,10 +2029,12 @@ def screener_worker():
                             r["ai_source"] = existing_stock.get("ai_source", "AI")
                             protected_count += 1
                     
-                    screener_col.delete_many({}) 
-                    screener_col.insert_many(results) 
-                    commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Update Screener {_now_str()}")
-                    print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã (Bảo vệ AI cho {protected_count} mã).", flush=True)
+                    # FIX BUG #1: Ghi AN TOÀN qua lock + collection tạm
+                    if _safe_replace_screener_results(results, tag="worker"):
+                        commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Update Screener {_now_str()}")
+                        print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã (Bảo vệ AI cho {protected_count} mã).", flush=True)
+                    else:
+                        print(f"[SCREENER] ⚠️ Không ghi được kết quả (lock timeout), giữ dữ liệu cũ.", flush=True)
 
                     try:
                         up_count = 0; down_count = 0; ref_count = 0
@@ -2140,8 +2158,10 @@ def screener_worker():
             print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
             time.sleep(60)
 
+
+# ===================== START WORKERS =====================
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
-threading.Thread(target=holiday_checker_worker, daemon=True).start()  # ← MỚI
+threading.Thread(target=holiday_checker_worker, daemon=True).start()
 threading.Thread(target=full_data_crawler_worker, daemon=True).start()
 threading.Thread(target=screener_worker, daemon=True).start()
 
@@ -2150,6 +2170,7 @@ threading.Thread(target=screener_worker, daemon=True).start()
 def home(): 
     print("[API] 🏠 Gọi API trang chủ (/)", flush=True)
     return "API is running!", 200
+
 
 @app.get("/api/status")
 def api_status():
@@ -2163,6 +2184,7 @@ def api_status():
         "message": "Đang cào real-time" if is_crawling else "Sẵn sàng"
     })
 
+
 @app.get("/api/pause-crawl")
 def pause_crawl():
     global is_auto_crawl_paused, stop_crawl_requested
@@ -2171,41 +2193,43 @@ def pause_crawl():
     print("\n[API] ⏸️ Đã TẠM DỪNG hoàn toàn tiến trình cào tự động!", flush=True)
     return jsonify({"status": "success", "message": "Đã tạm dừng cào tự động."})
 
+
 @app.get("/api/resume-crawl")
 def resume_crawl():
     global is_auto_crawl_paused, stop_crawl_requested, holiday_status, holiday_checked_today, is_holiday_paused
     is_auto_crawl_paused = False
     stop_crawl_requested = False
     
-    # Reset trạng thái check lễ nếu user muốn override
     with holiday_check_lock:
         if holiday_status == True:
             print(f"\n[API] ⚠️ User override: Reset trạng thái ngày lễ. Hệ thống sẽ crawl lại.", flush=True)
             holiday_status = None
             holiday_checked_today = None
     
-    # Reset cả is_holiday_paused để auto_crawler_worker không bị treo
     if is_holiday_paused:
         print(f"\n[API] ⚠️ Reset is_holiday_paused (đang trong chế độ nghỉ lễ tự động).", flush=True)
         is_holiday_paused = False
     
     print("\n[API] ▶️ Đã TIẾP TỤC tiến trình cào tự động!", flush=True)
     return jsonify({"status": "success", "message": "Đã tiếp tục cào tự động (đã reset trạng thái ngày lễ nếu có)."})
+
+
 @app.get("/api/holiday-status")
 def api_holiday_status():
-    """Xem trạng thái check ngày lễ hiện tại."""
     with holiday_check_lock:
         return jsonify({
             "status": "success",
             "data": {
                 "holiday_checked_today": holiday_checked_today,
-                "holiday_status": holiday_status,  # True = lễ, False = làm việc, None = chưa check
+                "holiday_status": holiday_status,
                 "holiday_detected_date": holiday_detected_date,
-                "is_auto_crawl_paused": is_auto_crawl_paused,  # User pause
-                "is_holiday_paused": is_holiday_paused,        # Holiday checker pause
-                "current_time_vn": (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
+                "is_auto_crawl_paused": is_auto_crawl_paused,
+                "is_holiday_paused": is_holiday_paused,
+                "current_time_vn": _now_str()
             }
         })
+
+
 @app.post("/api/set-fhsc-key")
 def api_set_fhsc_key():
     print("[API] 🔑 Gọi API /api/set-fhsc-key", flush=True)
@@ -2215,9 +2239,9 @@ def api_set_fhsc_key():
     settings_col.update_one({"_id": "fhsc_key"}, {"$set": {"value": new_key, "updated_at": _now_str()}}, upsert=True)
     return jsonify({"status": "success", "message": "Đã lưu API Key mới thành công!"})
 
+
 @app.get("/api/data")
 def api_get_data():
-    """Lấy toàn bộ giá realtime — NGUỒN CHÍNH cho Card."""
     print("[API] 📈 Gọi API /api/data (Lấy toàn bộ giá)", flush=True)
     try:
         cursor = collection.find({}, {"_id": 0})
@@ -2225,7 +2249,6 @@ def api_get_data():
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
-                # Đảm bảo prev_close luôn có trong response
                 if "prev_close" not in doc:
                     doc["prev_close"] = 0
                 
@@ -2252,6 +2275,7 @@ def api_get_data():
         return jsonify({"status": "success", "count": len(data), "data": data})
     except Exception as e: 
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.get("/api/sync")
 def api_sync():
@@ -2297,11 +2321,32 @@ def api_sync():
         "updated_data": {}
     })
 
+
+# FIX BUG #10: /api/screener trả 503 khi đang trong quá trình ghi, thay vì [] gây frontend crash
 @app.get("/api/screener")
 def api_get_screener():
     print("[API] 🏆 Gọi API /api/screener (Lấy điểm số)", flush=True)
-    try: return jsonify({"status": "success", "data": list(screener_col.find({}, {"_id": 0}))})
-    except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
+    try:
+        # Nếu đang trong quá trình ghi đè → chờ tối đa 5s cho lock release
+        if screener_lock.locked():
+            acquired = screener_lock.acquire(timeout=5)
+            if acquired:
+                screener_lock.release()
+        
+        data = list(screener_col.find({}, {"_id": 0}))
+        
+        if not data:
+            return jsonify({
+                "status": "retry",
+                "message": "Screener đang cập nhật, vui lòng thử lại sau 2s",
+                "data": []
+            }), 503
+        
+        return jsonify({"status": "success", "data": data})
+    except Exception as e:
+        log_exception("[API SCREENER]", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.get("/api/ai-analyze")
 def api_ai_analyze():
@@ -2339,7 +2384,7 @@ def api_ai_analyze():
             bctc_period = bctc_doc.get("latest_period", "Không rõ")
             try:
                 last_update_date = datetime.strptime(bctc_updated_at, "%d/%m/%Y %H:%M:%S")
-                if (datetime.utcnow() - last_update_date).days > 45:
+                if (datetime.now(timezone.utc) - last_update_date.replace(tzinfo=timezone.utc)).days > 45:
                     bctc_warning = f"⚠️ CẢNH BÁO: BCTC đã cũ, kỳ mới nhất là {bctc_period}, cào lúc {bctc_updated_at}."
             except:
                 pass
@@ -2360,6 +2405,7 @@ def api_ai_analyze():
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.get("/api/admin/force-ai-single")
 def admin_force_ai_single():
@@ -2432,6 +2478,7 @@ def admin_force_ai_single():
         "status": "success", 
         "message": f"Đã bắt đầu chạy AI cho mã {symbol}. Theo dõi log Render!"
     })
+
 
 @app.get("/api/admin/force-ai")
 def admin_force_ai():
@@ -2510,6 +2557,7 @@ def admin_force_ai():
         "message": f"Đã bắt đầu chạy AI cho {len(all_symbols)} mã. Xem log Render!"
     })
 
+
 @app.get("/api/force-history")
 def force_history():
     print(f"\n[API] 📥 Gọi API /api/force-history (Ép cào nến 30 ngày)", flush=True)
@@ -2538,6 +2586,7 @@ def force_history():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào 30 ngày nến..."})
 
+
 @app.get("/api/crawl-full-history")
 def crawl_full_history():
     print(f"\n[API] 📥 Gọi API /api/crawl-full-history (Ép cào nến 10 năm)", flush=True)
@@ -2560,6 +2609,7 @@ def crawl_full_history():
         finally: is_full_data_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào 10 năm nến..."})
+
 
 @app.get("/api/force-bctc")
 def force_bctc():
@@ -2610,6 +2660,7 @@ def force_bctc():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": f"Đang cào BCTC cho {len(symbols_str.split(',')) if symbols_str else limit_idx} mã..."})
 
+
 @app.get("/api/bctc-status")
 def api_bctc_status():
     print("[API] 📋 Gọi API /api/bctc-status", flush=True)
@@ -2635,6 +2686,7 @@ def api_bctc_status():
         log_exception("[API BCTC STATUS]", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 @app.get("/api/crawl-full-bctc")
 def crawl_full_bctc():
     print(f"\n[API] 📥 Gọi API /api/crawl-full-bctc", flush=True)
@@ -2659,6 +2711,7 @@ def crawl_full_bctc():
         finally: is_full_data_running = False
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào FULL BCTC..."})
+
 
 @app.get("/api/crawl-ratios")
 def crawl_ratios():
@@ -2717,6 +2770,7 @@ def crawl_ratios():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang cào bảng Ratio..."})
 
+
 @app.get("/api/force-screener")
 def force_screener():
     if request.args.get("key") != ADMIN_SECRET_KEY:
@@ -2725,7 +2779,7 @@ def force_screener():
     print(f"\n[API] 📥 Gọi API /api/force-screener", flush=True)
     global is_screener_running
     if is_screener_running: 
-        return jsonify({"status": "error", "message": "Đang chạy"}), 400
+        return jsonify({"status": "error", "message": "Screener đang chạy (worker hoặc API khác), vui lòng đợi!"}), 400
         
     is_screener_running = True
     print(f"[SCREENER] 🚀 Bắt đầu chấm điểm lại toàn bộ...", flush=True)
@@ -2747,7 +2801,18 @@ def force_screener():
                 
                 stock_db[sym] = doc
             
-            norm_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
+            # FIX BUG #5: Ghi update_fields riêng
+            norm_db = {}
+            for s, r in stock_db.items():
+                nd = normalize_stock_data(s, r)
+                update_fields = nd.pop("_update_fields", {})
+                if update_fields:
+                    try:
+                        collection.update_one({"symbol": s}, {"$set": update_fields})
+                    except Exception:
+                        pass
+                norm_db[s] = nd
+            
             medians = compute_sector_medians(norm_db)
             results = []
             
@@ -2761,7 +2826,6 @@ def force_screener():
             if results:
                 results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
                 
-                # === BẢO VỆ AI: Giữ nguyên bài AI thật trước khi ghi đè ===
                 for r in results:
                     existing_stock = collection.find_one({"symbol": r["symbol"]})
                     if existing_stock and existing_stock.get("ai_bctc") and len(existing_stock.get("ai_bctc")) > 100:
@@ -2773,10 +2837,12 @@ def force_screener():
                         r["ai_updated_at"] = existing_stock.get("ai_updated_at", "")
                         r["ai_source"] = existing_stock.get("ai_source", "AI")
 
-                screener_col.delete_many({}) 
-                screener_col.insert_many(results) 
-                commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Force Screener {_now_str()}")
-                print(f"[SCREENER] ✅ Đã chấm điểm xong {len(results)} mã (Đã bảo vệ bài AI cũ).", flush=True)
+                # FIX BUG #1: Ghi AN TOÀN qua lock + collection tạm
+                if _safe_replace_screener_results(results, tag="force-api"):
+                    commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Force Screener {_now_str()}")
+                    print(f"[SCREENER] ✅ Đã chấm điểm xong {len(results)} mã (Đã bảo vệ bài AI cũ).", flush=True)
+                else:
+                    print(f"[SCREENER] ⚠️ Không ghi được kết quả (lock timeout).", flush=True)
         except Exception as e:
             print(f"[SCREENER] ❌ Lỗi: {e}", flush=True)
         finally: 
@@ -2784,6 +2850,7 @@ def force_screener():
             
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
+
 
 @app.get("/api/force-realtime")
 def force_realtime():
@@ -2801,12 +2868,14 @@ def force_realtime():
         "message": f"Đã kích hoạt ép cào realtime cho {len(all_symbols)} mã."
     })
 
+
 @app.get("/api/reset-today")
 def reset_today():
     print(f"\n[API] 📥 Gọi API /api/reset-today", flush=True)
-    today_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d")
+    today_str = _vn_now().strftime("%Y-%m-%d")
     result = collection.update_many({"chot_so_today": today_str}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
     return jsonify({"status": "success", "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã."})
+
 
 @app.get("/api/force-fix")
 def force_fix_data():
@@ -2815,6 +2884,7 @@ def force_fix_data():
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
     return jsonify({"status": "success", "message": f"Đang ép cào lại toàn bộ {len(all_symbols)} mã."})
+
 
 @app.get("/api/retry-now")
 def retry_now():
@@ -2826,10 +2896,11 @@ def retry_now():
         return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
-# ===================== API LỊCH SỬ (TẢI TOÀN BỘ 1 LẦN) =====================
+
+
+# ===================== API LỊCH SỬ =====================
 @app.get("/api/history-all")
 def api_get_history_all():
-    """Trả về 50 nến gần nhất của tất cả mã — dùng cho lần tải đầu (tránh OOM)."""
     global _history_cache
     try:
         now = time.time()
@@ -2861,12 +2932,10 @@ def api_get_history_all():
     except Exception as e:
         log_exception("[API HISTORY ALL]", e)
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.get("/api/history-all-more")
 def api_get_history_all_more():
-    """
-    Trả về nến CŨ HƠN nến thứ 50 của tất cả mã (từ nến -300 đến -50).
-    Dùng để merge vào cache sau khi đã có 50 nến gần nhất.
-    """
     try:
         print("[API] 📊 /api/history-all-more: Đọc nến cũ hơn (250 nến/mã)...", flush=True)
         all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
@@ -2876,7 +2945,6 @@ def api_get_history_all_more():
             hist_doc = history_col.find_one({"symbol": sym}, {"_id": 0})
             if hist_doc and hist_doc.get("history_d1"):
                 bars = hist_doc["history_d1"]
-                # Bỏ 50 nến gần nhất đã có, lấy 250 nến trước đó (tổng 300 nến)
                 older_bars = bars[:-50][-250:] if len(bars) > 50 else []
                 if older_bars:
                     result[sym] = {"history_d1": older_bars}
@@ -2886,10 +2954,11 @@ def api_get_history_all_more():
         return jsonify(response_data)
     except Exception as e:
         log_exception("[API HISTORY ALL MORE]", e)
-        return jsonify({"status": "error", "message": str(e)}), 500       
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.get("/api/history-all-full")
 def api_get_history_all_full():
-    """Trả về TOÀN BỘ nến còn lại (từ đầu đến nến -300)."""
     try:
         all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
         result = {}
@@ -2898,7 +2967,6 @@ def api_get_history_all_full():
             hist_doc = history_col.find_one({"symbol": sym}, {"_id": 0})
             if hist_doc and hist_doc.get("history_d1"):
                 bars = hist_doc["history_d1"]
-                # Chỉ lấy nến trước nến -300
                 older_bars = bars[:-300] if len(bars) > 300 else []
                 if older_bars:
                     result[sym] = {"history_d1": older_bars}
@@ -2907,16 +2975,9 @@ def api_get_history_all_full():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ===================== API LỊCH SỬ (ĐÃ FIX ĐỒNG BỘ) =====================
-# ===================== API LỊCH SỬ (ĐÃ FIX ĐỒNG BỘ) =====================
+
 @app.get("/api/history")
 def api_get_history():
-    """
-    API lịch sử nến — ĐÃ FIX để ĐỒNG BỘ với /api/data.
-    - Đọc nến cũ từ history_col
-    - Nếu có giá realtime mới hơn trong collection → cập nhật/chèn nến hôm nay
-    - Đảm bảo Chart và Card luôn cùng giá
-    """
     symbol = request.args.get("symbol", "").upper().strip()
     if not symbol:
         return jsonify({"status": "error", "message": "Thiếu mã"}), 400
@@ -2927,18 +2988,14 @@ def api_get_history():
         hist_doc = history_col.find_one({"symbol": symbol}, {"_id": 0})
         history_d1 = hist_doc.get("history_d1", []) if hist_doc else []
         
-        # === FIX ĐỒNG BỘ: Lấy giá realtime từ collection ===
         live_doc = collection.find_one({"symbol": symbol}, {"_id": 0})
         
         if live_doc and live_doc.get("close", 0) > 0:
-            # Xác định "ngày hôm nay" của nến realtime
             today_live = live_doc.get("trading_date")
             
             if not today_live:
-                vn_now = datetime.utcnow() + timedelta(hours=7)
-                today_live = vn_now.strftime("%Y-%m-%d")
+                today_live = _vn_now().strftime("%Y-%m-%d")
             
-            # Chuẩn bị bar hôm nay
             bar_today = {
                 "time": today_live,
                 "open": float(live_doc.get("open", 0) or live_doc["close"]),
@@ -2948,7 +3005,6 @@ def api_get_history():
                 "volume": int(live_doc.get("volume", 0) or 0)
             }
             
-            # Tìm nến cùng ngày
             existing_idx = None
             for i, b in enumerate(history_d1):
                 if b.get("time") == today_live:
@@ -2956,7 +3012,6 @@ def api_get_history():
                     break
             
             if existing_idx is not None:
-                # Đã có → cập nhật close/high/low/volume mới nhất
                 history_d1[existing_idx]["close"] = bar_today["close"]
                 history_d1[existing_idx]["high"] = max(
                     float(history_d1[existing_idx].get("high", 0) or 0),
@@ -2969,7 +3024,6 @@ def api_get_history():
                 if bar_today["volume"] > 0:
                     history_d1[existing_idx]["volume"] = bar_today["volume"]
             else:
-                # Chưa có → chèn nến hôm nay
                 history_d1.append(bar_today)
                 history_d1.sort(key=lambda x: x["time"])
         
@@ -2990,4 +3044,4 @@ def api_get_history():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False)        
