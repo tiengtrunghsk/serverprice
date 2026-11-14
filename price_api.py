@@ -434,6 +434,9 @@ def _fetch_bctc_ssi(symbol: str):
             if unicodedata.category(ch) != "Mn"
         ).replace("đ", "d")
         label = re.sub(r"[^a-z0-9]+", " ", label).strip()
+        
+        # Chuyển field_code sang chữ in hoa để so sánh chính xác với ID của VCI
+        field = str(field_code).upper() if field_code else ""
 
         if report_name == "income_statement":
             if "doanh thu thuan" in label or "net revenue" in label:
@@ -444,10 +447,17 @@ def _fetch_bctc_ssi(symbol: str):
                 return "IS_NET_PROFIT_AFTER_TAX"
 
         elif report_name == "cash_flow":
+            # SO KHỚP TRỰC TIẾP VỚI ID CHUẨN CỦA VCI (Đã kiểm chứng qua file HPG)
+            if "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES" in field:
+                return "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
+                
+            # Dự phòng bằng tên tiếng Việt
             if (
-                "luu chuyen tien thuan tu hoat dong kinh doanh" in label
-                or "net cash flows from operating activities" in label
-                or "net cash from operating activities" in label
+                "hoat dong kinh doanh" in label 
+                or "san xuat kinh doanh" in label
+                or "hdkd" in label
+                or "operating activities" in label
+                or "operating activity" in label
             ):
                 return "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
 
@@ -467,7 +477,7 @@ def _fetch_bctc_ssi(symbol: str):
             if "no phai tra" in label or "total liabilities" in label:
                 return "BS_LIABILITIES"
 
-        return None # Trả về None nếu không phải trường cốt lõi
+        return None
 
     try:
         logger.info("[BCTC VCI] Bắt đầu lấy BCTC cho %s", symbol)
