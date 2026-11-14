@@ -1850,6 +1850,7 @@ def full_data_crawler_worker():
 def screener_worker():
     """
     Screener worker: chấm điểm sau khi chốt sổ (15h05+).
+    Có cơ chế BẢO VỆ AI: Không bao giờ ghi đè bài AI thật bằng Template.
     """
     while True:
         try:
@@ -1863,7 +1864,7 @@ def screener_worker():
             
             is_1630 = (current_hour == 16 and vn_now.minute == 30 and vn_now.second < 10)
             
-            # === SỬA: chỉ chấm điểm sau 15h05 ===
+            # Chỉ chấm điểm sau 15h05
             is_after_close = (current_hour > 15) or (current_hour == 15 and current_minute >= 5)
             is_just_closed = (is_after_close and crawled_count >= all_symbols_count and all_symbols_count > 0)
 
@@ -1929,13 +1930,16 @@ def screener_worker():
                         r["final_decision_reason"] = fd_reason
                     print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
 
+                # === BẢO VỆ AI: CHỈ TẠO TEMPLATE NẾU CHƯA CÓ BÀI VIẾT NÀO ===
                 if results:
-                    print(f"[SCREENER] 📝 Đang tạo/cập nhật Template cho các mã chưa có AI thật...", flush=True)
+                    print(f"[SCREENER] 📝 Đang kiểm tra và tạo Template cho các mã chưa có AI...", flush=True)
                     template_count = 0
                     for r in results:
                         sym = r["symbol"]
                         existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
-                        if existing and existing.get("ai_bctc") and existing.get("ai_source") == "AI":
+                        
+                        # BẢO VỆ AI: Nếu đã có bất kỳ văn bản AI nào (dù nguồn là gì), KHÔNG GHI ĐÈ
+                        if existing and existing.get("ai_bctc") and len(existing.get("ai_bctc")) > 100:
                             continue
                         
                         nd_for_template = normalized_db.get(sym, {})
@@ -1954,7 +1958,7 @@ def screener_worker():
                                 "ai_source": "TEMPLATE"
                             }})
                             template_count += 1
-                    print(f"[SCREENER] ✅ Đã tạo/cập nhật Template cho {template_count} mã (chưa có AI thật).", flush=True)
+                    print(f"[SCREENER] ✅ Đã tạo Template cho {template_count} mã (các mã có AI thật đã được bảo vệ).", flush=True)
                         
                 if results:
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
@@ -2084,7 +2088,6 @@ def screener_worker():
         except Exception as e: 
             print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
             time.sleep(60)
-
 
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
 threading.Thread(target=holiday_checker_worker, daemon=True).start()  # ← MỚI
@@ -2706,10 +2709,23 @@ def force_screener():
             
             if results:
                 results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
+                
+                # === BẢO VỆ AI: Giữ nguyên bài AI thật trước khi ghi đè ===
+                for r in results:
+                    existing_stock = collection.find_one({"symbol": r["symbol"]})
+                    if existing_stock and existing_stock.get("ai_bctc") and len(existing_stock.get("ai_bctc")) > 100:
+                        r["bctc_evaluation"] = existing_stock.get("ai_bctc", "")
+                        r["outlook"] = existing_stock.get("ai_outlook", "")
+                        r["ai_recommendation"] = existing_stock.get("ai_recommendation", "")
+                        r["ai_price_zone"] = existing_stock.get("ai_price_zone", "")
+                        r["macro_view"] = existing_stock.get("ai_macro_view", "")
+                        r["ai_updated_at"] = existing_stock.get("ai_updated_at", "")
+                        r["ai_source"] = existing_stock.get("ai_source", "AI")
+
                 screener_col.delete_many({}) 
                 screener_col.insert_many(results) 
                 commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Force Screener {_now_str()}")
-                print(f"[SCREENER] ✅ Đã chấm điểm xong {len(results)} mã.", flush=True)
+                print(f"[SCREENER] ✅ Đã chấm điểm xong {len(results)} mã (Đã bảo vệ bài AI cũ).", flush=True)
         except Exception as e:
             print(f"[SCREENER] ❌ Lỗi: {e}", flush=True)
         finally: 
