@@ -36,7 +36,7 @@ def log_exception(context: str, exc: Exception):
     logger.error("%s | %s: %s", context, type(exc).__name__, str(exc), exc_info=True)
 
 # ===================== VNSTOCK THẾ HỆ 6 =====================
-from vnstock import Market, Fundamental
+from vnstock import Market
 
 try:
     from ptkt import ProfessionalTechnicalAnalyzer
@@ -102,7 +102,13 @@ if os.path.exists(VN100_INFO_FILE):
 # ===================== DATABASE =====================
 logger.info("Đang kết nối MongoDB...")
 try:
-    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000, socketTimeoutMS=20000, appname="price_api")
+    mongo_client = MongoClient(
+        MONGO_URI, 
+        serverSelectionTimeoutMS=30000, 
+        connectTimeoutMS=15000, 
+        socketTimeoutMS=60000, # Tăng lên 60s để tránh lỗi NetworkTimeout trên Render
+        appname="price_api"
+    )
     mongo_client.admin.command("ping")
     db = mongo_client["quant_db"]
     collection = db["stocks"]
@@ -339,68 +345,285 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
         return df if df is not None and not df.empty else None
     except Exception: return None
 
-# ===================== CÀO BCTC =====================
+# ===================== CÀO BCTC TRỰC TIẾP TỪ VCI (MÃ 2) =====================
 def _fetch_bctc_ssi(symbol: str):
+    """
+    Lấy BCTC trực tiếp từ Vietcap IQ API, không dùng vnstock/FHSC.
+    Chỉ lấy các chỉ tiêu cốt lõi, bỏ qua các trường VCI_... rác.
+    """
     symbol = str(symbol).upper().strip()
-    fhsc_key = get_current_fhsc_key()
-    if not fhsc_key: 
-        print(f"  ⚠️ [BCTC] Bỏ qua {symbol} - Chưa có FHSC API KEY", flush=True)
+    if not symbol or not re.fullmatch(r"[A-Z0-9]{2,10}", symbol):
+        logger.warning("[BCTC VCI] Mã cổ phiếu không hợp lệ: %r", symbol)
         return None
-        
-    os.environ["FHSC_API_KEY"] = fhsc_key
-    print(f"  [BCTC] 🚀 Bắt đầu lấy dữ liệu cho mã {symbol}...", flush=True)
 
-    try:
-        equity = Fundamental().equity(symbol)
-        reports = {}
-        report_names = ("balance_sheet", "income_statement", "cash_flow")
+    # Danh sách các ID cốt lõi BẮT BUỘC phải lưu
+    CORE_IDS = {
+        "IS_NET_REVENUE", "IS_COST_OF_GOODS_SOLD", "IS_NET_PROFIT_AFTER_TAX",
+        "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES", "BS_TOTAL_ASSETS",
+        "BS_SHORT_TERM_ASSETS", "BS_LONG_TERM_ASSETS", "BS_OWNERS_EQUITY", "BS_LIABILITIES"
+    }
 
-        def fetch_with_retry(func, period="quarter", max_retries=3, limit=8):
-            for attempt in range(max_retries):
-                try: return func(period=period, source="fhsc", limit=limit)
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if any(k in err_str for k in ["429", "rate limit", "vượt giới hạn"]): 
-                        time.sleep((attempt + 1) * 10)
-                    elif any(k in err_str for k in ["networkerror", "remoteprotocolerror", "connection", "kết nối", "timeout"]): 
-                        time.sleep((attempt + 1) * 5)
-                    else: 
-                        print(f"    ❌ [BCTC ERROR] {symbol} | {str(e)}", flush=True)
-                        raise e
+    base_url = "https://iq.vietcap.com.vn/api/iq-insight-service"
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
+        ),
+        "Referer": "https://iq.vietcap.com.vn/",
+        "Origin": "https://iq.vietcap.com.vn",
+    }
+    session = requests.Session()
+    session.headers.update(headers)
+
+    def get_json(path, params=None, retries=3):
+        url = f"{base_url}{path}"
+        last_error = None
+        for attempt in range(retries):
+            try:
+                response = session.get(url, params=params, timeout=(8, 25))
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, (dict, list)):
+                    raise ValueError("VCI trả về JSON không hợp lệ")
+                return payload
+            except Exception as exc:
+                last_error = exc
+                if attempt < retries - 1:
+                    time.sleep((attempt + 1) * 2)
+        raise RuntimeError(f"VCI API lỗi {path}: {last_error}") from last_error
+
+    def unwrap(payload):
+        if not isinstance(payload, dict):
+            return payload
+        data = payload.get("data", payload)
+        if isinstance(data, dict) and "data" in data:
+            data = data["data"]
+        return data
+
+    def get_period(row):
+        year = (
+            row.get("yearReport") or row.get("year")
+            or row.get("year_report")
+        )
+        quarter = (
+            row.get("quarter") or row.get("quarterReport")
+            or row.get("quarter_report")
+        )
+        length = row.get("lengthReport") or row.get("length_report")
+        try:
+            year = int(year)
+            if quarter not in (None, ""):
+                quarter = int(quarter)
+            elif length not in (None, ""):
+                quarter = int(length)
+            else:
+                return None
+            if not 1 <= quarter <= 4:
+                return None
+            return f"{year}-Q{quarter}"
+        except (TypeError, ValueError):
             return None
 
-        latest_period = "Chưa xác định"
-        for report_name in report_names:
-            try:
-                report_func = getattr(equity, report_name, None)
-                if not callable(report_func): continue
-                
-                print(f"    ⏳ Đang lấy {report_name}...", flush=True)
-                df = fetch_with_retry(report_func)
-                time.sleep(1.5) 
-                
-                if df is not None and not df.empty:
-                    clean_df = df.astype(object).where(pd.notna(df), None)
-                    records = clean_df.to_dict(orient="records")
-                    
-                    if records and latest_period == "Chưa xác định":
-                        try:
-                            first_record = records[0]
-                            y, q = first_record.get("year"), first_record.get("quarter")
-                            if y and q: latest_period = f"Q{q}/{y}"
-                        except: pass
-                            
-                    reports[report_name] = json.loads(json.dumps(records, ensure_ascii=False, default=str))
-                    print(f"    ✓ Đã lấy {report_name} ({len(records)} dòng)", flush=True)
-            except Exception: pass
+    def canonical_id(report_name, field_code, title):
+        import unicodedata
+
+        label = str(title or field_code or "").strip().lower()
+        label = "".join(
+            ch for ch in unicodedata.normalize("NFD", label)
+            if unicodedata.category(ch) != "Mn"
+        ).replace("đ", "d")
+        label = re.sub(r"[^a-z0-9]+", " ", label).strip()
+        field = str(field_code).upper() if field_code else ""
+
+        if report_name == "income_statement":
+            if "doanh thu thuan" in label or "net revenue" in label:
+                return "IS_NET_REVENUE"
+            if "gia von hang ban" in label or "cost of goods sold" in label:
+                return "IS_COST_OF_GOODS_SOLD"
             
-        if reports: 
-            print(f"  ✅ [BCTC] Đã lấy xong {symbol} | Kỳ mới nhất: {latest_period}", flush=True)
-            reports["latest_period"] = latest_period 
-        return reports if reports else None
-    except Exception as e:
-        print(f"  ❌ [BCTC] Lỗi khi cào {symbol}: {e}", flush=True)
+            # BẮT CHÍNH XÁC LỢI NHUẬN SAU THUẾ (isa20), BỎ QUA LỢI ÍCH CỔ ĐÔNG THIỂU SỐ (isa21)
+            if field == "ISA20" or "loi nhuan sau thue thu nhap doanh nghiep" in label:
+                return "IS_NET_PROFIT_AFTER_TAX"
+            
+            # Hỗ trợ thêm cho các mã Ngân hàng/Chứng khoán (thường dùng id khác)
+            if field in ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX"] or "loi nhuan sau thue" in label:
+                if "co dong thieu so" not in label and "khong kiem soat" not in label:
+                    return "IS_NET_PROFIT_AFTER_TAX"
+
+        elif report_name == "cash_flow":
+            # CHỈ LẤY DUY NHẤT DÒNG CFA18 (Lưu chuyển tiền tệ ròng từ HĐKD)
+            if field == "CFA18":
+                return "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
+            
+            # Hỗ trợ cho các mã không dùng VCI (hoặc VCI đổi ID)
+            if "luu chuyen tien te rong" in label or "net cash flows from operating activities" in label:
+                return "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
+
+        elif report_name == "balance_sheet":
+            if "tong cong tai san" in label or "tong tai san" in label or "total assets" in label:
+                return "BS_TOTAL_ASSETS"
+            if "tai san ngan han" in label or "current assets" in label:
+                return "BS_SHORT_TERM_ASSETS"
+            if "tai san dai han" in label or "non current assets" in label:
+                return "BS_LONG_TERM_ASSETS"
+            
+            # Vốn chủ sở hữu (ưu tiên lấy dòng "Vốn chủ sở hữu", không lấy "Vốn và các quỹ" để tránh trùng lặp)
+            if "von chu so huu" in label or "owners equity" in label or "owner equity" in label:
+                return "BS_OWNERS_EQUITY"
+            if "von va cac quy" in label:
+                return "BS_OWNERS_EQUITY"
+                
+            if "no phai tra" in label or "total liabilities" in label:
+                return "BS_LIABILITIES"
+
         return None
+    try:
+        logger.info("[BCTC VCI] Bắt đầu lấy BCTC cho %s", symbol)
+
+        metadata = {}
+        try:
+            meta = unwrap(get_json(
+                f"/v1/company/{symbol}/financial-statement/metrics"
+            ))
+            if isinstance(meta, dict):
+                for section in (
+                    "INCOME_STATEMENT", "BALANCE_SHEET", "CASH_FLOW"
+                ):
+                    metadata[section] = {
+                        str(item.get("field")): (
+                            item.get("titleVi")
+                            or item.get("titleEn")
+                            or item.get("field")
+                        )
+                        for item in (meta.get(section) or [])
+                        if isinstance(item, dict) and item.get("field")
+                    }
+        except Exception as meta_error:
+            logger.warning(
+                "[BCTC VCI] Không lấy được metadata %s: %s",
+                symbol, meta_error
+            )
+
+        report_map = {
+            "balance_sheet": "BALANCE_SHEET",
+            "income_statement": "INCOME_STATEMENT",
+            "cash_flow": "CASH_FLOW",
+        }
+        reports = {}
+        latest_period = None
+        ignored_fields = {
+            "organCode", "ticker", "createDate", "updateDate",
+            "yearReport", "lengthReport", "publicDate", "quarter",
+            "quarterReport", "year", "year_report", "length_report",
+            "quarter_report",
+        }
+
+        for report_name, section in report_map.items():
+            try:
+                payload = unwrap(get_json(
+                    f"/v1/company/{symbol}/financial-statement",
+                    params={"section": section},
+                ))
+                if isinstance(payload, dict):
+                    rows = (
+                        payload.get("quarters")
+                        or payload.get("quarter")
+                        or []
+                    )
+                elif isinstance(payload, list):
+                    rows = payload
+                else:
+                    rows = []
+
+                records = []
+                titles = metadata.get(section, {})
+
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    period = get_period(row)
+                    if not period:
+                        continue
+
+                    if latest_period is None or period > latest_period:
+                        latest_period = period
+
+                    for field_code, raw_value in row.items():
+                        if field_code in ignored_fields or raw_value is None:
+                            continue
+                        if isinstance(raw_value, (dict, list, bool)):
+                            continue
+                        try:
+                            value = float(raw_value)
+                        except (TypeError, ValueError):
+                            continue
+                        if not np.isfinite(value):
+                            continue
+
+                        title = titles.get(str(field_code), str(field_code))
+                        item_id = canonical_id(report_name, field_code, title)
+                        
+                        # BỎ QUA NGAY NẾU KHÔNG NẰM TRONG DANH SÁCH CỐT LÕI
+                        if not item_id or item_id not in CORE_IDS:
+                            continue
+
+                        # Logic tính biên gộp hiện tại dùng giá vốn âm.
+                        if item_id == "IS_COST_OF_GOODS_SOLD" and value > 0:
+                            value = -value
+
+                        records.append({
+                            "id": item_id,
+                            "name": str(title),
+                            "period": period,
+                            "value": value,
+                            "unit": "VND",
+                            "source_field": str(field_code),
+                        })
+
+                if records:
+                    # Cắt tỉa chỉ giữ 8 kỳ gần nhất
+                    unique_periods = sorted(list(set([item["period"] for item in records])), reverse=True)
+                    keep_periods = set(unique_periods[:8])
+                    records = [item for item in records if item["period"] in keep_periods]
+
+                    reports[report_name] = records
+                    logger.info(
+                        "[BCTC VCI] %s | %s: %d chỉ tiêu, %d kỳ",
+                        symbol, report_name, len(records),
+                        len({item["period"] for item in records})
+                    )
+                else:
+                    logger.warning(
+                        "[BCTC VCI] %s | %s không có dữ liệu cốt lõi",
+                        symbol, report_name
+                    )
+
+            except Exception as report_error:
+                logger.warning(
+                    "[BCTC VCI] %s | lỗi %s: %s",
+                    symbol, report_name, report_error
+                )
+
+        if reports:
+            reports["latest_period"] = latest_period or "Chưa xác định"
+            reports["source"] = "VCI_DIRECT"
+            logger.info(
+                "[BCTC VCI] Hoàn tất %s | kỳ mới nhất: %s",
+                symbol, reports["latest_period"]
+            )
+            return reports
+
+        logger.error("[BCTC VCI] Không lấy được BCTC cho %s", symbol)
+        return None
+
+    except Exception as exc:
+        log_exception(f"[BCTC VCI] Lỗi lấy BCTC {symbol}", exc)
+        return None
+
+    finally:
+        session.close()
+
 
 # ===================== CÀO RATIO TỪ VNDIRECT =====================
 VNDIRECT_RATIOS = {
@@ -428,21 +651,6 @@ def get_vndirect_ratio(symbol, ratio_code):
     except Exception:
         pass
     return None
-
-# HÀM BỔ SUNG: Lấy Tên và SLCP trực tiếp từ VCI (Vietcap)
-def fetch_company_info_vci_live(symbol):
-    try:
-        url = f"https://api.vietcap.com.vn/api/price/symbols/getOverview?symbol={symbol}"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json().get("data", {})
-            name = data.get("organName", "") or data.get("companyName", "") or ""
-            shares = int(float(data.get("issueShare", 0) or 0))
-            return name, shares
-    except Exception as e:
-        print(f"  ⚠️ [VCI-INFO] Lỗi lấy thông tin {symbol}: {e}", flush=True)
-    return "", 0
 
 # ===================== CORE LOGIC CÀO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
@@ -681,45 +889,24 @@ def normalize_stock_data(symbol, data):
     pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
     
-    # BỔ SUNG: Nếu EPS trong DB vẫn đang là VND (vd: 3000), tự động chia 1000
+    # BỔ SUNG: Chuẩn hóa EPS về đơn vị Nghìn VNĐ
     if eps >= 1000:
         eps = eps / 1000.0
-        
+    # Nếu EPS quá lớn so với giá (VD: PDR eps=538 nhưng giá=11.5), tự động chia 1000
+    if close_price > 0 and eps > (close_price * 5): 
+        eps = eps / 1000.0
+        print(f"    [CẢNH BÁO] Đã sửa lỗi EPS cho {symbol} (chia 1000): {eps}", flush=True)
+
     bctc = data.get("bctc_history", [])
     profit_growth_yoy = float(bctc[0].get("profit_growth_yoy", 0)) if bctc else 0.0
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
     bvps = (close_price / pb) if pb > 0 and close_price > 0 else 0
     if eps == 0 and pe > 0 and close_price > 0: eps = close_price / pe
     
-    # Lấy thông tin hiện có trong DB
-    total_shares = float(data.get("total_shares", 0) or 0)
-    company_name = data.get("company_name", "") or ""
-    
-    # NẾU THIẾU SLCP HOẶC TÊN -> GỌI VCI LẤY LUÔN
-    if total_shares == 0 or not company_name:
-        name_vci, shares_vci = fetch_company_info_vci_live(symbol)
-        if shares_vci > 0:
-            total_shares = shares_vci
-            # Lưu luôn vào DB để lần sau không phải gọi lại
-            collection.update_one({"symbol": symbol}, {"$set": {"total_shares": total_shares}})
-            
-        if name_vci and not company_name:
-            company_name = name_vci
-            collection.update_one({"symbol": symbol}, {"$set": {"company_name": company_name}})
-
-    # TỰ ĐỘNG TÍNH LNST TỪ EPS VÀ SLCP NẾU BỊ THIẾU
-    net_profit_ttm = float(data.get("net_profit_ttm", 0) or 0)
-    if net_profit_ttm == 0 and eps > 0 and total_shares > 0:
-        # EPS (VNĐ) * SLCP / 1e9 = Tỷ VNĐ
-        net_profit_ttm = round((eps * 1000 * total_shares) / 1e9, 2)
-        collection.update_one({"symbol": symbol}, {"$set": {"net_profit_ttm": net_profit_ttm}})
-
     return {"close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
             "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
-            "net_profit_ttm": net_profit_ttm, "debt_to_equity": float(data.get("debt_to_equity", 0)),
-            "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, 
-            "credit_growth_yoy": credit_growth_yoy, "company_name": company_name, "total_shares": total_shares}
-
+            "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
+            "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy}
 def compute_sector_medians(normalized_db):
     buckets = {}
     for symbol, nd in normalized_db.items():
@@ -761,26 +948,45 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     if not is_financial and npat > 0 and cfo > 0 and (cfo / npat) >= 0.8 and eps > 0 and med_pe > 0: 
         methods["CFO_boost"] = round(eps * min(med_pe, cap_pe) * 1.10, 0)
     
-    # PS_METHOD (Bổ sung từ script cũ)
     if config.get("primary_metric") == "PB" and ps > 0 and med_ps > 0:
         sales_per_share = close / ps if ps > 0 else 0
         target_ps = min(med_ps, 2.5)
         if sales_per_share > 0:
             methods["PS_method"] = round(sales_per_share * target_ps, 0)
+            
+    # BỔ SUNG: LỌC BỎ CÁC PHƯƠNG PHÁP VÔ LÝ (Cao hơn 3 lần hoặc thấp hơn 0.2 lần giá hiện tại)
+    valid_methods = {}
+    for k, v in methods.items():
+        if v > 0 and close > 0:
+            if (v / close) >= 0.2 and (v / close) <= 3.0:
+                valid_methods[k] = v
+            else:
+                print(f"    [CẢNH BÁO] Loại bỏ PP {k} của {symbol} do lệch quá lớn: {v} (Giá hiện tại: {close})", flush=True)
+
+    if not valid_methods: 
+        return {"fair_low": 0, "fair_high": 0, "graham": 0, "methods": {}, "mos_pct": round(mos * 100, 1), "rationale": "Không đủ DL.", "discount_to_fair_pct": 0, "verdict": "KHÔNG ĐỦ DỮ LIỆU"}
     
-    if not methods: return {"fair_low": 0, "fair_high": 0, "graham": 0, "methods": {}, "mos_pct": round(mos * 100, 1), "rationale": "Không đủ DL.", "discount_to_fair_pct": 0, "verdict": "KHÔNG ĐỦ DỮ LIỆU"}
-    
-    weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1, "PS_method": 1}
+    weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1.5, "PS_method": 1}
     weighted = []
-    for k, v in methods.items(): weighted.extend([v] * int(weights.get(k, 1) * 2))
+    for k, v in valid_methods.items(): weighted.extend([v] * int(weights.get(k, 1) * 2))
     weighted.sort()
     n = len(weighted)
     fair_high = weighted[n // 2] if n % 2 else (weighted[n // 2 - 1] + weighted[n // 2]) / 2
+    
     fair_low = fair_high * (1 - mos)
     discount_to_fair = ((fair_low - close) / close * 100) if close > 0 else 0.0
     verdict = "KHÔNG CÓ GIÁ" if close <= 0 else ("RẺ - TRONG VÙNG MUA" if close <= fair_low else ("HỢP LÝ - CHỜ ĐIỀU CHỈNH" if close <= fair_high else ("HƠI ĐẮT - KHÔNG MUA" if close <= fair_high * 1.2 else "ĐẮT - TRÁNH")))
-    return {"fair_low": round(fair_low, 0), "fair_high": round(fair_high, 0), "graham": round(methods.get("Graham", 0), 0), "methods": {k: round(v, 0) for k, v in methods.items()}, "mos_pct": round(mos * 100, 1), "rationale": f"[{group_label}]", "discount_to_fair_pct": round(discount_to_fair, 1), "verdict": verdict}
-
+    
+    return {
+        "fair_low": round(fair_low, 0), 
+        "fair_high": round(fair_high, 0), 
+        "graham": round(valid_methods.get("Graham", 0), 0), 
+        "methods": {k: round(v, 0) for k, v in valid_methods.items()}, 
+        "mos_pct": round(mos * 100, 1), 
+        "rationale": f"[{group_label}]", 
+        "discount_to_fair_pct": round(discount_to_fair, 1), 
+        "verdict": verdict
+    }
 def compute_final_decision(fund_score, tech_score, val_score, total_score, verdict, cfo, npat, roe, debt_to_equity, discount_to_fair_pct=0.0, close_price=0.0, fair_high=0.0, fair_low=0.0):
     is_bank_or_sec = roe > 0 and debt_to_equity > 3.0
     if fund_score < 20: return ("❌ TRÁNH", "rose", f"PTCB yếu")
@@ -904,9 +1110,7 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     sim_data = get_historical_return_rate_with_details(symbol)
     
     # Bổ sung metadata
-    # SỬA: Lấy company_name và total_shares trực tiếp từ nd (đã được normalize xử lý)
-    company_name = nd.get("company_name", "")
-    total_shares = nd.get("total_shares", 0)
+    meta = VN100_METADATA.get(symbol, {})
 
     # === BỔ SUNG: BỐC BÀI VIẾT AI TỪ STOCKS SANG VÀ TỰ TÍNH LẠI PRICE_ZONE ===
     ai_data = {
@@ -970,9 +1174,9 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "sim_end_quarter": sim_data["end_quarter"] if sim_data else "",
         "sim_end_price": sim_data["end_price_mean"] if sim_data else 0,
         
-        "company_name": company_name,
-        "market_cap": (total_shares * close_price) / 1e9 if close_price > 0 else 0,
-        "total_shares": total_shares,
+        "company_name": meta.get("company_name", ""),
+        "market_cap": meta.get("market_cap", 0),
+        "total_shares": meta.get("total_shares", 0),
         
         "data_warnings": data_warnings,
         "is_data_incomplete": is_data_incomplete,
@@ -1139,6 +1343,7 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
         "macro_view": macro_view,
         "_source": "TEMPLATE",
     }
+
 def _call_ai_for_symbol(symbol, sm, si, sector):
     try:
         verified_facts = build_verified_facts(symbol, sm, si, sector)
@@ -1165,11 +1370,10 @@ NHIỆM VỤ: Diễn giải dữ liệu đã tính sẵn cho mã {symbol}. KHÔN
 
 --- QUY TẮC BẮT BUỘC ---
 1. MỌI nhận định phải có SỐ CỤ THỂ từ dữ kiện.
-2. VỀ VÙNG MUA: PHẢI dùng đúng 2 con số: fair value {fair_high:,.0f}, vùng mua {fair_low:,.0f}.
-3. VỀ KHUYẾN NGHỊ: Hệ thống đã tính → "{final_decision}". BẠN PHẢI trả về recommendation = "{rec_text}" và weight = "{rec_weight}". 
+2. VỀ KHUYẾN NGHỊ: Hệ thống đã tính → "{final_decision}". BẠN PHẢI trả về recommendation = "{rec_text}" và weight = "{rec_weight}". 
 TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ TỪ NÀO KHÁC.
-4. VỀ "ĐỊNH GIÁ & HÀNH ĐỘNG GIÁ" (outlook): Phải làm nổi bật "Biên an toàn" (Margin of Safety). Nếu giá đang trong vùng mua, phải kết luận rõ đây là cơ hội. Nếu giá đắt, phải nói rõ rủi ro.
-5. VỀ "VĨ MÔ & SÓNG NGÀNH" (macro_view): Phân tích dựa trên chu kỳ giá hàng hóa (đối với ngành Vật liệu/Phân bón/Hóa chất/Thép) hoặc chính sách vĩ mô (đối với Ngân hàng/BĐS). KHÔNG nói chung chung về VN-Index.
+3. VỀ "ĐỊNH GIÁ & HÀNH ĐỘNG GIÁ" (outlook): Phải làm nổi bật "Biên an toàn" (Margin of Safety). Nếu giá đang trong vùng mua, phải kết luận rõ đây là cơ hội. Nếu giá đắt, phải nói rõ rủi ro.
+4. VỀ "VĨ MÔ & SÓNG NGÀNH" (macro_view): Phân tích dựa trên chu kỳ giá hàng hóa (đối với ngành Vật liệu/Phân bón/Hóa chất/Thép) hoặc chính sách vĩ mô (đối với Ngân hàng/BĐS). KHÔNG nói chung chung về VN-Index.
 
 --- ĐỊNH DẠNG: JSON THUẦN TÚY (KHÔNG ```json) ---
 {{
@@ -1179,7 +1383,6 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
   "valuation_verdict": "Copy nguyên văn: '{verdict}'",
   "outlook": "4-5 câu. So sánh giá {close_price:,.0f} với vùng mua {fair_low:,.0f}-{fair_high:,.0f}. Giải thích quyết định '{final_decision}'. Nhấn mạnh biên an toàn {discount_pct:.1f}%.",
   "recommendation": "BẮT BUỘC: '{rec_text}' — {rec_weight}",
-  "price_zone": "BẮT BUỘC: 'Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | Giá hiện tại: {close_price:,.0f} | Verdict: {verdict}'",
   "macro_view": "4-5 câu. Phân tích chu kỳ hàng hóa hoặc vĩ mô tác động trực tiếp đến doanh nghiệp."
 }}"""
 
@@ -1202,27 +1405,16 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                     
                     parsed = json.loads(content)
                     
-                    raw_pz = parsed.get("price_zone", "")
-                    if isinstance(raw_pz, dict):
-                        parsed["price_zone"] = " | ".join([f"{k}: {v}" for k, v in raw_pz.items()])
-                    elif isinstance(raw_pz, list):
-                        parsed["price_zone"] = " - ".join([str(i) for i in raw_pz])
+                    # === SỬA TẠI ĐÂY: KHÔNG QUAN TÂM AI TRẢ VỀ GÌ, LUÔN GHI ĐÈ ===
+                    if fair_low > 0 and fair_high > 0:
+                        parsed["price_zone"] = (
+                            f"Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | "
+                            f"Giá hiện tại: {close_price:,.0f} | Verdict: {verdict}"
+                        )
                     else:
-                        parsed["price_zone"] = str(raw_pz)
+                        parsed["price_zone"] = "Chưa đủ dữ liệu định giá (Cần cào lại BCTC/Chỉ số)"
 
-                    if fair_low > 0:
-                        pz_text = parsed["price_zone"]
-                        numbers_in_pz = re.findall(r"\d{1,3}(?:[.,]\d{3})+|\d{4,}", pz_text)
-                        allowed = {f"{int(fair_low):,}", f"{int(fair_high):,}", f"{int(close_price):,}"}
-                        for num in numbers_in_pz:
-                            if num not in allowed and num.replace(",", "").replace(".", "") not in [str(int(fair_low)), str(int(fair_high)), str(int(close_price))]:
-                                print(f"  ⚠️ [{symbol}] AI bịa số trong price_zone: {num} → Ghi đè", flush=True)
-                                parsed["price_zone"] = (
-                                    f"Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | "
-                                    f"Giá hiện tại: {close_price:,.0f} | Verdict: {verdict}"
-                                )
-                                break
-
+                    # Tương tự với khuyến nghị, đảm bảo nó luôn khớp với hệ thống
                     ai_rec = parsed.get("recommendation", "").upper()
                     expected_rec = rec_text.upper()
                     if expected_rec not in ai_rec:
@@ -2205,7 +2397,7 @@ def force_screener():
             for sym, nd in norm_db.items():
                 grp = get_sub_sector(sym)
                 cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(sym))
-                med, _ = get_median_for_symbol(sym, medians)
+                med, _ = get_median_for_symbol(sym, medians)  # <--- ĐÃ SỬA LỖI TẠI ĐÂY (symbol -> sym)
                 res = evaluate_stock_from_db(sym, nd, med, grp, cfg)
                 if res: results.append(res)
                 count += 1
