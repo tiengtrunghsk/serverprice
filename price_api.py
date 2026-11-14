@@ -15,6 +15,7 @@ from typing import Dict, Optional, Set
 import requests
 from flask import Flask, jsonify, request, abort
 from flask_cors import CORS
+from flask_compress import Compress          # ← THÊM DÒNG NÀY
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
@@ -147,8 +148,15 @@ except Exception as e:
     sys.exit(1)
 
 # ===================== APP =====================
+# ===================== APP =====================
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
+
+# Bật nén GZIP (giảm 70-80% dung lượng truyền đi)
+Compress(app)
+app.config['COMPRESS_MIMETYPES'] = ['application/json', 'text/html', 'text/css', 'text/javascript']
+app.config['COMPRESS_LEVEL'] = 6
+app.config['COMPRESS_MIN_SIZE'] = 500
 
 # === BIẾN TRẠNG THÁI ===
 # === BIẾN TRẠNG THÁI ===
@@ -165,7 +173,11 @@ holiday_checked_today = None
 holiday_status = None
 holiday_detected_date = None
 holiday_check_lock = threading.Lock()
-is_holiday_paused = False           # ← THÊM DÒNG NÀY
+is_holiday_paused = False
+
+# === CACHE CHO /api/history-all (60 giây) ===
+_history_cache = {"data": None, "timestamp": 0, "lock": threading.Lock()}
+HISTORY_CACHE_TTL = 60  # giây           # ← THÊM DÒNG NÀY
 def get_current_fhsc_key():
     setting = settings_col.find_one({"_id": "fhsc_key"})
     if setting and setting.get("value"): return setting["value"]
@@ -669,8 +681,10 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
     """
     Cào giá realtime. Từ 15h05 trở đi sẽ chốt sổ (ghi nến vào history_d1).
     Dời từ 15h00 -> 15h05 để tránh delay dữ liệu ATC.
+    Tự động xoá cache /api/history-all sau khi cào xong.
     """
-    global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
+    global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested, _history_cache
+    
     if is_crawling: return
     is_crawling = True
     stop_crawl_requested = False 
@@ -798,6 +812,11 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     print(f"  ❌ [LỖI] {sym}: Không lấy được dữ liệu.", flush=True)
                     collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": _now_str()}}, upsert=True)
             time.sleep(1)
+
+        # ✅ XOÁ CACHE HISTORY để lần tải sau có dữ liệu mới nhất
+        with _history_cache["lock"]:
+            _history_cache["data"] = None
+            _history_cache["timestamp"] = 0
 
         if is_closing_time and pending_history_files:
             files_to_push = list(pending_history_files.keys())
@@ -2809,7 +2828,47 @@ def retry_now():
         return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
+# ===================== API LỊCH SỬ (TẢI TOÀN BỘ 1 LẦN) =====================
+@app.get("/api/history-all")
+def api_get_history_all():
+    """
+    Trả về TOÀN BỘ dữ liệu lịch sử của tất cả mã (chỉ 200 nến gần nhất).
+    Có CACHE 60 giây để tránh server phải đọc DB liên tục.
+    """
+    global _history_cache
+    try:
+        now = time.time()
+        # Kiểm tra cache còn hạn không
+        with _history_cache["lock"]:
+            if _history_cache["data"] and (now - _history_cache["timestamp"]) < HISTORY_CACHE_TTL:
+                print(f"[API] 🚀 /api/history-all: Trả cache ({len(_history_cache['data']['data'])} mã)", flush=True)
+                return jsonify(_history_cache["data"])
+        
+        # Nếu cache hết hạn, đọc từ DB
+        print("[API] 📊 /api/history-all: Đọc DB (cache hết hạn)...", flush=True)
+        all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+        result = {}
+        
+        for sym in all_symbols:
+            hist_doc = history_col.find_one({"symbol": sym}, {"_id": 0})
+            if hist_doc and hist_doc.get("history_d1"):
+                result[sym] = {"history_d1": hist_doc.get("history_d1", [])[-200:]}
+                
+        response_data = {"status": "success", "count": len(result), "data": result}
+        
+        # Lưu vào cache
+        with _history_cache["lock"]:
+            _history_cache["data"] = response_data
+            _history_cache["timestamp"] = now
+            
+        print(f"[API] ✅ /api/history-all: Đã tải {len(result)} mã, lưu cache {HISTORY_CACHE_TTL}s", flush=True)
+        return jsonify(response_data)
+    except Exception as e:
+        log_exception("[API HISTORY ALL]", e)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
+
+# ===================== API LỊCH SỬ (ĐÃ FIX ĐỒNG BỘ) =====================
 # ===================== API LỊCH SỬ (ĐÃ FIX ĐỒNG BỘ) =====================
 @app.get("/api/history")
 def api_get_history():
