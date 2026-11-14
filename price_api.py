@@ -2751,7 +2751,7 @@ def crawl_ratios():
                 collection.update_one({"symbol": sym}, {"$set": {
                     "pe": round(ratios.get("pe", 0), 2),
                     "pb": round(ratios.get("pb", 0), 2),
-                    "ps": round(ratios.get("ps", 0), 2),
+                    
                     "eps": eps_final, 
                     "roe": round(roe_val, 1),
                     "roa": round(roa_val, 1),
