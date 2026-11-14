@@ -1871,7 +1871,7 @@ def full_data_crawler_worker():
                     if not bctc_doc or "updated_at" not in bctc_doc: need = True
                     else:
                         try:
-                            if datetime.strptime(bctc_doc["updated_at"], "%d/%m/%Y %H:%M:%S") < thirty_days_ago: need = True
+                            if datetime.strptime(bctc_doc["updated_at"], "%d/%m/%Y %H:%M:%S").replace(tzinfo=timezone.utc) < thirty_days_ago: need = True
                         except: need = True
                     if need:
                         res = _fetch_bctc_ssi(symbol)
