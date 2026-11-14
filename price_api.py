@@ -2465,7 +2465,97 @@ def api_get_history():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+# ===================== API DỌN RÁC DATABASE =====================
+@app.get("/api/clean-garbage")
+def api_clean_garbage():
+    if request.args.get("key") != ADMIN_SECRET_KEY:
+        return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
 
+    print(f"\n[API] 🧹 Gọi API /api/clean-garbage (Dọn rác Database)", flush=True)
+    
+    global is_full_data_running
+    if is_full_data_running: 
+        return jsonify({"status": "error", "message": "Hệ thống đang chạy tiến trình khác, vui lòng đợi!"}), 400
+        
+    is_full_data_running = True
+
+    def _run():
+        global is_full_data_running
+        try:
+            print("[CLEANUP] 🚀 Bắt đầu dọn rác BCTC (Xóa VCI_..., cắt tỉa 8 kỳ)...", flush=True)
+            
+            # Danh sách các ID cốt lõi cần giữ lại cho việc chấm điểm
+            CORE_IDS = {
+                "IS_NET_REVENUE",
+                "IS_COST_OF_GOODS_SOLD",
+                "IS_NET_PROFIT_AFTER_TAX",
+                "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES",
+                "BS_TOTAL_ASSETS",
+                "BS_SHORT_TERM_ASSETS",
+                "BS_LONG_TERM_ASSETS",
+                "BS_OWNERS_EQUITY",
+                "BS_LIABILITIES"
+            }
+
+            cursor = bctc_col.find({})
+            total_docs = bctc_col.count_documents({})
+            updated_count = 0
+
+            for doc in cursor:
+                sym = doc.get("symbol")
+                update_data = {}
+                needs_update = False
+
+                for report_key in ["balance_sheet", "income_statement", "cash_flow"]:
+                    if report_key in doc and isinstance(doc[report_key], list):
+                        original_list = doc[report_key]
+                        
+                        # 1. Lọc bỏ các trường không nằm trong danh sách CORE_IDS
+                        filtered_list = [item for item in original_list if item.get("id") in CORE_IDS]
+                        
+                        # 2. Cắt tỉa chỉ giữ lại 8 kỳ gần nhất
+                        if filtered_list:
+                            unique_periods = sorted(list(set([item["period"] for item in filtered_list])), reverse=True)
+                            keep_periods = set(unique_periods[:8])
+                            filtered_list = [item for item in filtered_list if item["period"] in keep_periods]
+                        
+                        # Nếu số lượng phần tử bị giảm đi -> Đánh dấu cần update
+                        if len(filtered_list) != len(original_list):
+                            update_data[report_key] = filtered_list
+                            needs_update = True
+
+                if needs_update:
+                    bctc_col.update_one({"_id": doc["_id"]}, {"$set": update_data})
+                    updated_count += 1
+                    if updated_count % 20 == 0:
+                        print(f"[CLEANUP] ⏳ Đã dọn dẹp {updated_count}/{total_docs} mã BCTC...", flush=True)
+
+            print(f"[CLEANUP] ✅ Đã dọn dẹp xong {updated_count} documents trong bảng BCTC.", flush=True)
+
+            # 3. Dọn dẹp các trường rác trong bảng `stocks`
+            print("[CLEANUP] 🧹 Đang dọn dẹp các trường rác trong bảng Giá (stocks)...", flush=True)
+            # Liệt kê các trường không dùng đến trong bảng stocks
+            junk_fields = [
+                "is_incomplete", 
+                "last_error_at", 
+                "chot_so_today", 
+                "ratio_updated_at"
+            ]
+            
+            # Sử dụng lệnh $unset để xóa các trường này trên toàn bộ collection
+            unset_query = {field: "" for field in junk_fields}
+            result = collection.update_many({}, {"$unset": unset_query})
+            print(f"[CLEANUP] ✅ Đã dọn dẹp {result.modified_count} mã trong bảng Giá (stocks).", flush=True)
+
+            print("[CLEANUP] 🏁 HOÀN TẤT QUÁ TRÌNH DỌN RÁC!", flush=True)
+
+        except Exception as e:
+            print(f"[CLEANUP] ❌ Lỗi trong quá trình dọn rác: {e}", flush=True)
+        finally:
+            is_full_data_running = False
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "success", "message": "Đang chạy tiến trình dọn rác Database. Vui lòng xem log trên Render!"})
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port, debug=False)
