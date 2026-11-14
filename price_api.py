@@ -1870,8 +1870,12 @@ def api_get_data():
             if sym:
                 data[sym] = doc
 
-        # === BỔ SUNG: Lấy nến cuối cùng của TẤT CẢ các mã trong 1 lần query duy nhất ===
-        # Thay vì gọi find_one 100 lần, dùng aggregate để tối ưu tốc độ
+        # 1. Kiểm tra giờ giao dịch (Giờ VN)
+        vn_now = datetime.utcnow() + timedelta(hours=7)
+        is_weekend = vn_now.weekday() >= 5
+        is_trading_hours = (9 <= vn_now.hour < 15) and not is_weekend
+
+        # 2. Lấy nến cuối cùng của TẤT CẢ các mã (tối ưu 1 query)
         pipeline = [
             {"$match": {"history_d1.0": {"$exists": True}}},
             {"$project": {"symbol": 1, "last_bar": {"$arrayElemAt": ["$history_d1", -1]}}}
@@ -1879,24 +1883,25 @@ def api_get_data():
         last_bars = {item["symbol"]: item.get("last_bar") for item in history_col.aggregate(pipeline)}
 
         for sym, doc in data.items():
-            # Nếu tìm thấy nến cuối cùng trong bảng history_data
-            if sym in last_bars and last_bars[sym]:
-                last_bar = last_bars[sym]
-                bar_close = last_bar.get("close")
-                bar_time = last_bar.get("time")
+            # === SỬA: Chỉ ghi đè từ nến khi NGOÀI giờ giao dịch ===
+            if not is_trading_hours:
+                if sym in last_bars and last_bars[sym]:
+                    last_bar = last_bars[sym]
+                    bar_close = last_bar.get("close")
+                    bar_time = last_bar.get("time")
 
-                if bar_close and bar_close > 0:
-                    doc["close"] = bar_close
+                    if bar_close and bar_close > 0:
+                        doc["close"] = bar_close
 
-                if bar_time:
-                    try:
-                        dt = datetime.strptime(bar_time, "%Y-%m-%d")
-                        date_display = dt.strftime("%d/%m/%Y")
-                        time_part = doc.get("updated_at", "15:00:00").split(" ")[1] if " " in doc.get("updated_at", "") else "15:00:00"
-                        doc["updated_at"] = f"{date_display} {time_part}"
-                        doc["trading_date"] = bar_time
-                    except:
-                        pass
+                    if bar_time:
+                        try:
+                            dt = datetime.strptime(bar_time, "%Y-%m-%d")
+                            date_display = dt.strftime("%d/%m/%Y")
+                            time_part = doc.get("updated_at", "15:00:00").split(" ")[1] if " " in doc.get("updated_at", "") else "15:00:00"
+                            doc["updated_at"] = f"{date_display} {time_part}"
+                            doc["trading_date"] = bar_time
+                        except:
+                            pass
 
             # Tính toán lại % thay đổi giá
             close_price = doc.get("close", 0)
