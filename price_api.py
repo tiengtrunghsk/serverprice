@@ -80,6 +80,23 @@ ALIBABA_API_KEY = os.environ.get("ALIBABA_API_KEY", "").strip()
 AI_API_URL = "https://ws-8lcqaxwxdv0h9xzy.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
 AI_MODEL_NAME = os.environ.get("AI_MODEL_NAME", "qwen3.7-max-2026-06-08")
 AI_TEMPERATURE = 0.15
+# ===================== DANH SÁCH MÃ THANH KHOẢN (DÙNG ĐỂ CHECK NGÀY LỄ) =====================
+# Top 15 mã thanh khoản cao nhất VN — luôn khớp ATO ngay từ 9h15
+LIQUID_SYMBOLS_TOP = [
+    "VNM", "VCB", "VIC", "VHM", "HPG", 
+    "FPT", "MWG", "TCB", "VPB", "ACB",
+    "BID", "CTG", "MSN", "GAS", "PLX"
+]
+
+# Top 30 mã mid-cap thanh khoản tốt — dùng để verify nếu top 15 không khớp
+LIQUID_SYMBOLS_MID = [
+    "SSI", "VND", "HCM", "VCI", "MBS",
+    "STB", "SHB", "TPB", "MBB", "HDB",
+    "VIB", "LPB", "OCB", "MSB", "EIB",
+    "PNJ", "FRT", "DGW", "REE", "PC1",
+    "DGC", "DPM", "DCM", "HSG", "NKG",
+    "KDH", "NLG", "DXG", "CEO", "PDR"
+]
 
 # ===================== ĐỌC METADATA TỪ FILE JSON =====================
 VN100_METADATA = {}
@@ -134,6 +151,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
 
 # === BIẾN TRẠNG THÁI ===
+# === BIẾN TRẠNG THÁI ===
 is_crawling = False
 is_full_data_running = False
 is_screener_running = False
@@ -141,6 +159,12 @@ is_ai_running = False
 LAST_TELEGRAM_TIME = 0
 stop_crawl_requested = False
 is_auto_crawl_paused = False
+
+# === BIẾN CHO HOLIDAY CHECKER (THREAD RIÊNG) ===
+holiday_checked_today = None        # Ngày đã check xong (YYYY-MM-DD)
+holiday_status = None               # True = ngày lễ, False = ngày làm việc, None = chưa check
+holiday_detected_date = None        # Ngày phát hiện là lễ (để auto_crawler_worker biết)
+holiday_check_lock = threading.Lock()  # Lock tránh race condition khi đọc/ghi
 
 def get_current_fhsc_key():
     setting = settings_col.find_one({"_id": "fhsc_key"})
@@ -1431,17 +1455,183 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
     except Exception as e:
         print(f"  ❌ Lỗi nghiêm trọng ở _call_ai_for_symbol cho {symbol}: {e}", flush=True)
         return None
+# ===================== HOLIDAY CHECKER (THREAD RIÊNG) =====================
 
+def _check_holiday_smart_standalone(vn_now):
+    """
+    Check ngày lễ thông minh đa tầng (standalone, không phụ thuộc closure).
+    
+    Chiến lược:
+    - Tầng 1: 15 mã top thanh khoản — nếu ≥3 mã có volume > 0 → Ngày làm việc (99.9%)
+    - Tầng 2: Nếu top 15 không có volume nhưng có ≥3 mã biến động giá → Ngày làm việc (99%)
+    - Tầng 3: Check thêm 30 mã mid-cap — nếu có giao dịch → Ngày làm việc (95%)
+    - Tầng 4: Cả 45 mã đều không giao dịch → Ngày lễ (99.99%)
+    
+    Returns: tuple (is_holiday: bool, confidence: str, details: str)
+    """
+    # === TẦNG 1: Check 15 mã thanh khoản cao nhất ===
+    top_with_volume = 0
+    top_with_change = 0
+    top_total = 0
+    
+    for sym in LIQUID_SYMBOLS_TOP:
+        doc = collection.find_one({"symbol": sym})
+        if doc:
+            top_total += 1
+            vol = doc.get("volume", 0) or 0
+            close_p = doc.get("close", 0) or 0
+            prev_p = doc.get("prev_close", 0) or 0
+            
+            if vol > 0:
+                top_with_volume += 1
+            if prev_p > 0 and close_p != prev_p:
+                top_with_change += 1
+    
+    if top_with_volume >= 3:
+        return (False, "99.9%", f"TOP: {top_with_volume}/{top_total} mã có volume > 0")
+    
+    if top_with_change >= 3:
+        return (False, "99%", f"TOP: {top_with_change}/{top_total} mã có biến động giá (volume=0)")
+    
+    # === TẦNG 3: Check thêm 30 mã mid-cap ===
+    mid_with_volume = 0
+    mid_with_change = 0
+    mid_total = 0
+    
+    for sym in LIQUID_SYMBOLS_MID:
+        doc = collection.find_one({"symbol": sym})
+        if doc:
+            mid_total += 1
+            vol = doc.get("volume", 0) or 0
+            close_p = doc.get("close", 0) or 0
+            prev_p = doc.get("prev_close", 0) or 0
+            
+            if vol > 0:
+                mid_with_volume += 1
+            if prev_p > 0 and close_p != prev_p:
+                mid_with_change += 1
+    
+    if mid_with_volume >= 2 or mid_with_change >= 5:
+        return (False, "95%", f"MID: {mid_with_volume}/{mid_total} mã volume>0, {mid_with_change}/{mid_total} mã biến động")
+    
+    # === TẦNG 4: Cả 45 mã đều không giao dịch ===
+    return (
+        True,
+        "99.99%",
+        f"Cả TOP ({top_total} mã) + MID ({mid_total} mã) đều không giao dịch. Volume=0, giá đứng."
+    )
+
+
+def holiday_checker_worker():
+    """
+    Thread riêng để check ngày lễ lúc 9h30.
+    Độc lập hoàn toàn với auto_crawler_worker → không bị trễ khi crawler bận.
+    
+    Logic:
+    - Thức dậy mỗi 30s
+    - Chỉ check vào ngày làm việc (T2-T6), từ 9h30 trở đi
+    - Chỉ check 1 lần/ngày
+    - Nếu phát hiện ngày lễ:
+        * Set holiday_status = True, holiday_checked_today = today
+        * Set holiday_detected_date = today
+        * Ngủ tới 8h55 hôm sau
+    - Nếu ngày làm việc:
+        * Set holiday_status = False, holiday_checked_today = today
+        * Tiếp tục ngủ 60s/lần (không check lại)
+    """
+    global holiday_checked_today, holiday_status, holiday_detected_date, is_auto_crawl_paused
+    
+    print("🗓️ [HOLIDAY] Đã bật thread check ngày lễ (9h30 hàng ngày)!", flush=True)
+    
+    while True:
+        try:
+            # Nếu user pause toàn bộ hệ thống → tạm dừng check
+            if is_auto_crawl_paused:
+                time.sleep(30)
+                continue
+            
+            vn_now = datetime.utcnow() + timedelta(hours=7)
+            today_str = vn_now.strftime("%Y-%m-%d")
+            current_hour = vn_now.hour
+            current_minute = vn_now.minute
+            weekday = vn_now.weekday()
+            
+            # Cuối tuần: không cần check, auto_crawler_worker tự xử lý
+            if weekday >= 5:
+                time.sleep(60)
+                continue
+            
+            # Ngoài giờ check (trước 9h30 hoặc sau 15h): ngủ
+            is_after_930 = (current_hour > 9) or (current_hour == 9 and current_minute >= 30)
+            is_before_15h = current_hour < 15
+            if not (is_after_930 and is_before_15h):
+                time.sleep(30)
+                continue
+            
+            # Đã check hôm nay rồi → ngủ tiếp
+            with holiday_check_lock:
+                already_checked = (holiday_checked_today == today_str)
+            
+            if already_checked:
+                time.sleep(60)
+                continue
+            
+            # Đã đến giờ check và chưa check → tiến hành
+            print(f"\n🗓️ [HOLIDAY] Check ngày lễ lúc {vn_now.strftime('%H:%M:%S')} (thread riêng)...", flush=True)
+            
+            is_holiday, confidence, details = _check_holiday_smart_standalone(vn_now)
+            
+            # Ghi kết quả (dùng lock để tránh race condition)
+            with holiday_check_lock:
+                holiday_checked_today = today_str
+                holiday_status = is_holiday
+                if is_holiday:
+                    holiday_detected_date = today_str
+            
+            if is_holiday:
+                print(f"🌙 [HOLIDAY] KẾT LUẬN: NGÀY LỄ (Độ tin cậy {confidence})", flush=True)
+                print(f"   Chi tiết: {details}", flush=True)
+                print(f"🌙 [HOLIDAY] Tạm dừng crawl tới 8h55 hôm sau...", flush=True)
+                
+                # Set cờ để auto_crawler_worker dừng crawl (nếu đang crawl)
+                is_auto_crawl_paused = True
+                
+                # Ngủ tới 8h55 hôm sau
+                tomorrow = vn_now + timedelta(days=1)
+                while tomorrow.weekday() >= 5:
+                    tomorrow += timedelta(days=1)
+                wake_up_time = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
+                sleep_seconds = (wake_up_time - vn_now).total_seconds()
+                time.sleep(min(sleep_seconds, 3600))
+                
+                # Sáng hôm sau: tự mở lại
+                is_auto_crawl_paused = False
+                print(f"☀️ [HOLIDAY] Đã hết thời gian nghỉ, tự mở lại hệ thống.", flush=True)
+            else:
+                print(f"✅ [HOLIDAY] KẾT LUẬN: NGÀY LÀM VIỆC (Độ tin cậy {confidence})", flush=True)
+                print(f"   Chi tiết: {details}", flush=True)
+                time.sleep(60)
+                
+        except Exception as e:
+            print(f"❌ [HOLIDAY] Lỗi: {e}", flush=True)
+            time.sleep(30)
 # ===================== BACKGROUND WORKERS =====================
 def auto_crawler_worker():
     """
-    Auto crawler với logic:
-    - Cào 9h-15h (nghỉ trưa 11h30-13h)
-    - Vẫn cào 15h00-15h05 để bắt giá ATC muộn
-    - Chốt sổ sau 15h05
-    - Tự phát hiện ngày lễ
+    Auto crawler — KHÔNG tự check ngày lễ.
+    Đọc kết quả từ holiday_checker_worker qua biến global holiday_status.
+    
+    Logic:
+    - Cuối tuần: ngủ
+    - Ngoài 9h-15h05: ngủ
+    - holiday_status == True (ngày lễ): ngủ tới mai
+    - holiday_status == None + đã 9h30: chờ holiday_checker_worker check (ngủ ngắn)
+    - holiday_status == False: crawl bình thường
     """
-    print("⏰ [AUTO] Đã bật chế độ cào Real-time (Tự động phát hiện ngày nghỉ)!", flush=True)
+    global holiday_status, holiday_checked_today, holiday_detected_date
+    
+    print("⏰ [AUTO] Đã bật chế độ cào Real-time (Đọc kết quả check lễ từ thread riêng)!", flush=True)
+    
     while True:
         try:
             global is_auto_crawl_paused
@@ -1455,6 +1645,7 @@ def auto_crawler_worker():
             current_minute = vn_now.minute
             weekday = vn_now.weekday()
 
+            # === XỬ LÝ CUỐI TUẦN ===
             is_weekend = weekday >= 5
             if is_weekend:
                 tomorrow = vn_now + timedelta(days=1)
@@ -1469,17 +1660,12 @@ def auto_crawler_worker():
 
             is_lunch_break = (current_hour == 11 and current_minute >= 30) or (current_hour == 12)
             is_trading_time = (9 <= current_hour < 15) and (not is_lunch_break)
-            
-            # === BỔ SUNG: cửa sổ chốt sổ 15h00-15h05 ===
-            # Trong khoảng này vẫn chạy để bắt giá ATC muộn
             is_closing_window = (current_hour == 15 and current_minute < 5)
 
             if not (is_trading_time or is_closing_window):
                 if is_lunch_break:
                     wake_up_time = vn_now.replace(hour=13, minute=0, second=0, microsecond=0)
                 else:
-                    # Nếu đã qua 15h05 → ngủ tới 8h55 hôm sau
-                    # Nếu đang trong 15h00-15h05 → ngủ ngắn 15s rồi check lại
                     if current_hour == 15 and current_minute < 5:
                         time.sleep(15)
                         continue
@@ -1496,37 +1682,37 @@ def auto_crawler_worker():
                     time.sleep(min(sleep_seconds, 3600))
                     continue
 
-            if current_hour == 10 and current_minute == 0:
-                all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-                any_changed = False
-                
-                print(f"🔍 [AUTO] Kiểm tra toàn bộ {len(all_symbols)} mã (Ngày lễ hay ngày làm việc?)...", flush=True)
-                
-                for sym in all_symbols:
-                    doc = collection.find_one({"symbol": sym})
-                    if doc:
-                        if doc.get("close") != doc.get("prev_close") or doc.get("volume", 0) > 0:
-                            any_changed = True
-                            print(f"  ✅ [AUTO] Thị trường đang giao dịch (Mã {sym} đã biến động).", flush=True)
-                            break
-                
-                if not any_changed:
-                    print(f"🌙 [AUTO] Toàn bộ {len(all_symbols)} mã đều đứng giá. Kết luận: Hôm nay là NGÀY NGHỈ.", flush=True)
-                    tomorrow = vn_now + timedelta(days=1)
-                    while tomorrow.weekday() >= 5:
-                        tomorrow += timedelta(days=1)
-                    wake_up_time = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
-                    sleep_seconds = (wake_up_time - vn_now).total_seconds()
-                    print(f"🌙 [AUTO] Tạm nghỉ đến {wake_up_time.strftime('%H:%M %d/%m')}...", flush=True)
-                    time.sleep(min(sleep_seconds, 3600))
-                    continue
+            # ══════════════════════════════════════════════════════════════
+            # ĐỌC KẾT QUẢ CHECK NGÀY LỄ TỪ GLOBAL
+            # ══════════════════════════════════════════════════════════════
+            with holiday_check_lock:
+                current_holiday_status = holiday_status
+                current_holiday_checked_date = holiday_checked_today
+            
+            is_after_930 = (current_hour > 9) or (current_hour == 9 and current_minute >= 30)
+            
+            # Nếu đã qua 9h30 và chưa check xong → chờ holiday_checker_worker
+            if is_after_930 and current_holiday_checked_date != today_str:
+                print(f"⏳ [AUTO] Chờ holiday_checker_worker check xong (đã qua 9h30)...", flush=True)
+                time.sleep(15)
+                continue
+            
+            # Nếu phát hiện ngày lễ → ngủ (holiday_checker_worker đã set is_auto_crawl_paused = True, 
+            # nhưng vẫn kiểm tra để đảm bảo)
+            if current_holiday_checked_date == today_str and current_holiday_status == True:
+                print(f"🌙 [AUTO] Hôm nay là ngày lễ (theo holiday_checker). Tạm nghỉ...", flush=True)
+                # holiday_checker_worker đã set is_auto_crawl_paused = True rồi
+                time.sleep(60)
+                continue
 
+            # ══════════════════════════════════════════════════════════════
+            # CRAWL BÌNH THƯỜNG (chỉ chạy khi không phải ngày lễ)
+            # ══════════════════════════════════════════════════════════════
             collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
             crawled_count = collection.count_documents({"chot_so_today": today_str})
 
             if crawled_count >= len(all_symbols) and len(all_symbols) > 0:
-                # Nếu đang trong 15h00-15h05 mà đã chốt sổ → ngủ 15s chờ 15h05 để re-check
                 if current_hour == 15 and current_minute < 5:
                     time.sleep(15)
                     continue
@@ -1822,6 +2008,7 @@ def screener_worker():
 
 
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
+threading.Thread(target=holiday_checker_worker, daemon=True).start()  # ← MỚI
 threading.Thread(target=full_data_crawler_worker, daemon=True).start()
 threading.Thread(target=screener_worker, daemon=True).start()
 
@@ -1846,12 +2033,33 @@ def pause_crawl():
 
 @app.get("/api/resume-crawl")
 def resume_crawl():
-    global is_auto_crawl_paused, stop_crawl_requested
+    global is_auto_crawl_paused, stop_crawl_requested, holiday_status, holiday_checked_today
     is_auto_crawl_paused = False
     stop_crawl_requested = False
+    
+    # Reset trạng thái check lễ nếu user muốn override
+    with holiday_check_lock:
+        if holiday_status == True:
+            print(f"\n[API] ⚠️ User override: Reset trạng thái ngày lễ. Hệ thống sẽ crawl lại.", flush=True)
+            holiday_status = None
+            holiday_checked_today = None
+    
     print("\n[API] ▶️ Đã TIẾP TỤC tiến trình cào tự động!", flush=True)
-    return jsonify({"status": "success", "message": "Đã tiếp tục cào tự động."})
-
+    return jsonify({"status": "success", "message": "Đã tiếp tục cào tự động (đã reset trạng thái ngày lễ nếu có)."})
+@app.get("/api/holiday-status")
+def api_holiday_status():
+    """Xem trạng thái check ngày lễ hiện tại."""
+    with holiday_check_lock:
+        return jsonify({
+            "status": "success",
+            "data": {
+                "holiday_checked_today": holiday_checked_today,
+                "holiday_status": holiday_status,  # True = lễ, False = làm việc, None = chưa check
+                "holiday_detected_date": holiday_detected_date,
+                "is_auto_crawl_paused": is_auto_crawl_paused,
+                "current_time_vn": (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
+            }
+        })
 @app.post("/api/set-fhsc-key")
 def api_set_fhsc_key():
     print("[API] 🔑 Gọi API /api/set-fhsc-key", flush=True)
