@@ -1457,7 +1457,18 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
         return None
 # ===================== HOLIDAY CHECKER (THREAD RIÊNG) =====================
 
-def _check_holiday_smart_standalone(
+def _check_holiday_smart_standalone(vn_now):
+    """
+    Check ngày lễ thông minh đa tầng (standalone, không phụ thuộc closure).
+    
+    Chiến lược:
+    - Tầng 1: 15 mã top thanh khoản — nếu ≥3 mã có volume > 0 → Ngày làm việc (99.9%)
+    - Tầng 2: Nếu top 15 không có volume nhưng có ≥3 mã biến động giá → Ngày làm việc (99%)
+    - Tầng 3: Check thêm 30 mã mid-cap — nếu có giao dịch → Ngày làm việc (95%)
+    - Tầng 4: Cả 45 mã đều không giao dịch → Ngày lễ (99.99%)
+    
+    Returns: tuple (is_holiday: bool, confidence: str, details: str)
+    """
     # === TẦNG 1: Check 15 mã thanh khoản cao nhất ===
     top_with_volume = 0
     top_with_change = 0
@@ -1512,7 +1523,25 @@ def _check_holiday_smart_standalone(
 
 
 def holiday_checker_worker():
-   
+    """
+    Thread riêng để check ngày lễ lúc 9h30.
+    Độc lập hoàn toàn với auto_crawler_worker → không bị trễ khi crawler bận.
+    
+    Sử dụng biến RIÊNG is_holiday_paused — KHÔNG đụng is_auto_crawl_paused của user.
+    
+    Logic:
+    - Thức dậy mỗi 30s
+    - Chỉ check vào ngày làm việc (T2-T6), từ 9h30 trở đi
+    - Chỉ check 1 lần/ngày
+    - Nếu phát hiện ngày lễ:
+        * Set holiday_status = True, holiday_checked_today = today
+        * Set is_holiday_paused = True (KHÔNG đụng is_auto_crawl_paused)
+        * Ngủ tới 8h55 hôm sau
+        * Sáng hôm sau: tự reset is_holiday_paused = False
+    - Nếu ngày làm việc:
+        * Set holiday_status = False, holiday_checked_today = today
+        * Tiếp tục ngủ 60s/lần (không check lại)
+    """
     global holiday_checked_today, holiday_status, holiday_detected_date, is_holiday_paused
     
     print("🗓️ [HOLIDAY] Đã bật thread check ngày lễ (9h30 hàng ngày)!", flush=True)
@@ -1592,7 +1621,21 @@ def holiday_checker_worker():
             time.sleep(30)
 # ===================== BACKGROUND WORKERS =====================
 def auto_crawler_worker():
-   
+    """
+    Auto crawler — KHÔNG tự check ngày lễ.
+    Đọc kết quả từ holiday_checker_worker qua biến global holiday_status.
+    
+    Có timeout fallback: nếu quá 10h mà holiday_checker chưa check xong 
+    (VD: thread bị chết) → tự check lấy để tránh treo.
+    
+    Logic:
+    - Cuối tuần: ngủ
+    - Ngoài 9h-15h05: ngủ
+    - is_auto_crawl_paused (user pause) HOẶC is_holiday_paused (holiday tự pause): ngủ
+    - holiday_status == True (ngày lễ): ngủ tới mai
+    - holiday_status == None + đã 9h30: chờ holiday_checker_worker (fallback lúc 10h)
+    - holiday_status == False: crawl bình thường
+    """
     global holiday_status, holiday_checked_today, holiday_detected_date, is_holiday_paused
     
     print("⏰ [AUTO] Đã bật chế độ cào Real-time (Đọc kết quả check lễ từ thread riêng)!", flush=True)
