@@ -2829,28 +2829,20 @@ def retry_now():
 # ===================== API LỊCH SỬ (TẢI TOÀN BỘ 1 LẦN) =====================
 @app.get("/api/history-all")
 def api_get_history_all():
-    """
-    Trả về TOÀN BỘ dữ liệu lịch sử (chỉ 50 nến gần nhất).
-    Dùng $slice từ MongoDB để giảm RAM load (tránh OOM trên Render free tier).
-    Có CACHE 60 giây để tránh server phải đọc DB liên tục.
-    """
+    """Trả về 50 nến gần nhất của tất cả mã — dùng cho lần tải đầu (tránh OOM)."""
     global _history_cache
     try:
         now = time.time()
-        
-        # Kiểm tra cache còn hạn không
         with _history_cache["lock"]:
             if _history_cache["data"] and (now - _history_cache["timestamp"]) < HISTORY_CACHE_TTL:
                 print(f"[API] 🚀 /api/history-all: Trả cache ({len(_history_cache['data']['data'])} mã)", flush=True)
                 return jsonify(_history_cache["data"])
         
-        # Nếu cache hết hạn, đọc từ DB
-        print("[API] 📊 /api/history-all: Đọc DB (cache hết hạn)...", flush=True)
+        print("[API] 📊 /api/history-all: Đọc DB (50 nến/mã)...", flush=True)
         all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
         result = {}
         
         for sym in all_symbols:
-            # ✅ Dùng $slice để MongoDB chỉ trả 50 nến cuối → giảm RAM Python
             hist_doc = history_col.find_one(
                 {"symbol": sym}, 
                 {"_id": 0, "history_d1": {"$slice": -50}}
@@ -2860,17 +2852,60 @@ def api_get_history_all():
                 
         response_data = {"status": "success", "count": len(result), "data": result}
         
-        # Lưu vào cache
         with _history_cache["lock"]:
             _history_cache["data"] = response_data
             _history_cache["timestamp"] = now
             
-        print(f"[API] ✅ /api/history-all: Đã tải {len(result)} mã, lưu cache {HISTORY_CACHE_TTL}s", flush=True)
+        print(f"[API] ✅ /api/history-all: Đã tải {len(result)} mã (50 nến)", flush=True)
         return jsonify(response_data)
     except Exception as e:
         log_exception("[API HISTORY ALL]", e)
         return jsonify({"status": "error", "message": str(e)}), 500
-
+@app.get("/api/history-all-more")
+def api_get_history_all_more():
+    """
+    Trả về nến CŨ HƠN nến thứ 50 của tất cả mã (từ nến -300 đến -50).
+    Dùng để merge vào cache sau khi đã có 50 nến gần nhất.
+    """
+    try:
+        print("[API] 📊 /api/history-all-more: Đọc nến cũ hơn (250 nến/mã)...", flush=True)
+        all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+        result = {}
+        
+        for sym in all_symbols:
+            hist_doc = history_col.find_one({"symbol": sym}, {"_id": 0})
+            if hist_doc and hist_doc.get("history_d1"):
+                bars = hist_doc["history_d1"]
+                # Bỏ 50 nến gần nhất đã có, lấy 250 nến trước đó (tổng 300 nến)
+                older_bars = bars[:-50][-250:] if len(bars) > 50 else []
+                if older_bars:
+                    result[sym] = {"history_d1": older_bars}
+                
+        response_data = {"status": "success", "count": len(result), "data": result}
+        print(f"[API] ✅ /api/history-all-more: Đã tải {len(result)} mã (250 nến cũ)", flush=True)
+        return jsonify(response_data)
+    except Exception as e:
+        log_exception("[API HISTORY ALL MORE]", e)
+        return jsonify({"status": "error", "message": str(e)}), 500       
+@app.get("/api/history-all-full")
+def api_get_history_all_full():
+    """Trả về TOÀN BỘ nến còn lại (từ đầu đến nến -300)."""
+    try:
+        all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+        result = {}
+        
+        for sym in all_symbols:
+            hist_doc = history_col.find_one({"symbol": sym}, {"_id": 0})
+            if hist_doc and hist_doc.get("history_d1"):
+                bars = hist_doc["history_d1"]
+                # Chỉ lấy nến trước nến -300
+                older_bars = bars[:-300] if len(bars) > 300 else []
+                if older_bars:
+                    result[sym] = {"history_d1": older_bars}
+        
+        return jsonify({"status": "success", "count": len(result), "data": result})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # ===================== API LỊCH SỬ (ĐÃ FIX ĐỒNG BỘ) =====================
 # ===================== API LỊCH SỬ (ĐÃ FIX ĐỒNG BỘ) =====================
