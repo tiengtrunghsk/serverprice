@@ -106,7 +106,7 @@ try:
         MONGO_URI, 
         serverSelectionTimeoutMS=30000, 
         connectTimeoutMS=15000, 
-        socketTimeoutMS=60000, # Tăng lên 60s để tránh lỗi NetworkTimeout trên Render
+        socketTimeoutMS=60000,
         appname="price_api"
     )
     mongo_client.admin.command("ping")
@@ -158,7 +158,12 @@ def _get_trading_date_str() -> str:
     return vn_now.strftime("%Y-%m-%d")
 
 def _is_after_15h() -> bool:
-    return (datetime.utcnow() + timedelta(hours=7)).hour >= 15
+    """
+    Trả về True nếu đã qua 15h05 — thời điểm an toàn để chốt sổ.
+    Đã dời từ 15h00 -> 15h05 để tránh delay dữ liệu ATC từ API.
+    """
+    vn_now = datetime.utcnow() + timedelta(hours=7)
+    return vn_now.hour > 15 or (vn_now.hour == 15 and vn_now.minute >= 5)
 
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
@@ -231,21 +236,18 @@ def extract_metrics_from_bctc_data(bctc_doc):
     cashflow = bctc_doc.get("cash_flow", [])
     balance = bctc_doc.get("balance_sheet", [])
     
-    # 1. LNST TTM (4 quý)
     periods = sorted(list(set([item.get("period") for item in income if item.get("period")])), reverse=True)
     npat_ttm = 0
     for p in periods[:4]:
         npat_ttm += _get_bctc_value(income, ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX", "IS_NET_PROFIT"], p)
     metrics["net_profit_ttm"] = round(npat_ttm / 1e9, 2)
     
-    # 2. CFO TTM (4 quý)
     cf_periods = sorted(list(set([item.get("period") for item in cashflow if item.get("period")])), reverse=True)
     cfo_ttm = 0
     for p in cf_periods[:4]:
         cfo_ttm += _get_bctc_value(cashflow, "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES", p)
     metrics["cfo_latest"] = round(cfo_ttm / 1e9, 2)
     
-    # 3. Biên gộp (Quý mới nhất)
     latest_period = periods[0] if periods else None
     if latest_period:
         rev = _get_bctc_value(income, "IS_NET_REVENUE", latest_period)
@@ -253,7 +255,6 @@ def extract_metrics_from_bctc_data(bctc_doc):
         if rev > 0:
             metrics["gross_margin"] = round((rev + cogs) / rev * 100, 1)
             
-    # 4. D/E (Quý mới nhất)
     bs_periods = sorted(list(set([item.get("period") for item in balance if item.get("period")])), reverse=True)
     latest_bs_period = bs_periods[0] if bs_periods else None
     if latest_bs_period:
@@ -345,18 +346,13 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
         return df if df is not None and not df.empty else None
     except Exception: return None
 
-# ===================== CÀO BCTC TRỰC TIẾP TỪ VCI (MÃ 2) =====================
+# ===================== CÀO BCTC TRỰC TIẾP TỪ VCI =====================
 def _fetch_bctc_ssi(symbol: str):
-    """
-    Lấy BCTC trực tiếp từ Vietcap IQ API, không dùng vnstock/FHSC.
-    Chỉ lấy các chỉ tiêu cốt lõi, bỏ qua các trường VCI_... rác.
-    """
     symbol = str(symbol).upper().strip()
     if not symbol or not re.fullmatch(r"[A-Z0-9]{2,10}", symbol):
         logger.warning("[BCTC VCI] Mã cổ phiếu không hợp lệ: %r", symbol)
         return None
 
-    # Danh sách các ID cốt lõi BẮT BUỘC phải lưu
     CORE_IDS = {
         "IS_NET_REVENUE", "IS_COST_OF_GOODS_SOLD", "IS_NET_PROFIT_AFTER_TAX",
         "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES", "BS_TOTAL_ASSETS",
@@ -442,21 +438,17 @@ def _fetch_bctc_ssi(symbol: str):
             if "gia von hang ban" in label or "cost of goods sold" in label:
                 return "IS_COST_OF_GOODS_SOLD"
             
-            # BẮT CHÍNH XÁC LỢI NHUẬN SAU THUẾ (isa20), BỎ QUA LỢI ÍCH CỔ ĐÔNG THIỂU SỐ (isa21)
             if field == "ISA20" or "loi nhuan sau thue thu nhap doanh nghiep" in label:
                 return "IS_NET_PROFIT_AFTER_TAX"
             
-            # Hỗ trợ thêm cho các mã Ngân hàng/Chứng khoán (thường dùng id khác)
             if field in ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX"] or "loi nhuan sau thue" in label:
                 if "co dong thieu so" not in label and "khong kiem soat" not in label:
                     return "IS_NET_PROFIT_AFTER_TAX"
 
         elif report_name == "cash_flow":
-            # CHỈ LẤY DUY NHẤT DÒNG CFA18 (Lưu chuyển tiền tệ ròng từ HĐKD)
             if field == "CFA18":
                 return "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
             
-            # Hỗ trợ cho các mã không dùng VCI (hoặc VCI đổi ID)
             if "luu chuyen tien te rong" in label or "net cash flows from operating activities" in label:
                 return "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
 
@@ -468,7 +460,6 @@ def _fetch_bctc_ssi(symbol: str):
             if "tai san dai han" in label or "non current assets" in label:
                 return "BS_LONG_TERM_ASSETS"
             
-            # Vốn chủ sở hữu (ưu tiên lấy dòng "Vốn chủ sở hữu", không lấy "Vốn và các quỹ" để tránh trùng lặp)
             if "von chu so huu" in label or "owners equity" in label or "owner equity" in label:
                 return "BS_OWNERS_EQUITY"
             if "von va cac quy" in label:
@@ -564,11 +555,9 @@ def _fetch_bctc_ssi(symbol: str):
                         title = titles.get(str(field_code), str(field_code))
                         item_id = canonical_id(report_name, field_code, title)
                         
-                        # BỎ QUA NGAY NẾU KHÔNG NẰM TRONG DANH SÁCH CỐT LÕI
                         if not item_id or item_id not in CORE_IDS:
                             continue
 
-                        # Logic tính biên gộp hiện tại dùng giá vốn âm.
                         if item_id == "IS_COST_OF_GOODS_SOLD" and value > 0:
                             value = -value
 
@@ -582,7 +571,6 @@ def _fetch_bctc_ssi(symbol: str):
                         })
 
                 if records:
-                    # Cắt tỉa chỉ giữ 8 kỳ gần nhất
                     unique_periods = sorted(list(set([item["period"] for item in records])), reverse=True)
                     keep_periods = set(unique_periods[:8])
                     records = [item for item in records if item["period"] in keep_periods]
@@ -654,6 +642,10 @@ def get_vndirect_ratio(symbol, ratio_code):
 
 # ===================== CORE LOGIC CÀO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
+    """
+    Cào giá realtime. Từ 15h05 trở đi sẽ chốt sổ (ghi nến vào history_d1).
+    Dời từ 15h00 -> 15h05 để tránh delay dữ liệu ATC.
+    """
     global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
     if is_crawling: return
     is_crawling = True
@@ -664,6 +656,10 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
         vn_now = datetime.utcnow() + timedelta(hours=7)
         real_today = vn_now.strftime("%Y-%m-%d")
         current_hour = vn_now.hour
+        current_minute = vn_now.minute
+
+        # === ĐIỀU KIỆN CHỐT SỔ: sau 15h05 (thay vì 15h00) ===
+        is_closing_time = (current_hour > 15) or (current_hour == 15 and current_minute >= 5)
 
         alert_batch, pending_history_files = [], {}
 
@@ -748,7 +744,8 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     if prev_close > 0 and abs(pct_change) >= 3.0 and vol_pct >= 120.0:
                         alert_batch.append({"sym": sym, "pct_change": pct_change, "volume_percent": vol_pct, "trend": "🔴 GIẢM" if pct_change < 0 else "🟢 TĂNG"})
                         
-                    if current_hour >= 15:
+                    # === CHỐT SỔ SAU 15H05 ===
+                    if is_closing_time:
                         has_traded_today = (not is_locked) or (data.get("volume", 0) > 0)
                         
                         if has_traded_today:
@@ -778,7 +775,7 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                     collection.update_one({"symbol": sym}, {"$set": {"is_incomplete": True, "last_error_at": _now_str()}}, upsert=True)
             time.sleep(1)
 
-        if current_hour >= 15 and pending_history_files:
+        if is_closing_time and pending_history_files:
             files_to_push = list(pending_history_files.keys())
             for i in range(0, len(files_to_push), 10):
                 chunk_files = files_to_push[i:i+10]
@@ -842,7 +839,7 @@ def commit_multiple_files_to_github(files_to_update: dict, commit_message: str, 
         except Exception: time.sleep(2)
     return False
 
-# ===================== CHẤM ĐIỂM (FULL LOGIC) =====================
+# ===================== CHẤM ĐIỂM =====================
 FALLBACK_SECTOR_MAPPING = {
     "NGAN_HANG": ["ACB","BID","CTG","TCB","MBB","STB","VPB","HDB","VIB","TPB","SHB","SSB","LPB","MSB","OCB","EIB","VCB"],
     "CHUNG_KHOAN": ["SSI","VCI","HCM","VIX","MBS","FTS","BSI","CTS","ORS"],
@@ -889,10 +886,8 @@ def normalize_stock_data(symbol, data):
     pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
     
-    # BỔ SUNG: Chuẩn hóa EPS về đơn vị Nghìn VNĐ
     if eps >= 1000:
         eps = eps / 1000.0
-    # Nếu EPS quá lớn so với giá (VD: PDR eps=538 nhưng giá=11.5), tự động chia 1000
     if close_price > 0 and eps > (close_price * 5): 
         eps = eps / 1000.0
         print(f"    [CẢNH BÁO] Đã sửa lỗi EPS cho {symbol} (chia 1000): {eps}", flush=True)
@@ -907,6 +902,7 @@ def normalize_stock_data(symbol, data):
             "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
             "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
             "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy}
+
 def compute_sector_medians(normalized_db):
     buckets = {}
     for symbol, nd in normalized_db.items():
@@ -954,7 +950,6 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
         if sales_per_share > 0:
             methods["PS_method"] = round(sales_per_share * target_ps, 0)
             
-    # BỔ SUNG: LỌC BỎ CÁC PHƯƠNG PHÁP VÔ LÝ (Cao hơn 3 lần hoặc thấp hơn 0.2 lần giá hiện tại)
     valid_methods = {}
     for k, v in methods.items():
         if v > 0 and close > 0:
@@ -987,6 +982,7 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
         "discount_to_fair_pct": round(discount_to_fair, 1), 
         "verdict": verdict
     }
+
 def compute_final_decision(fund_score, tech_score, val_score, total_score, verdict, cfo, npat, roe, debt_to_equity, discount_to_fair_pct=0.0, close_price=0.0, fair_high=0.0, fair_low=0.0):
     is_bank_or_sec = roe > 0 and debt_to_equity > 3.0
     if fund_score < 20: return ("❌ TRÁNH", "rose", f"PTCB yếu")
@@ -1109,24 +1105,20 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
 
     sim_data = get_historical_return_rate_with_details(symbol)
     
-    # Bổ sung metadata
     meta = VN100_METADATA.get(symbol, {})
 
-    # === BỔ SUNG: BỐC BÀI VIẾT AI TỪ STOCKS SANG VÀ TỰ TÍNH LẠI PRICE_ZONE ===
     ai_data = {
         "bctc": "", "catalyst": "", "risks": "", "outlook": "", 
         "recommendation": "", "price_zone": "", "macro_view": "", 
         "ai_updated_at": "Chưa phân tích", "ai_source": ""
     }
     
-    # 1. Tìm trong bảng stocks xem mã này đã có bài AI chưa
     stock_doc = collection.find_one({"symbol": symbol}, {
         "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1, 
         "ai_updated_at": 1, "ai_source": 1
     })
     
     if stock_doc and stock_doc.get("ai_bctc"):
-        # Nếu có, bốc toàn bộ văn bản AI sang
         ai_data["bctc"] = stock_doc.get("ai_bctc", "")
         ai_data["catalyst"] = stock_doc.get("ai_catalyst", "")
         ai_data["risks"] = stock_doc.get("ai_risks", "")
@@ -1134,7 +1126,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         ai_data["ai_updated_at"] = stock_doc.get("ai_updated_at", "Chưa phân tích")
         ai_data["ai_source"] = stock_doc.get("ai_source", "AI")
         
-        # 2. TỰ TÍNH LẠI VÙNG MUA VÀ KHUYẾN NGHỊ (Không cho AI tự tính)
         metrics_for_template = {
             **nd,
             "fair_value_low": fv["fair_low"],
@@ -1155,7 +1146,6 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         ai_data["outlook"] = temp_template.get("outlook", "")
         ai_data["recommendation"] = temp_template.get("recommendation", "")
         ai_data["price_zone"] = temp_template.get("price_zone", "")
-    # =======================================================================
 
     return {
         "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
@@ -1231,7 +1221,6 @@ def build_verified_facts(symbol, sm, si, sector):
     return "\n".join(lines)
 
 def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
-    """Tạo báo cáo Template khi chưa có AI."""
     close = float(stock_metrics.get("close", stock_metrics.get("close_price", 0)) or 0)
     pe = float(stock_metrics.get("pe", 0) or 0)
     pb = float(stock_metrics.get("pb", 0) or 0)
@@ -1260,7 +1249,6 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     sector_name = SECTOR_NAMES.get(sector, sector)
     is_bank_or_sec = sector in ("NGAN_HANG", "CHUNG_KHOAN")
 
-    # --- Phần BCTC ---
     bctc_parts = [f"Chỉ số sinh lời: ROE đạt {roe:.1f}%, ROA {roa:.1f}%."]
     if is_bank_or_sec:
         bctc_parts.append(f"P/E {pe:.2f}x và P/B {pb:.2f}x phản ánh mức định giá của định chế tài chính. D/E {de:.2f} là bản chất ngân hàng.")
@@ -1281,7 +1269,6 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     if div_yield > 0: bctc_parts.append(f"Cổ tức {div_yield}%/năm.")
     bctc = " ".join(bctc_parts)
 
-    # --- Phần Catalyst & Risks ---
     moat_map = {
         "NGAN_HANG": "tệp khách hàng bán lẻ trung thành và chi phí vốn thấp",
         "CHUNG_KHOAN": "thị phần môi giới ổn định và quan hệ với nhà đầu tư tổ chức",
@@ -1305,7 +1292,6 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     }
     risks = risk_map.get(sector, f"Rủi ro chung của ngành {sector_name}.")
 
-    # --- Phần Outlook ---
     if verdict == "RẺ - TRONG VÙNG MUA":
         outlook = f"Giá {close:,.0f} VNĐ nằm dưới vùng mua an toàn {fair_low:,.0f} VNĐ, biên an toàn {discount_pct:.1f}% (MoS {mos_pct:.0f}%). Đây là vùng định giá hấp dẫn cho tích sản dài hạn. Quyết định: {final_decision}."
     elif verdict == "HỢP LÝ - CHỜ ĐIỀU CHỈNH":
@@ -1315,7 +1301,6 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
     else:
         outlook = f"Chưa đủ dữ liệu định giá. Verdict: {verdict}."
 
-    # --- Recommendation ---
     rec_text, rec_weight = DECISION_TO_RECOMMENDATION.get(final_decision, ("NẮM GIỮ / THEO DÕI", "Tỷ trọng 0%"))
     recommendation = f"{rec_text} — {rec_weight}"
 
@@ -1358,8 +1343,6 @@ def _call_ai_for_symbol(symbol, sm, si, sector):
         discount_pct = float(sm.get("discount_to_fair_pct", 0) or 0)
         close_price = float(sm.get("close", sm.get("close_price", 0)) or 0)
         
-        # === BỔ SUNG: QUY ĐỔI RA VNĐ ĐỂ AI HIỂU ĐÚNG ĐƠN VỊ ===
-        # Nếu giá < 1000 (tức là đang ở đơn vị Nghìn VNĐ), tự động nhân 1000
         if close_price > 0 and close_price < 1000:
             close_price *= 1000
         if fair_low > 0 and fair_low < 1000:
@@ -1415,7 +1398,6 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                     
                     parsed = json.loads(content)
                     
-                    # === SỬA TẠI ĐÂY: LUÔN GHI ĐÈ PRICE_ZONE BẰNG SỐ CHUẨN TỪ HỆ THỐNG (ĐÃ NHÂN 1000) ===
                     if fair_low > 0 and fair_high > 0:
                         parsed["price_zone"] = (
                             f"Vùng mua: {fair_low:,.0f} VNĐ — {fair_high:,.0f} VNĐ | "
@@ -1424,7 +1406,6 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                     else:
                         parsed["price_zone"] = "Chưa đủ dữ liệu định giá (Cần cào lại BCTC/Chỉ số)"
 
-                    # Kiểm tra khuyến nghị AI xem có tự đổi chữ không
                     ai_rec = parsed.get("recommendation", "").upper()
                     expected_rec = rec_text.upper()
                     if expected_rec not in ai_rec:
@@ -1453,6 +1434,13 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
 
 # ===================== BACKGROUND WORKERS =====================
 def auto_crawler_worker():
+    """
+    Auto crawler với logic:
+    - Cào 9h-15h (nghỉ trưa 11h30-13h)
+    - Vẫn cào 15h00-15h05 để bắt giá ATC muộn
+    - Chốt sổ sau 15h05
+    - Tự phát hiện ngày lễ
+    """
     print("⏰ [AUTO] Đã bật chế độ cào Real-time (Tự động phát hiện ngày nghỉ)!", flush=True)
     while True:
         try:
@@ -1481,16 +1469,26 @@ def auto_crawler_worker():
 
             is_lunch_break = (current_hour == 11 and current_minute >= 30) or (current_hour == 12)
             is_trading_time = (9 <= current_hour < 15) and (not is_lunch_break)
+            
+            # === BỔ SUNG: cửa sổ chốt sổ 15h00-15h05 ===
+            # Trong khoảng này vẫn chạy để bắt giá ATC muộn
+            is_closing_window = (current_hour == 15 and current_minute < 5)
 
-            if not is_trading_time:
+            if not (is_trading_time or is_closing_window):
                 if is_lunch_break:
                     wake_up_time = vn_now.replace(hour=13, minute=0, second=0, microsecond=0)
                 else:
-                    wake_up_time = vn_now.replace(hour=8, minute=55, second=0, microsecond=0)
-                    if current_hour >= 15:
-                        wake_up_time += timedelta(days=1)
-                    while wake_up_time.weekday() >= 5:
-                        wake_up_time += timedelta(days=1)
+                    # Nếu đã qua 15h05 → ngủ tới 8h55 hôm sau
+                    # Nếu đang trong 15h00-15h05 → ngủ ngắn 15s rồi check lại
+                    if current_hour == 15 and current_minute < 5:
+                        time.sleep(15)
+                        continue
+                    else:
+                        wake_up_time = vn_now.replace(hour=8, minute=55, second=0, microsecond=0)
+                        if current_hour >= 15:
+                            wake_up_time += timedelta(days=1)
+                        while wake_up_time.weekday() >= 5:
+                            wake_up_time += timedelta(days=1)
                         
                 sleep_seconds = (wake_up_time - vn_now).total_seconds()
                 if sleep_seconds > 0:
@@ -1528,6 +1526,10 @@ def auto_crawler_worker():
             crawled_count = collection.count_documents({"chot_so_today": today_str})
 
             if crawled_count >= len(all_symbols) and len(all_symbols) > 0:
+                # Nếu đang trong 15h00-15h05 mà đã chốt sổ → ngủ 15s chờ 15h05 để re-check
+                if current_hour == 15 and current_minute < 5:
+                    time.sleep(15)
+                    continue
                 time.sleep(60)
                 continue
 
@@ -1571,7 +1573,6 @@ def full_data_crawler_worker():
                             res.update({"symbol": symbol, "updated_at": _now_str()})
                             bctc_col.update_one({"symbol": symbol}, {"$set": res}, upsert=True)
                             
-                            # BỔ SUNG: Tự động bóc tách dữ liệu tài chính lưu vào stocks
                             extracted = extract_metrics_from_bctc_data(res)
                             if extracted:
                                 collection.update_one({"symbol": symbol}, {"$set": extracted})
@@ -1582,17 +1583,24 @@ def full_data_crawler_worker():
         except Exception: time.sleep(60)
 
 def screener_worker():
+    """
+    Screener worker: chấm điểm sau khi chốt sổ (15h05+).
+    """
     while True:
         try:
             vn_now = datetime.utcnow() + timedelta(hours=7)
             today_str = vn_now.strftime("%Y-%m-%d")
             current_hour = vn_now.hour
+            current_minute = vn_now.minute
             
             all_symbols_count = collection.count_documents({})
             crawled_count = collection.count_documents({"chot_so_today": today_str})
             
             is_1630 = (current_hour == 16 and vn_now.minute == 30 and vn_now.second < 10)
-            is_just_closed = (current_hour >= 15 and crawled_count >= all_symbols_count and all_symbols_count > 0)
+            
+            # === SỬA: chỉ chấm điểm sau 15h05 ===
+            is_after_close = (current_hour > 15) or (current_hour == 15 and current_minute >= 5)
+            is_just_closed = (is_after_close and crawled_count >= all_symbols_count and all_symbols_count > 0)
 
             if is_1630 or is_just_closed:
                 today_screener_check = screener_col.find_one({"date": today_str})
@@ -1600,7 +1608,7 @@ def screener_worker():
                     time.sleep(60)
                     continue
 
-                print(f"\n[SCREENER] ⏰ Kích hoạt chấm điểm (Lý do: {'16h30' if is_1630 else 'Vừa chốt sổ xong'})", flush=True)
+                print(f"\n[SCREENER] ⏰ Kích hoạt chấm điểm (Lý do: {'16h30' if is_1630 else 'Vừa chốt sổ sau 15h05'})", flush=True)
                 
                 stock_db = {}
                 print("[SCREENER] 📥 Đang nạp dữ liệu BCTC để tính toán các chỉ số...", flush=True)
@@ -1609,13 +1617,11 @@ def screener_worker():
                     bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
                     doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                     
-                    # === BỔ SUNG: TỰ ĐỘNG TRÍCH XUẤT CFO, LN_TTM, D/E, GM TỪ BCTC ===
                     if bctc:
                         extracted = extract_metrics_from_bctc_data(bctc)
                         if extracted:
                             doc.update(extracted) 
                             collection.update_one({"symbol": sym}, {"$set": extracted})
-                    # ================================================================
                     
                     stock_db[sym] = doc
                 
@@ -1632,7 +1638,6 @@ def screener_worker():
                         res["date"] = today_str
                         results.append(res)
                 
-                # === BỔ SUNG: TÍNH LẠI FINAL_DECISION LẦN 2 (Đảm bảo tính nhất quán) ===
                 if results:
                     print(f"[SCREENER] 🔄 Đang tính lại final_decision lần 2 để đảm bảo tính nhất quán...", flush=True)
                     for r in results:
@@ -1658,18 +1663,15 @@ def screener_worker():
                         r["final_decision_color"] = fd_color
                         r["final_decision_reason"] = fd_reason
                     print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
-                # === KẾT THÚC BỔ SUNG ===
 
-                # === BỔ SUNG: TỰ ĐỘNG TẠO TEMPLATE CHO CÁC MÃ CHƯA CÓ AI THẬT ===
                 if results:
                     print(f"[SCREENER] 📝 Đang tạo/cập nhật Template cho các mã chưa có AI thật...", flush=True)
                     template_count = 0
                     for r in results:
                         sym = r["symbol"]
-                        # SỬA: Chỉ bỏ qua nếu đã có AI THẬT (ai_source == "AI"). Template sẽ được cập nhật lại.
                         existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
                         if existing and existing.get("ai_bctc") and existing.get("ai_source") == "AI":
-                            continue  # Đã có AI thật, không ghi đè
+                            continue
                         
                         nd_for_template = normalized_db.get(sym, {})
                         template_data = build_fallback_narrative(sym, nd_for_template, r, get_sector(sym))
@@ -1688,7 +1690,6 @@ def screener_worker():
                             }})
                             template_count += 1
                     print(f"[SCREENER] ✅ Đã tạo/cập nhật Template cho {template_count} mã (chưa có AI thật).", flush=True)
-                # === KẾT THÚC BỔ SUNG ===
                         
                 if results:
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
@@ -1823,6 +1824,7 @@ def screener_worker():
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
 threading.Thread(target=full_data_crawler_worker, daemon=True).start()
 threading.Thread(target=screener_worker, daemon=True).start()
+
 # ===================== ROUTES =====================
 @app.get("/")
 def home(): 
@@ -1861,6 +1863,7 @@ def api_set_fhsc_key():
 
 @app.get("/api/data")
 def api_get_data():
+    """Lấy toàn bộ giá realtime — NGUỒN CHÍNH cho Card."""
     print("[API] 📈 Gọi API /api/data (Lấy toàn bộ giá)", flush=True)
     try:
         cursor = collection.find({}, {"_id": 0})
@@ -1868,65 +1871,32 @@ def api_get_data():
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
+                # Đảm bảo prev_close luôn có trong response
+                if "prev_close" not in doc:
+                    doc["prev_close"] = 0
+                
+                if "price_change_percent" not in doc or doc["price_change_percent"] == 0:
+                    close_price = doc.get("close", 0)
+                    prev_close = doc.get("prev_close", 0)
+                    pct = 0.0
+                    avail = False
+                    arrow, color = "—", "slate"
+                    if close_price > 0 and prev_close > 0:
+                        raw_pct = ((close_price - prev_close) / prev_close) * 100
+                        if -30.0 <= raw_pct <= 30.0:
+                            pct = round(raw_pct, 2)
+                            avail = True
+                            if pct > 0: arrow, color = "▲", "emerald"
+                            elif pct < 0: arrow, color = "▼", "rose"
+                    doc["price_change_percent"] = pct
+                    doc["price_change_available"] = avail
+                    doc["price_arrow"] = arrow
+                    doc["price_color"] = color
+                
+                doc["volume_percent"] = doc.get("volume_percent", 0.0)
                 data[sym] = doc
-
-        # 1. Kiểm tra giờ giao dịch (Giờ VN)
-        vn_now = datetime.utcnow() + timedelta(hours=7)
-        is_weekend = vn_now.weekday() >= 5
-        is_trading_hours = (9 <= vn_now.hour < 15) and not is_weekend
-
-        # 2. Lấy nến cuối cùng của TẤT CẢ các mã (tối ưu 1 query)
-        pipeline = [
-            {"$match": {"history_d1.0": {"$exists": True}}},
-            {"$project": {"symbol": 1, "last_bar": {"$arrayElemAt": ["$history_d1", -1]}}}
-        ]
-        last_bars = {item["symbol"]: item.get("last_bar") for item in history_col.aggregate(pipeline)}
-
-        for sym, doc in data.items():
-            # === SỬA: Chỉ ghi đè từ nến khi NGOÀI giờ giao dịch ===
-            if not is_trading_hours:
-                if sym in last_bars and last_bars[sym]:
-                    last_bar = last_bars[sym]
-                    bar_close = last_bar.get("close")
-                    bar_time = last_bar.get("time")
-
-                    if bar_close and bar_close > 0:
-                        doc["close"] = bar_close
-
-                    if bar_time:
-                        try:
-                            dt = datetime.strptime(bar_time, "%Y-%m-%d")
-                            date_display = dt.strftime("%d/%m/%Y")
-                            time_part = doc.get("updated_at", "15:00:00").split(" ")[1] if " " in doc.get("updated_at", "") else "15:00:00"
-                            doc["updated_at"] = f"{date_display} {time_part}"
-                            doc["trading_date"] = bar_time
-                        except:
-                            pass
-
-            # Tính toán lại % thay đổi giá
-            close_price = doc.get("close", 0)
-            prev_close = doc.get("prev_close", 0)
-            pct = 0.0
-            avail = False
-            arrow, color = "—", "slate"
-            
-            if close_price > 0 and prev_close > 0:
-                raw_pct = ((close_price - prev_close) / prev_close) * 100
-                if -30.0 <= raw_pct <= 30.0:
-                    pct = round(raw_pct, 2)
-                    avail = True
-                    if pct > 0: arrow, color = "▲", "emerald"
-                    elif pct < 0: arrow, color = "▼", "rose"
-                    
-            doc["price_change_percent"] = pct
-            doc["price_change_available"] = avail
-            doc["price_arrow"] = arrow
-            doc["price_color"] = color
-            doc["volume_percent"] = doc.get("volume_percent", 0.0)
-
         return jsonify({"status": "success", "count": len(data), "data": data})
     except Exception as e: 
-        log_exception("[API GET DATA]", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.get("/api/sync")
@@ -2044,7 +2014,6 @@ def admin_force_ai_single():
         
     global is_ai_running
     
-    # Lấy mã từ URL, ví dụ: /api/admin/force-ai-single?symbol=HCM
     symbol = request.args.get("symbol", "").upper().strip()
     
     if not symbol:
@@ -2056,14 +2025,13 @@ def admin_force_ai_single():
     if not ALIBABA_API_KEY:
         return jsonify({"status": "error", "message": "Thiếu ALIBABA_API_KEY trong biến môi trường!"}), 500
     
-    # Kiểm tra xem mã này có dữ liệu trong Database chưa
     sm = collection.find_one({"symbol": symbol}, {"_id": 0})
     si = screener_col.find_one({"symbol": symbol}, {"_id": 0})
     
     if not sm or not si:
         return jsonify({
             "status": "error", 
-            "message": f"Mã {symbol} chưa đủ dữ liệu nền (chưa có trong bảng giá hoặc chưa được chấm điểm). Hãy chạy /api/force-screener trước."
+            "message": f"Mã {symbol} chưa đủ dữ liệu nền. Hãy chạy /api/force-screener trước."
         }), 404
 
     is_ai_running = True
@@ -2073,12 +2041,9 @@ def admin_force_ai_single():
         global is_ai_running
         try:
             sector = si.get("sector", "SAN_XUAT_TIEU_DUNG_PHONG_THU")
-            
-            # Gọi AI
             ai_result = _call_ai_for_symbol(symbol, sm, si, sector)
             
             if ai_result:
-                # 1. Lưu vào bảng stocks (collection)
                 collection.update_one({"symbol": symbol}, {"$set": {
                     "ai_bctc": ai_result.get("bctc", ""),
                     "ai_catalyst": ai_result.get("catalyst", ""),
@@ -2088,10 +2053,9 @@ def admin_force_ai_single():
                     "ai_price_zone": ai_result.get("price_zone", ""),
                     "ai_macro_view": ai_result.get("macro_view", ""),
                     "ai_updated_at": _now_str(),
-                    "ai_source": "AI"  # Đánh dấu nguồn là AI
+                    "ai_source": "AI"
                 }})
                 
-                # 2. BỔ SUNG: Lưu vào bảng screener_results (screener_col) để giao diện web đọc được ngay
                 screener_col.update_one({"symbol": symbol}, {"$set": {
                     "bctc_evaluation": ai_result.get("bctc", ""),
                     "outlook": ai_result.get("outlook", ""),
@@ -2099,12 +2063,12 @@ def admin_force_ai_single():
                     "ai_price_zone": ai_result.get("price_zone", ""),
                     "macro_view": ai_result.get("macro_view", ""),
                     "ai_updated_at": _now_str(),
-                    "ai_source": "AI"  # Đánh dấu nguồn là AI
+                    "ai_source": "AI"
                 }})
                 
                 print(f"[ADMIN-AI-SINGLE] ✅ {symbol} - Đã lưu phân tích AI thành công vào cả 2 bảng!", flush=True)
             else:
-                print(f"[ADMIN-AI-SINGLE] ❌ {symbol} - Gọi AI thất bại. Xem log lỗi ở trên.", flush=True)
+                print(f"[ADMIN-AI-SINGLE] ❌ {symbol} - Gọi AI thất bại.", flush=True)
         finally:
             is_ai_running = False
 
@@ -2112,7 +2076,7 @@ def admin_force_ai_single():
     
     return jsonify({
         "status": "success", 
-        "message": f"Đã bắt đầu chạy AI cho mã {symbol}. Hãy theo dõi log trên Render!"
+        "message": f"Đã bắt đầu chạy AI cho mã {symbol}. Theo dõi log Render!"
     })
 
 @app.get("/api/admin/force-ai")
@@ -2189,7 +2153,7 @@ def admin_force_ai():
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({
         "status": "success", 
-        "message": f"Đã bắt đầu chạy AI cho {len(all_symbols)} mã. Xem log Render để theo dõi tiến trình!"
+        "message": f"Đã bắt đầu chạy AI cho {len(all_symbols)} mã. Xem log Render!"
     })
 
 @app.get("/api/force-history")
@@ -2276,7 +2240,6 @@ def force_bctc():
                     period = res.get("latest_period", "Không rõ")
                     print(f"  ✅ [THÀNH CÔNG] {sym} | Kỳ BCTC: {period}", flush=True)
                     
-                    # BỔ SUNG: Tự động trích xuất số liệu tài chính lưu vào stocks ngay lập tức
                     extracted = extract_metrics_from_bctc_data(res)
                     if extracted:
                         collection.update_one({"symbol": sym}, {"$set": extracted})
@@ -2295,7 +2258,7 @@ def force_bctc():
 
 @app.get("/api/bctc-status")
 def api_bctc_status():
-    print("[API] 📋 Gọi API /api/bctc-status (Lấy danh sách BCTC)", flush=True)
+    print("[API] 📋 Gọi API /api/bctc-status", flush=True)
     try:
         all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1, "_id": 0})]
         result = []
@@ -2320,7 +2283,7 @@ def api_bctc_status():
 
 @app.get("/api/crawl-full-bctc")
 def crawl_full_bctc():
-    print(f"\n[API] 📥 Gọi API /api/crawl-full-bctc (Ép cào toàn bộ BCTC)", flush=True)
+    print(f"\n[API] 📥 Gọi API /api/crawl-full-bctc", flush=True)
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
@@ -2345,7 +2308,7 @@ def crawl_full_bctc():
 
 @app.get("/api/crawl-ratios")
 def crawl_ratios():
-    print(f"\n[API] 📥 Gọi API /api/crawl-ratios (Cào P/E, P/B, ROE từ VNDirect)", flush=True)
+    print(f"\n[API] 📥 Gọi API /api/crawl-ratios", flush=True)
     global is_full_data_running
     if is_full_data_running: return jsonify({"status": "error", "message": "Đang chạy"}), 400
     is_full_data_running = True
@@ -2398,17 +2361,16 @@ def crawl_ratios():
             is_full_data_running = False
 
     threading.Thread(target=_run, daemon=True).start()
-    return jsonify({"status": "success", "message": "Đang cào bảng Ratio (P/E, ROE...) từ VNDirect..."})
+    return jsonify({"status": "success", "message": "Đang cào bảng Ratio..."})
 
 @app.get("/api/force-screener")
 def force_screener():
     if request.args.get("key") != ADMIN_SECRET_KEY:
         return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
         
-    print(f"\n[API] 📥 Gọi API /api/force-screener (Ép chấm điểm lại)", flush=True)
+    print(f"\n[API] 📥 Gọi API /api/force-screener", flush=True)
     global is_screener_running
     if is_screener_running: 
-        print("[SCREENER] ⚠️ Đang có tiến trình chấm điểm chạy, bỏ qua lệnh mới.", flush=True)
         return jsonify({"status": "error", "message": "Đang chạy"}), 400
         
     is_screener_running = True
@@ -2418,82 +2380,70 @@ def force_screener():
         global is_screener_running
         try:
             stock_db = {}
-            print(f"[SCREENER] 📥 Đang nạp dữ liệu BCTC để tính toán...", flush=True)
             for doc in collection.find({}):
                 sym = doc["symbol"]
                 bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
                 doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
                 
-                # === BỔ SUNG: TỰ ĐỘNG TRÍCH XUẤT SỐ LIỆU ===
                 if bctc:
                     extracted = extract_metrics_from_bctc_data(bctc)
                     if extracted:
                         doc.update(extracted)
                         collection.update_one({"symbol": sym}, {"$set": extracted})
-                # =============================================
                 
                 stock_db[sym] = doc
-            
-            print(f"[SCREENER] 📊 Đã tải dữ liệu của {len(stock_db)} mã từ Database.", flush=True)
             
             norm_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
             medians = compute_sector_medians(norm_db)
             results = []
             
-            count = 0
             for sym, nd in norm_db.items():
                 grp = get_sub_sector(sym)
                 cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(sym))
-                med, _ = get_median_for_symbol(sym, medians)  # <--- ĐÃ SỬA LỖI TẠI ĐÂY (symbol -> sym)
+                med, _ = get_median_for_symbol(sym, medians)
                 res = evaluate_stock_from_db(sym, nd, med, grp, cfg)
                 if res: results.append(res)
-                count += 1
-                if count % 20 == 0:
-                    print(f"[SCREENER] ⏳ Đã xử lý {count}/{len(norm_db)} mã...", flush=True)
             
             if results:
                 results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
                 screener_col.delete_many({}) 
                 screener_col.insert_many(results) 
-                print(f"[SCREENER] 💾 Đã lưu {len(results)} mã vào MongoDB.", flush=True)
-                
                 commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Force Screener {_now_str()}")
-                print(f"[SCREENER] ✅ Đã đẩy file JSON lên Github thành công!", flush=True)
+                print(f"[SCREENER] ✅ Đã chấm điểm xong {len(results)} mã.", flush=True)
         except Exception as e:
-            print(f"[SCREENER] ❌ Lỗi trong quá trình chấm điểm: {e}", flush=True)
+            print(f"[SCREENER] ❌ Lỗi: {e}", flush=True)
         finally: 
             is_screener_running = False
-            print(f"[SCREENER] 🏁 Đã kết thúc tiến trình chấm điểm.\n", flush=True)
             
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"status": "success", "message": "Đang chấm điểm lại..."})
 
 @app.get("/api/force-realtime")
 def force_realtime():
-    print(f"\n[API] ⚡ Gọi API /api/force-realtime (Ép cào giá Realtime ngay lập tức)", flush=True)
+    print(f"\n[API] ⚡ Gọi API /api/force-realtime", flush=True)
     global is_crawling
     
     if is_crawling:
-        return jsonify({"status": "error", "message": "Hệ thống đang trong quá trình cào, vui lòng đợi vài giây!"}), 400
+        return jsonify({"status": "error", "message": "Hệ thống đang cào, vui lòng đợi!"}), 400
         
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
     
     return jsonify({
         "status": "success", 
-        "message": f"Đã kích hoạt ép cào realtime cho toàn bộ {len(all_symbols)} mã. Vui lòng đợi 1-2 phút rồi F5 trang web!"
+        "message": f"Đã kích hoạt ép cào realtime cho {len(all_symbols)} mã."
     })
 
 @app.get("/api/reset-today")
 def reset_today():
-    print(f"\n[API] 📥 Gọi API /api/reset-today (Hủy chốt sổ)", flush=True)
+    print(f"\n[API] 📥 Gọi API /api/reset-today", flush=True)
     today_str = (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d")
     result = collection.update_many({"chot_so_today": today_str}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
     return jsonify({"status": "success", "message": f"Đã xóa cờ chốt sổ của {result.modified_count} mã."})
 
 @app.get("/api/force-fix")
 def force_fix_data():
-    print(f"\n[API] 📥 Gọi API /api/force-fix (Ép cào lại toàn bộ giá)", flush=True)
+    print(f"\n[API] 📥 Gọi API /api/force-fix", flush=True)
     collection.update_many({}, {"$unset": {"chot_so_today": "", "is_locked": "", "trading_date": ""}})
     all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
     threading.Thread(target=_execute_crawl, args=(all_symbols, False, True)).start()
@@ -2501,18 +2451,24 @@ def force_fix_data():
 
 @app.get("/api/retry-now")
 def retry_now():
-    print(f"\n[API] 📥 Gọi API /api/retry-now (Cào bù mã lỗi)", flush=True)
+    print(f"\n[API] 📥 Gọi API /api/retry-now", flush=True)
     if is_crawling:
-        return jsonify({"status": "error", "message": "Hệ thống đang chạy, vui lòng đợi!"})
+        return jsonify({"status": "error", "message": "Hệ thống đang chạy!"})
     incomplete_symbols = [doc["symbol"] for doc in collection.find({"is_incomplete": True}, {"symbol": 1})]
     if not incomplete_symbols:
         return jsonify({"status": "success", "message": "Không có mã nào bị lỗi!"})
     threading.Thread(target=_execute_crawl, args=(incomplete_symbols, True, True)).start()
     return jsonify({"status": "success", "message": f"Đã kích hoạt cào bù {len(incomplete_symbols)} mã!"})
 
-# ===================== API LỊCH SỬ =====================
+# ===================== API LỊCH SỬ (ĐÃ FIX ĐỒNG BỘ) =====================
 @app.get("/api/history")
 def api_get_history():
+    """
+    API lịch sử nến — ĐÃ FIX để ĐỒNG BỘ với /api/data.
+    - Đọc nến cũ từ history_col
+    - Nếu có giá realtime mới hơn trong collection → cập nhật/chèn nến hôm nay
+    - Đảm bảo Chart và Card luôn cùng giá
+    """
     symbol = request.args.get("symbol", "").upper().strip()
     if not symbol:
         return jsonify({"status": "error", "message": "Thiếu mã"}), 400
@@ -2521,17 +2477,66 @@ def api_get_history():
     
     try:
         hist_doc = history_col.find_one({"symbol": symbol}, {"_id": 0})
-        if not hist_doc:
-            return jsonify({"status": "error", "message": "Không có dữ liệu lịch sử"}), 404
+        history_d1 = hist_doc.get("history_d1", []) if hist_doc else []
+        
+        # === FIX ĐỒNG BỘ: Lấy giá realtime từ collection ===
+        live_doc = collection.find_one({"symbol": symbol}, {"_id": 0})
+        
+        if live_doc and live_doc.get("close", 0) > 0:
+            # Xác định "ngày hôm nay" của nến realtime
+            today_live = live_doc.get("trading_date")
             
+            if not today_live:
+                vn_now = datetime.utcnow() + timedelta(hours=7)
+                today_live = vn_now.strftime("%Y-%m-%d")
+            
+            # Chuẩn bị bar hôm nay
+            bar_today = {
+                "time": today_live,
+                "open": float(live_doc.get("open", 0) or live_doc["close"]),
+                "high": float(live_doc.get("high", 0) or live_doc["close"]),
+                "low": float(live_doc.get("low", 0) or live_doc["close"]),
+                "close": float(live_doc["close"]),
+                "volume": int(live_doc.get("volume", 0) or 0)
+            }
+            
+            # Tìm nến cùng ngày
+            existing_idx = None
+            for i, b in enumerate(history_d1):
+                if b.get("time") == today_live:
+                    existing_idx = i
+                    break
+            
+            if existing_idx is not None:
+                # Đã có → cập nhật close/high/low/volume mới nhất
+                history_d1[existing_idx]["close"] = bar_today["close"]
+                history_d1[existing_idx]["high"] = max(
+                    float(history_d1[existing_idx].get("high", 0) or 0),
+                    bar_today["high"]
+                )
+                old_low = float(history_d1[existing_idx].get("low", 0) or 0)
+                history_d1[existing_idx]["low"] = (
+                    min(old_low, bar_today["low"]) if old_low > 0 else bar_today["low"]
+                )
+                if bar_today["volume"] > 0:
+                    history_d1[existing_idx]["volume"] = bar_today["volume"]
+            else:
+                # Chưa có → chèn nến hôm nay
+                history_d1.append(bar_today)
+                history_d1.sort(key=lambda x: x["time"])
+        
+        if not history_d1:
+            return jsonify({"status": "error", "message": "Không có dữ liệu lịch sử"}), 404
+        
         return jsonify({
             "status": "success", 
             "symbol": symbol,
-            "history_d1": hist_doc.get("history_d1", []),
-            "history_w1": hist_doc.get("history_w1", []),
-            "history_mn": hist_doc.get("history_mn", [])
+            "history_d1": history_d1,
+            "history_w1": hist_doc.get("history_w1", []) if hist_doc else [],
+            "history_mn": hist_doc.get("history_mn", []) if hist_doc else []
         })
     except Exception as e:
+        log_exception("[API HISTORY]", e)
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
