@@ -1063,7 +1063,8 @@ def get_median_for_symbol(symbol, sector_medians):
     sub, sector = get_sub_sector(symbol), get_sector(symbol)
     if sub in sector_medians and sector_medians[sub]["n"] >= 3: return sector_medians[sub], sub
     if sector in sector_medians: return sector_medians[sector], sector
-    return {"pe": 12.0, "pb": 2.0, "ps": 1.5, "roe": 12.0, "n": 0}, sector
+    # Đã bỏ "ps"
+    return {"pe": 12.0, "pb": 2.0, "roe": 12.0, "n": 0}, sector
 
 def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     eps, bvps, close = nd["eps"], nd["bvps"], nd["close_price"]
@@ -1481,24 +1482,31 @@ def build_fallback_narrative(symbol, stock_metrics, screener_item, sector):
 
 def _call_ai_for_symbol(symbol, sm, si, sector):
     try:
+        # =======================================================
+        # BƯỚC 1: KIỂM TRA DỮ LIỆU ĐẦU VÀO (CHẶN GỌI AI VÔ ÍCH)
+        # =======================================================
+        fair_low = float(sm.get("fair_value_low", 0) or 0)
+        fair_high = float(sm.get("fair_value_high", 0) or 0)
+        
+        # Nếu chưa có vùng định giá, không gọi AI (tránh AI viết rác)
+        if fair_low <= 0 or fair_high <= 0:
+            print(f"  ⚠️ [{symbol}] Bỏ qua gọi AI: Chưa có dữ liệu Fair Value (cần chạy Screener trước).", flush=True)
+            return None
+
         verified_facts = build_verified_facts(symbol, sm, si, sector)
         sector_guidance = get_sector_guidance(sector)
         
         final_decision = si.get("final_decision", "CHƯA XÁC ĐỊNH")
         rec_text, rec_weight = DECISION_TO_RECOMMENDATION.get(final_decision, ("NẮM GIỮ / THEO DÕI", "Tỷ trọng 0%"))
         
-        fair_low = float(sm.get("fair_value_low", 0) or 0)
-        fair_high = float(sm.get("fair_value_high", 0) or 0)
         verdict = sm.get("valuation_verdict", "CHƯA TÍNH")
         discount_pct = float(sm.get("discount_to_fair_pct", 0) or 0)
         close_price = float(sm.get("close", sm.get("close_price", 0)) or 0)
         
-        if close_price > 0 and close_price < 1000:
-            close_price *= 1000
-        if fair_low > 0 and fair_low < 1000:
-            fair_low *= 1000
-        if fair_high > 0 and fair_high < 1000:
-            fair_high *= 1000
+        # Chuẩn hóa đơn vị
+        if close_price > 0 and close_price < 1000: close_price *= 1000
+        if fair_low > 0 and fair_low < 1000: fair_low *= 1000
+        if fair_high > 0 and fair_high < 1000: fair_high *= 1000
 
         prompt = f"""Bạn là Chuyên gia Phân tích Đầu tư Giá trị (Value Investing) với 20 năm kinh nghiệm tại các quỹ lớn ở Việt Nam.
 
@@ -1548,14 +1556,13 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                     
                     parsed = json.loads(content)
                     
-                    if fair_low > 0 and fair_high > 0:
-                        parsed["price_zone"] = (
-                            f"Vùng mua: {fair_low:,.0f} VNĐ — {fair_high:,.0f} VNĐ | "
-                            f"Giá hiện tại: {close_price:,.0f} VNĐ | Verdict: {verdict}"
-                        )
-                    else:
-                        parsed["price_zone"] = "Chưa đủ dữ liệu định giá (Cần cào lại BCTC/Chỉ số)"
+                    # LUÔN GHI ĐÈ PRICE_ZONE BẰNG DỮ LIỆU CHUẨN TỪ HỆ THỐNG
+                    parsed["price_zone"] = (
+                        f"Vùng mua: {fair_low:,.0f} VNĐ — {fair_high:,.0f} VNĐ | "
+                        f"Giá hiện tại: {close_price:,.0f} VNĐ | Verdict: {verdict}"
+                    )
 
+                    # LUÔN GHI ĐÈ KHUYẾN NGHỊ BẰNG DỮ LIỆU CHUẨN TỪ HỆ THỐNG
                     ai_rec = parsed.get("recommendation", "").upper()
                     expected_rec = rec_text.upper()
                     if expected_rec not in ai_rec:
