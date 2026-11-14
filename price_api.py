@@ -429,6 +429,21 @@ def get_vndirect_ratio(symbol, ratio_code):
         pass
     return None
 
+# HÀM BỔ SUNG: Lấy Tên và SLCP trực tiếp từ VCI (Vietcap)
+def fetch_company_info_vci_live(symbol):
+    try:
+        url = f"https://api.vietcap.com.vn/api/price/symbols/getOverview?symbol={symbol}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            name = data.get("organName", "") or data.get("companyName", "") or ""
+            shares = int(float(data.get("issueShare", 0) or 0))
+            return name, shares
+    except Exception as e:
+        print(f"  ⚠️ [VCI-INFO] Lỗi lấy thông tin {symbol}: {e}", flush=True)
+    return "", 0
+
 # ===================== CORE LOGIC CÀO =====================
 def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = False):
     global is_crawling, LAST_TELEGRAM_TIME, stop_crawl_requested
@@ -675,10 +690,35 @@ def normalize_stock_data(symbol, data):
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
     bvps = (close_price / pb) if pb > 0 and close_price > 0 else 0
     if eps == 0 and pe > 0 and close_price > 0: eps = close_price / pe
+    
+    # Lấy thông tin hiện có trong DB
+    total_shares = float(data.get("total_shares", 0) or 0)
+    company_name = data.get("company_name", "") or ""
+    
+    # NẾU THIẾU SLCP HOẶC TÊN -> GỌI VCI LẤY LUÔN
+    if total_shares == 0 or not company_name:
+        name_vci, shares_vci = fetch_company_info_vci_live(symbol)
+        if shares_vci > 0:
+            total_shares = shares_vci
+            # Lưu luôn vào DB để lần sau không phải gọi lại
+            collection.update_one({"symbol": symbol}, {"$set": {"total_shares": total_shares}})
+            
+        if name_vci and not company_name:
+            company_name = name_vci
+            collection.update_one({"symbol": symbol}, {"$set": {"company_name": company_name}})
+
+    # TỰ ĐỘNG TÍNH LNST TỪ EPS VÀ SLCP NẾU BỊ THIẾU
+    net_profit_ttm = float(data.get("net_profit_ttm", 0) or 0)
+    if net_profit_ttm == 0 and eps > 0 and total_shares > 0:
+        # EPS (VNĐ) * SLCP / 1e9 = Tỷ VNĐ
+        net_profit_ttm = round((eps * 1000 * total_shares) / 1e9, 2)
+        collection.update_one({"symbol": symbol}, {"$set": {"net_profit_ttm": net_profit_ttm}})
+
     return {"close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
             "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
-            "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
-            "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy}
+            "net_profit_ttm": net_profit_ttm, "debt_to_equity": float(data.get("debt_to_equity", 0)),
+            "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, 
+            "credit_growth_yoy": credit_growth_yoy, "company_name": company_name, "total_shares": total_shares}
 
 def compute_sector_medians(normalized_db):
     buckets = {}
@@ -864,7 +904,9 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     sim_data = get_historical_return_rate_with_details(symbol)
     
     # Bổ sung metadata
-    meta = VN100_METADATA.get(symbol, {})
+    # SỬA: Lấy company_name và total_shares trực tiếp từ nd (đã được normalize xử lý)
+    company_name = nd.get("company_name", "")
+    total_shares = nd.get("total_shares", 0)
 
     # === BỔ SUNG: BỐC BÀI VIẾT AI TỪ STOCKS SANG VÀ TỰ TÍNH LẠI PRICE_ZONE ===
     ai_data = {
@@ -928,9 +970,9 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         "sim_end_quarter": sim_data["end_quarter"] if sim_data else "",
         "sim_end_price": sim_data["end_price_mean"] if sim_data else 0,
         
-        "company_name": meta.get("company_name", ""),
-        "market_cap": meta.get("market_cap", 0),
-        "total_shares": meta.get("total_shares", 0),
+        "company_name": company_name,
+        "market_cap": (total_shares * close_price) / 1e9 if close_price > 0 else 0,
+        "total_shares": total_shares,
         
         "data_warnings": data_warnings,
         "is_data_incomplete": is_data_incomplete,
