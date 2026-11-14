@@ -161,11 +161,11 @@ stop_crawl_requested = False
 is_auto_crawl_paused = False
 
 # === BIẾN CHO HOLIDAY CHECKER (THREAD RIÊNG) ===
-holiday_checked_today = None        # Ngày đã check xong (YYYY-MM-DD)
-holiday_status = None               # True = ngày lễ, False = ngày làm việc, None = chưa check
-holiday_detected_date = None        # Ngày phát hiện là lễ (để auto_crawler_worker biết)
-holiday_check_lock = threading.Lock()  # Lock tránh race condition khi đọc/ghi
-
+holiday_checked_today = None
+holiday_status = None
+holiday_detected_date = None
+holiday_check_lock = threading.Lock()
+is_holiday_paused = False           # ← THÊM DÒNG NÀY
 def get_current_fhsc_key():
     setting = settings_col.find_one({"_id": "fhsc_key"})
     if setting and setting.get("value"): return setting["value"]
@@ -1527,25 +1527,29 @@ def holiday_checker_worker():
     Thread riêng để check ngày lễ lúc 9h30.
     Độc lập hoàn toàn với auto_crawler_worker → không bị trễ khi crawler bận.
     
+    Sử dụng biến RIÊNG is_holiday_paused — KHÔNG đụng is_auto_crawl_paused của user.
+    
     Logic:
     - Thức dậy mỗi 30s
     - Chỉ check vào ngày làm việc (T2-T6), từ 9h30 trở đi
     - Chỉ check 1 lần/ngày
     - Nếu phát hiện ngày lễ:
         * Set holiday_status = True, holiday_checked_today = today
-        * Set holiday_detected_date = today
+        * Set is_holiday_paused = True (KHÔNG đụng is_auto_crawl_paused)
         * Ngủ tới 8h55 hôm sau
+        * Sáng hôm sau: tự reset is_holiday_paused = False
     - Nếu ngày làm việc:
         * Set holiday_status = False, holiday_checked_today = today
         * Tiếp tục ngủ 60s/lần (không check lại)
     """
-    global holiday_checked_today, holiday_status, holiday_detected_date, is_auto_crawl_paused
+    global holiday_checked_today, holiday_status, holiday_detected_date, is_holiday_paused
     
     print("🗓️ [HOLIDAY] Đã bật thread check ngày lễ (9h30 hàng ngày)!", flush=True)
     
     while True:
         try:
-            # Nếu user pause toàn bộ hệ thống → tạm dừng check
+            # Nếu USER pause toàn bộ hệ thống → tạm dừng check
+            # (KHÔNG check is_holiday_paused ở đây vì thread này tự quản lý biến đó)
             if is_auto_crawl_paused:
                 time.sleep(30)
                 continue
@@ -1593,8 +1597,8 @@ def holiday_checker_worker():
                 print(f"   Chi tiết: {details}", flush=True)
                 print(f"🌙 [HOLIDAY] Tạm dừng crawl tới 8h55 hôm sau...", flush=True)
                 
-                # Set cờ để auto_crawler_worker dừng crawl (nếu đang crawl)
-                is_auto_crawl_paused = True
+                # SỬA: Dùng biến RIÊNG is_holiday_paused (KHÔNG đụng is_auto_crawl_paused của user)
+                is_holiday_paused = True
                 
                 # Ngủ tới 8h55 hôm sau
                 tomorrow = vn_now + timedelta(days=1)
@@ -1604,8 +1608,8 @@ def holiday_checker_worker():
                 sleep_seconds = (wake_up_time - vn_now).total_seconds()
                 time.sleep(min(sleep_seconds, 3600))
                 
-                # Sáng hôm sau: tự mở lại
-                is_auto_crawl_paused = False
+                # Sáng hôm sau: tự mở lại (CHỈ biến is_holiday_paused, giữ nguyên is_auto_crawl_paused)
+                is_holiday_paused = False
                 print(f"☀️ [HOLIDAY] Đã hết thời gian nghỉ, tự mở lại hệ thống.", flush=True)
             else:
                 print(f"✅ [HOLIDAY] KẾT LUẬN: NGÀY LÀM VIỆC (Độ tin cậy {confidence})", flush=True)
@@ -1621,21 +1625,27 @@ def auto_crawler_worker():
     Auto crawler — KHÔNG tự check ngày lễ.
     Đọc kết quả từ holiday_checker_worker qua biến global holiday_status.
     
+    Có timeout fallback: nếu quá 10h mà holiday_checker chưa check xong 
+    (VD: thread bị chết) → tự check lấy để tránh treo.
+    
     Logic:
     - Cuối tuần: ngủ
     - Ngoài 9h-15h05: ngủ
+    - is_auto_crawl_paused (user pause) HOẶC is_holiday_paused (holiday tự pause): ngủ
     - holiday_status == True (ngày lễ): ngủ tới mai
-    - holiday_status == None + đã 9h30: chờ holiday_checker_worker check (ngủ ngắn)
+    - holiday_status == None + đã 9h30: chờ holiday_checker_worker (fallback lúc 10h)
     - holiday_status == False: crawl bình thường
     """
-    global holiday_status, holiday_checked_today, holiday_detected_date
+    global holiday_status, holiday_checked_today, holiday_detected_date, is_holiday_paused
     
     print("⏰ [AUTO] Đã bật chế độ cào Real-time (Đọc kết quả check lễ từ thread riêng)!", flush=True)
     
     while True:
         try:
             global is_auto_crawl_paused
-            if is_auto_crawl_paused:
+            
+            # User pause HOẶC holiday pause → đều tạm dừng
+            if is_auto_crawl_paused or is_holiday_paused:
                 time.sleep(10)
                 continue
 
@@ -1693,15 +1703,44 @@ def auto_crawler_worker():
             
             # Nếu đã qua 9h30 và chưa check xong → chờ holiday_checker_worker
             if is_after_930 and current_holiday_checked_date != today_str:
-                print(f"⏳ [AUTO] Chờ holiday_checker_worker check xong (đã qua 9h30)...", flush=True)
-                time.sleep(15)
-                continue
+                # === TIMEOUT FALLBACK: nếu quá 10h mà vẫn chưa check → tự check ===
+                is_after_10h = (current_hour >= 10)
+                if is_after_10h:
+                    print(f"⚠️ [AUTO] Quá 10h mà chưa có kết quả check lễ → TỰ CHECK (fallback).", flush=True)
+                    try:
+                        is_holiday, confidence, details = _check_holiday_smart_standalone(vn_now)
+                        with holiday_check_lock:
+                            holiday_checked_today = today_str
+                            holiday_status = is_holiday
+                            if is_holiday:
+                                holiday_detected_date = today_str
+                        
+                        if is_holiday:
+                            print(f"🌙 [AUTO] Fallback: NGÀY LỄ (Độ tin cậy {confidence}): {details}", flush=True)
+                            is_holiday_paused = True
+                            # Ngủ tới mai
+                            tomorrow = vn_now + timedelta(days=1)
+                            while tomorrow.weekday() >= 5:
+                                tomorrow += timedelta(days=1)
+                            wake_up = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
+                            time.sleep(min((wake_up - vn_now).total_seconds(), 3600))
+                            is_holiday_paused = False
+                            continue
+                        else:
+                            print(f"✅ [AUTO] Fallback: NGÀY LÀM VIỆC (Độ tin cậy {confidence}): {details}", flush=True)
+                    except Exception as fe:
+                        print(f"❌ [AUTO] Fallback check lỗi: {fe}. Mặc định ngày làm việc.", flush=True)
+                        with holiday_check_lock:
+                            holiday_checked_today = today_str
+                            holiday_status = False
+                else:
+                    print(f"⏳ [AUTO] Chờ holiday_checker_worker check xong (đã qua 9h30)...", flush=True)
+                    time.sleep(15)
+                    continue
             
-            # Nếu phát hiện ngày lễ → ngủ (holiday_checker_worker đã set is_auto_crawl_paused = True, 
-            # nhưng vẫn kiểm tra để đảm bảo)
+            # Nếu phát hiện ngày lễ → ngủ (holiday_checker_worker đã set is_holiday_paused = True)
             if current_holiday_checked_date == today_str and current_holiday_status == True:
                 print(f"🌙 [AUTO] Hôm nay là ngày lễ (theo holiday_checker). Tạm nghỉ...", flush=True)
-                # holiday_checker_worker đã set is_auto_crawl_paused = True rồi
                 time.sleep(60)
                 continue
 
@@ -2033,7 +2072,7 @@ def pause_crawl():
 
 @app.get("/api/resume-crawl")
 def resume_crawl():
-    global is_auto_crawl_paused, stop_crawl_requested, holiday_status, holiday_checked_today
+    global is_auto_crawl_paused, stop_crawl_requested, holiday_status, holiday_checked_today, is_holiday_paused
     is_auto_crawl_paused = False
     stop_crawl_requested = False
     
@@ -2043,6 +2082,11 @@ def resume_crawl():
             print(f"\n[API] ⚠️ User override: Reset trạng thái ngày lễ. Hệ thống sẽ crawl lại.", flush=True)
             holiday_status = None
             holiday_checked_today = None
+    
+    # Reset cả is_holiday_paused để auto_crawler_worker không bị treo
+    if is_holiday_paused:
+        print(f"\n[API] ⚠️ Reset is_holiday_paused (đang trong chế độ nghỉ lễ tự động).", flush=True)
+        is_holiday_paused = False
     
     print("\n[API] ▶️ Đã TIẾP TỤC tiến trình cào tự động!", flush=True)
     return jsonify({"status": "success", "message": "Đã tiếp tục cào tự động (đã reset trạng thái ngày lễ nếu có)."})
@@ -2056,7 +2100,8 @@ def api_holiday_status():
                 "holiday_checked_today": holiday_checked_today,
                 "holiday_status": holiday_status,  # True = lễ, False = làm việc, None = chưa check
                 "holiday_detected_date": holiday_detected_date,
-                "is_auto_crawl_paused": is_auto_crawl_paused,
+                "is_auto_crawl_paused": is_auto_crawl_paused,  # User pause
+                "is_holiday_paused": is_holiday_paused,        # Holiday checker pause
                 "current_time_vn": (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
             }
         })
