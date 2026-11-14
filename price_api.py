@@ -911,28 +911,44 @@ def normalize_stock_data(symbol, data):
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
     
     eps_need_update = False
-    old_eps = eps
+    ps_need_update = False
+    update_fields = {}
 
-    # Kiểm tra và sửa EPS (từ đồng VNĐ -> nghìn VNĐ)
+    # =========================================================
+    # 1. KIỂM TRA VÀ SỬA EPS
+    # =========================================================
     if eps >= 1000:
         eps = eps / 1000.0
         eps_need_update = True
-    # Nếu EPS quá lớn so với giá (VD: PDR eps=538 nhưng giá=11.5), tự động chia 1000
     elif close_price > 0 and eps > (close_price * 5): 
         eps = eps / 1000.0
         eps_need_update = True
         
     if eps_need_update:
-        print(f"    [CẢNH BÁO] Đã sửa lỗi EPS cho {symbol} (chia 1000): {eps}", flush=True)
-        # GHI ĐÈ LUÔN VÀO DATABASE ĐỂ LẦN SAU KHÔNG BỊ LỖI NỮA
+        update_fields["eps"] = round(eps, 2)
+
+    # =========================================================
+    # 2. KIỂM TRA VÀ SỬA PS (Doanh thu)
+    # Lỗi thường gặp: PS bị chia 1000 lần do doanh thu tính bằng đồng thay vì nghìn đồng
+    # VD: CTD có giá 76, PS = 0.01 (vô lý). Đúng ra PS phải ~ 10.
+    # =========================================================
+    if 0 < ps < 0.1 and close_price > 0:
+        ps = ps * 1000.0  # Nhân lại 1000 lần để bù lỗi
+        ps_need_update = True
+        
+    if ps_need_update:
+        update_fields["ps"] = round(ps, 2)
+
+    # Ghi đè tất cả các trường bị lỗi vào DB 1 lần duy nhất
+    if update_fields:
+        print(f"    [TỰ ĐỘNG SỬA] {symbol}: Sửa lỗi đơn vị {list(update_fields.keys())} -> {update_fields}", flush=True)
         try:
-            collection.update_one(
-                {"symbol": symbol}, 
-                {"$set": {"eps": round(eps, 2)}} # Lưu làm tròn 2 chữ số thập phân
-            )
-        except Exception as e:
+            collection.update_one({"symbol": symbol}, {"$set": update_fields})
+        except Exception:
             pass
 
+    # =========================================================
+    
     bctc = data.get("bctc_history", [])
     profit_growth_yoy = float(bctc[0].get("profit_growth_yoy", 0)) if bctc else 0.0
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
