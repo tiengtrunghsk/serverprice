@@ -2387,7 +2387,7 @@ def force_screener():
             for sym, nd in norm_db.items():
                 grp = get_sub_sector(sym)
                 cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(sym))
-                med, _ = get_median_for_symbol(symbol, medians)
+                med, _ = get_median_for_symbol(sym, medians)  # <--- ĐÃ SỬA LỖI TẠI ĐÂY (symbol -> sym)
                 res = evaluate_stock_from_db(sym, nd, med, grp, cfg)
                 if res: results.append(res)
                 count += 1
