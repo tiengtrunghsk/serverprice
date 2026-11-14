@@ -910,17 +910,37 @@ def normalize_stock_data(symbol, data):
     pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
     
+    eps_need_update = False
+    old_eps = eps
+
+    # Kiểm tra và sửa EPS (từ đồng VNĐ -> nghìn VNĐ)
     if eps >= 1000:
         eps = eps / 1000.0
-    if close_price > 0 and eps > (close_price * 5): 
+        eps_need_update = True
+    # Nếu EPS quá lớn so với giá (VD: PDR eps=538 nhưng giá=11.5), tự động chia 1000
+    elif close_price > 0 and eps > (close_price * 5): 
         eps = eps / 1000.0
+        eps_need_update = True
+        
+    if eps_need_update:
         print(f"    [CẢNH BÁO] Đã sửa lỗi EPS cho {symbol} (chia 1000): {eps}", flush=True)
+        # GHI ĐÈ LUÔN VÀO DATABASE ĐỂ LẦN SAU KHÔNG BỊ LỖI NỮA
+        try:
+            collection.update_one(
+                {"symbol": symbol}, 
+                {"$set": {"eps": round(eps, 2)}} # Lưu làm tròn 2 chữ số thập phân
+            )
+        except Exception as e:
+            pass
 
     bctc = data.get("bctc_history", [])
     profit_growth_yoy = float(bctc[0].get("profit_growth_yoy", 0)) if bctc else 0.0
     credit_growth_yoy = float(bctc[0].get("credit_growth_yoy", 0)) if bctc else 0.0
     bvps = (close_price / pb) if pb > 0 and close_price > 0 else 0
-    if eps == 0 and pe > 0 and close_price > 0: eps = close_price / pe
+    
+    # Nếu eps bị = 0 thì mới tính lại từ PE
+    if eps == 0 and pe > 0 and close_price > 0: 
+        eps = close_price / pe
     
     return {"close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
             "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
