@@ -569,9 +569,15 @@ def _fetch_bctc_ssi(symbol: str):
                         })
 
                 if records:
+                    # === BỔ SUNG: CHỈ GIỮ LẠI 8 KỲ GẦN NHẤT ĐỂ TRÁNH PHÌNH DATABASE ===
+                    unique_periods = sorted(list(set([item["period"] for item in records])), reverse=True)
+                    keep_periods = set(unique_periods[:8])
+                    records = [item for item in records if item["period"] in keep_periods]
+                    # =========================================================================
+
                     reports[report_name] = records
                     logger.info(
-                        "[BCTC VCI] %s | %s: %d chỉ tiêu, %d kỳ",
+                        "[BCTC VCI] %s | %s: %d chỉ tiêu, %d kỳ (đã lọc)",
                         symbol, report_name, len(records),
                         len({item["period"] for item in records})
                     )
