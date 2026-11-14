@@ -728,7 +728,7 @@ def _fetch_bctc_ssi(symbol: str):
 VNDIRECT_RATIOS = {
     "pe": "PRICE_TO_EARNINGS",
     "pb": "PRICE_TO_BOOK",
-    "ps": "PRICE_TO_SALES",
+    
     "eps": "EPS_TR",
     "roe": "ROAE_TR_AVG5Q",
     "roa": "ROAA_TR_AVG5Q",
@@ -1007,11 +1007,10 @@ def normalize_stock_data(symbol, data):
     Trả về dict normalized. Caller tự quyết định ghi DB nếu cần.
     """
     close_price = float(data.get("close", data.get("close_price", 0)) or 0)
-    pe, pb, ps = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0), float(data.get("ps", 0) or 0)
+    pe, pb = float(data.get("pe", 0) or 0), float(data.get("pb", 0) or 0)
     roe, roa, eps = float(data.get("roe", 0) or 0), float(data.get("roa", 0) or 0), float(data.get("eps", 0) or 0)
     
     eps_need_update = False
-    ps_need_update = False
     update_fields = {}
 
     if eps >= 1000:
@@ -1022,12 +1021,6 @@ def normalize_stock_data(symbol, data):
         eps_need_update = True
     if eps_need_update: 
         update_fields["eps"] = round(eps, 2)
-
-    if close_price > 0 and (ps <= 0 or ps < 0.2):
-        ps = ps * 1000.0
-        ps_need_update = True
-    if ps_need_update: 
-        update_fields["ps"] = round(ps, 2)
 
     if update_fields:
         print(f"    [CHUẨN HÓA] {symbol}: Sửa lỗi đơn vị {list(update_fields.keys())} -> {update_fields}", flush=True)
@@ -1041,26 +1034,29 @@ def normalize_stock_data(symbol, data):
         eps = close_price / pe
     
     return {
-        "close_price": close_price, "pe": pe, "pb": pb, "ps": ps, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
+        "close_price": close_price, "pe": pe, "pb": pb, "roe": roe, "roa": roa, "eps": eps, "bvps": bvps,
         "dividend_yield": float(data.get("dividend_yield", 0)), "cfo_latest": float(data.get("cfo_latest", 0)),
         "net_profit_ttm": float(data.get("net_profit_ttm", 0)), "debt_to_equity": float(data.get("debt_to_equity", 0)),
         "gross_margin": float(data.get("gross_margin", 0)), "profit_growth_yoy": profit_growth_yoy, "credit_growth_yoy": credit_growth_yoy,
         "_update_fields": update_fields  # Caller dùng để ghi DB nếu cần
     }
-
 def compute_sector_medians(normalized_db):
     buckets = {}
     for symbol, nd in normalized_db.items():
         for key in (get_sub_sector(symbol), get_sector(symbol)):
-            b = buckets.setdefault(key, {"pe": [], "pb": [], "ps": [], "roe": []})
+            b = buckets.setdefault(key, {"pe": [], "pb": [], "roe": []})
             if nd["pe"] > 0: b["pe"].append(nd["pe"])
             if nd["pb"] > 0: b["pb"].append(nd["pb"])
-            if nd["ps"] > 0: b["ps"].append(nd["ps"])
             if nd["roe"] != 0: b["roe"].append(nd["roe"])
     medians = {}
     for key, b in buckets.items():
         if len(b["pe"]) + len(b["pb"]) < 3: continue
-        medians[key] = {"pe": float(np.median(b["pe"])) if b["pe"] else 0.0, "pb": float(np.median(b["pb"])) if b["pb"] else 0.0, "ps": float(np.median(b["ps"])) if b["ps"] else 0.0, "roe": float(np.median(b["roe"])) if b["roe"] else 0.0, "n": len(b["pe"]) + len(b["pb"])}
+        medians[key] = {
+            "pe": float(np.median(b["pe"])) if b["pe"] else 0.0, 
+            "pb": float(np.median(b["pb"])) if b["pb"] else 0.0, 
+            "roe": float(np.median(b["roe"])) if b["roe"] else 0.0, 
+            "n": len(b["pe"]) + len(b["pb"])
+        }
     return medians
 
 def get_median_for_symbol(symbol, sector_medians):
@@ -1072,10 +1068,9 @@ def get_median_for_symbol(symbol, sector_medians):
 def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     eps, bvps, close = nd["eps"], nd["bvps"], nd["close_price"]
     cfo, npat = nd["cfo_latest"], nd["net_profit_ttm"]
-    ps = nd.get("ps", 0)
     roe = nd.get("roe", 0)
     methods = {}
-    med_pe, med_pb, med_ps, med_roe = sector_median.get("pe") or 12.0, sector_median.get("pb") or 2.0, sector_median.get("ps") or 0.0, sector_median.get("roe") or 0.0
+    med_pe, med_pb, med_roe = sector_median.get("pe") or 12.0, sector_median.get("pb") or 2.0, sector_median.get("roe") or 0.0
     cap_pe, cap_pb, mos = config["cap_pe"], config["cap_pb"], config["mos"]
     is_financial = group_label in ("NGAN_HANG", "CHUNG_KHOAN", "INSURANCE")
     
@@ -1088,12 +1083,6 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
         methods["Graham"] = round((22.5 * eps * bvps) ** 0.5, 0)
     if not is_financial and npat > 0 and cfo > 0 and (cfo / npat) >= 0.8 and eps > 0 and med_pe > 0: 
         methods["CFO_boost"] = round(eps * min(med_pe, cap_pe) * 1.10, 0)
-    
-    if config.get("primary_metric") == "PB" and ps > 0 and med_ps > 0:
-        sales_per_share = close / ps if ps > 0 else 0
-        target_ps = min(med_ps, 2.5)
-        if sales_per_share > 0:
-            methods["PS_method"] = round(sales_per_share * target_ps, 0)
             
     valid_methods = {}
     for k, v in methods.items():
@@ -1106,7 +1095,7 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
     if not valid_methods: 
         return {"fair_low": 0, "fair_high": 0, "graham": 0, "methods": {}, "mos_pct": round(mos * 100, 1), "rationale": "Không đủ DL.", "discount_to_fair_pct": 0, "verdict": "KHÔNG ĐỦ DỮ LIỆU"}
     
-    weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1.5, "PS_method": 1}
+    weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1.5}
     weighted = []
     for k, v in valid_methods.items(): weighted.extend([v] * int(weights.get(k, 1) * 2))
     weighted.sort()
@@ -1143,7 +1132,8 @@ def compute_final_decision(fund_score, tech_score, val_score, total_score, verdi
 
 def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     sector = get_sector(symbol)
-    pe, pb, ps, roe, roa = nd["pe"], nd["pb"], nd["ps"], nd["roe"], nd["roa"]
+    # ĐÃ BỎ PS Ở ĐÂY
+    pe, pb, roe, roa = nd["pe"], nd["pb"], nd["roe"], nd["roa"]
     close_price, cfo_latest, net_profit_ttm = nd["close_price"], nd["cfo_latest"], nd["net_profit_ttm"]
     debt_to_equity, profit_growth_yoy, credit_growth_yoy = nd["debt_to_equity"], nd["profit_growth_yoy"], nd["credit_growth_yoy"]
     
@@ -1206,14 +1196,15 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         fund_score += 5
     fund_score = int(np.clip(fund_score, 0, 50))
 
+    # ĐÃ BỎ PS TRONG PHẦN TÍNH ĐIỂM ĐỊNH GIÁ
     val_score = 0
     if sector == "BAT_DONG_SAN":
-        if (0 < pb < 1.5) or (0 < ps < 2.0): val_score = 30
-        elif (0 < pb < 2.2) or (0 < ps < 3.5): val_score = 18
+        if 0 < pb < 1.5: val_score = 30
+        elif 0 < pb < 2.2: val_score = 18
         else: val_score = 8
     elif sector == "NGUYEN_VAT_LIEU_CHU_KY":
-        if (0 < ps < 1.2) or (0 < pe < 12): val_score = 30
-        elif (0 < ps < 2.0) or (0 < pe < 18): val_score = 18
+        if 0 < pe < 12: val_score = 30
+        elif 0 < pe < 18: val_score = 18
         else: val_score = 8
     elif sector == "CONG_NGHE_BAN_LE":
         if 0 < pe < 18 or (profit_growth_yoy > 20 and pe < 25): val_score = 30
@@ -1252,7 +1243,7 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
     
     meta = VN100_METADATA.get(symbol, {})
 
-    # FIX BUG #6: Chỉ dùng template nếu chưa có AI thật
+    # Chỉ dùng template nếu chưa có AI thật
     stock_doc = collection.find_one({"symbol": symbol}, {
         "ai_bctc": 1, "ai_catalyst": 1, "ai_risks": 1, "ai_macro_view": 1, 
         "ai_outlook": 1, "ai_recommendation": 1, "ai_price_zone": 1,
@@ -1306,7 +1297,8 @@ def evaluate_stock_from_db(symbol, nd, sector_median, group_label, config):
         ai_data["ai_source"] = "TEMPLATE"
 
     return {
-        "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb, "ps": ps,
+        # ĐÃ BỎ "ps": ps KHỎI RETURN
+        "symbol": symbol, "sector": sector, "sub_sector": group_label, "close_price": close_price, "pe": pe, "pb": pb,
         "roe": roe, "roa": roa, "eps": round(nd["eps"], 0), "bvps": round(nd["bvps"], 0), "dividend_yield": nd["dividend_yield"], "profit_growth_yoy": profit_growth_yoy,
         "cfo_latest": cfo_latest, "net_profit_ttm": net_profit_ttm, "debt_to_equity": debt_to_equity, "gross_margin": nd["gross_margin"],
         "fundamental_score": fund_score, "valuation_score": val_score, "technical_score": tech_score, "total_score": total_score,
