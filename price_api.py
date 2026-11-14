@@ -437,52 +437,43 @@ def _fetch_bctc_ssi(symbol: str):
         field = str(field_code).upper() if field_code else ""
 
         if report_name == "income_statement":
-            # 1. Doanh thu thuần
             if "doanh thu thuan" in label or "net revenue" in label:
                 return "IS_NET_REVENUE"
-            # 2. Giá vốn hàng bán
             if "gia von hang ban" in label or "cost of goods sold" in label:
                 return "IS_COST_OF_GOODS_SOLD"
-            # 3. Lợi nhuận sau thuế (Quét cực rộng cho cả Ngân hàng và Sản xuất)
-            if (
-                "loi nhuan sau thue" in label 
-                or "net profit after tax" in label
-                or "loi nhuan thuan" in label
-                or field == "ISA21" 
-                or field == "IS_NET_PROFIT_AFTER_TAX"
-            ):
+            
+            # BẮT CHÍNH XÁC LỢI NHUẬN SAU THUẾ (isa20), BỎ QUA LỢI ÍCH CỔ ĐÔNG THIỂU SỐ (isa21)
+            if field == "ISA20" or "loi nhuan sau thue thu nhap doanh nghiep" in label:
                 return "IS_NET_PROFIT_AFTER_TAX"
+            
+            # Hỗ trợ thêm cho các mã Ngân hàng/Chứng khoán (thường dùng id khác)
+            if field in ["IS_NET_PROFIT_AFTER_TAX", "IS_PROFIT_AFTER_TAX"] or "loi nhuan sau thue" in label:
+                if "co dong thieu so" not in label and "khong kiem soat" not in label:
+                    return "IS_NET_PROFIT_AFTER_TAX"
 
         elif report_name == "cash_flow":
-            # Chỉ lấy dòng Lưu chuyển tiền tệ RÒNG (không lấy các dòng chi tiết nhỏ lẻ)
-            if (
-                "luu chuyen tien te rong" in label 
-                or "luu chuyen tien thuan" in label
-                or "net cash flows from operating activities" in label
-                or field == "CFA18" 
-                or field == "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
-            ):
+            # CHỈ LẤY DUY NHẤT DÒNG CFA18 (Lưu chuyển tiền tệ ròng từ HĐKD)
+            if field == "CFA18":
+                return "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
+            
+            # Hỗ trợ cho các mã không dùng VCI (hoặc VCI đổi ID)
+            if "luu chuyen tien te rong" in label or "net cash flows from operating activities" in label:
                 return "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES"
 
         elif report_name == "balance_sheet":
-            # 1. Tổng tài sản
             if "tong cong tai san" in label or "tong tai san" in label or "total assets" in label:
                 return "BS_TOTAL_ASSETS"
-            # 2. Tài sản ngắn hạn
             if "tai san ngan han" in label or "current assets" in label:
                 return "BS_SHORT_TERM_ASSETS"
-            # 3. Tài sản dài hạn
             if "tai san dai han" in label or "non current assets" in label:
                 return "BS_LONG_TERM_ASSETS"
-            # 4. Vốn chủ sở hữu
-            if (
-                "von chu so huu" in label
-                or "owners equity" in label
-                or "owner equity" in label
-                or "von va cac quy" in label
-            ):
+            
+            # Vốn chủ sở hữu (ưu tiên lấy dòng "Vốn chủ sở hữu", không lấy "Vốn và các quỹ" để tránh trùng lặp)
+            if "von chu so huu" in label or "owners equity" in label or "owner equity" in label:
                 return "BS_OWNERS_EQUITY"
-            # 5. Nợ phải trả
+            if "von va cac quy" in label:
+                return "BS_OWNERS_EQUITY"
+                
             if "no phai tra" in label or "total liabilities" in label:
                 return "BS_LIABILITIES"
 
