@@ -349,13 +349,19 @@ def _fetch_history_ssi(symbol: str, start_date: str, end_date: str):
 def _fetch_bctc_ssi(symbol: str):
     """
     Lấy BCTC trực tiếp từ Vietcap IQ API, không dùng vnstock/FHSC.
-    Giữ nguyên tên hàm và cấu trúc dữ liệu để các luồng crawl/MongoDB
-    hiện tại tiếp tục hoạt động mà không cần sửa các API gọi hàm này.
+    Chỉ lấy các chỉ tiêu cốt lõi, bỏ qua các trường VCI_... rác.
     """
     symbol = str(symbol).upper().strip()
     if not symbol or not re.fullmatch(r"[A-Z0-9]{2,10}", symbol):
         logger.warning("[BCTC VCI] Mã cổ phiếu không hợp lệ: %r", symbol)
         return None
+
+    # Danh sách các ID cốt lõi BẮT BUỘC phải lưu
+    CORE_IDS = {
+        "IS_NET_REVENUE", "IS_COST_OF_GOODS_SOLD", "IS_NET_PROFIT_AFTER_TAX",
+        "CF_NET_CASH_FLOWS_FROM_OPERATING_ACTIVITIES", "BS_TOTAL_ASSETS",
+        "BS_SHORT_TERM_ASSETS", "BS_LONG_TERM_ASSETS", "BS_OWNERS_EQUITY", "BS_LIABILITIES"
+    }
 
     base_url = "https://iq.vietcap.com.vn/api/iq-insight-service"
     headers = {
@@ -410,7 +416,6 @@ def _fetch_bctc_ssi(symbol: str):
             if quarter not in (None, ""):
                 quarter = int(quarter)
             elif length not in (None, ""):
-                # Vietcap thường biểu diễn kỳ báo cáo quý bằng 1..4.
                 quarter = int(length)
             else:
                 return None
@@ -462,8 +467,7 @@ def _fetch_bctc_ssi(symbol: str):
             if "no phai tra" in label or "total liabilities" in label:
                 return "BS_LIABILITIES"
 
-        # Lưu cả chỉ tiêu chưa ánh xạ để không bỏ mất dữ liệu từ VCI.
-        return f"VCI_{str(field_code).upper()}" if field_code else None
+        return None # Trả về None nếu không phải trường cốt lõi
 
     try:
         logger.info("[BCTC VCI] Bắt đầu lấy BCTC cho %s", symbol)
@@ -549,10 +553,10 @@ def _fetch_bctc_ssi(symbol: str):
                             continue
 
                         title = titles.get(str(field_code), str(field_code))
-                        item_id = canonical_id(
-                            report_name, field_code, title
-                        )
-                        if not item_id:
+                        item_id = canonical_id(report_name, field_code, title)
+                        
+                        # BỎ QUA NGAY NẾU KHÔNG NẰM TRONG DANH SÁCH CỐT LÕI
+                        if not item_id or item_id not in CORE_IDS:
                             continue
 
                         # Logic tính biên gộp hiện tại dùng giá vốn âm.
@@ -569,21 +573,20 @@ def _fetch_bctc_ssi(symbol: str):
                         })
 
                 if records:
-                    # === BỔ SUNG: CHỈ GIỮ LẠI 8 KỲ GẦN NHẤT ĐỂ TRÁNH PHÌNH DATABASE ===
+                    # Cắt tỉa chỉ giữ 8 kỳ gần nhất
                     unique_periods = sorted(list(set([item["period"] for item in records])), reverse=True)
                     keep_periods = set(unique_periods[:8])
                     records = [item for item in records if item["period"] in keep_periods]
-                    # =========================================================================
 
                     reports[report_name] = records
                     logger.info(
-                        "[BCTC VCI] %s | %s: %d chỉ tiêu, %d kỳ (đã lọc)",
+                        "[BCTC VCI] %s | %s: %d chỉ tiêu, %d kỳ",
                         symbol, report_name, len(records),
                         len({item["period"] for item in records})
                     )
                 else:
                     logger.warning(
-                        "[BCTC VCI] %s | %s không có dữ liệu",
+                        "[BCTC VCI] %s | %s không có dữ liệu cốt lõi",
                         symbol, report_name
                     )
 
