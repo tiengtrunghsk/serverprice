@@ -1851,6 +1851,7 @@ def screener_worker():
     """
     Screener worker: chấm điểm sau khi chốt sổ (15h05+).
     Có cơ chế BẢO VỆ AI: Không bao giờ ghi đè bài AI thật bằng Template.
+    Đảm bảo bài AI được giữ nguyên ở cả bảng stocks (collection) và screener_results (screener_col).
     """
     while True:
         try:
@@ -1930,7 +1931,7 @@ def screener_worker():
                         r["final_decision_reason"] = fd_reason
                     print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
 
-                # === BẢO VỆ AI: CHỈ TẠO TEMPLATE NẾU CHƯA CÓ BÀI VIẾT NÀO ===
+                # === BẢO VỆ AI (BẢNG STOCKS): CHỈ TẠO TEMPLATE NẾU CHƯA CÓ BÀI VIẾT NÀO ===
                 if results:
                     print(f"[SCREENER] 📝 Đang kiểm tra và tạo Template cho các mã chưa có AI...", flush=True)
                     template_count = 0
@@ -1962,10 +1963,27 @@ def screener_worker():
                         
                 if results:
                     results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
+                    
+                    # === BẢO VỆ AI (BẢNG SCREENER_COL): GIỮ NGUYÊN BÀI AI TRƯỚC KHI GHI ĐÈ ===
+                    protected_count = 0
+                    for r in results:
+                        sym = r["symbol"]
+                        existing_stock = collection.find_one({"symbol": sym})
+                        if existing_stock and existing_stock.get("ai_bctc") and len(existing_stock.get("ai_bctc")) > 100:
+                            # Đã có AI thật → copy sang kết quả mới để không bị Template đè
+                            r["bctc_evaluation"] = existing_stock.get("ai_bctc", "")
+                            r["outlook"] = existing_stock.get("ai_outlook", "")
+                            r["ai_recommendation"] = existing_stock.get("ai_recommendation", "")
+                            r["ai_price_zone"] = existing_stock.get("ai_price_zone", "")
+                            r["macro_view"] = existing_stock.get("ai_macro_view", "")
+                            r["ai_updated_at"] = existing_stock.get("ai_updated_at", "")
+                            r["ai_source"] = existing_stock.get("ai_source", "AI")
+                            protected_count += 1
+                    
                     screener_col.delete_many({}) 
                     screener_col.insert_many(results) 
                     commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Update Screener {_now_str()}")
-                    print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã.", flush=True)
+                    print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã (Bảo vệ AI cho {protected_count} mã).", flush=True)
 
                     try:
                         up_count = 0; down_count = 0; ref_count = 0
