@@ -2830,12 +2830,14 @@ def retry_now():
 @app.get("/api/history-all")
 def api_get_history_all():
     """
-    Trả về TOÀN BỘ dữ liệu lịch sử của tất cả mã (chỉ 200 nến gần nhất).
+    Trả về TOÀN BỘ dữ liệu lịch sử (chỉ 50 nến gần nhất).
+    Dùng $slice từ MongoDB để giảm RAM load (tránh OOM trên Render free tier).
     Có CACHE 60 giây để tránh server phải đọc DB liên tục.
     """
     global _history_cache
     try:
         now = time.time()
+        
         # Kiểm tra cache còn hạn không
         with _history_cache["lock"]:
             if _history_cache["data"] and (now - _history_cache["timestamp"]) < HISTORY_CACHE_TTL:
@@ -2848,9 +2850,13 @@ def api_get_history_all():
         result = {}
         
         for sym in all_symbols:
-            hist_doc = history_col.find_one({"symbol": sym}, {"_id": 0})
+            # ✅ Dùng $slice để MongoDB chỉ trả 50 nến cuối → giảm RAM Python
+            hist_doc = history_col.find_one(
+                {"symbol": sym}, 
+                {"_id": 0, "history_d1": {"$slice": -50}}
+            )
             if hist_doc and hist_doc.get("history_d1"):
-                result[sym] = {"history_d1": hist_doc.get("history_d1", [])[-200:]}
+                result[sym] = {"history_d1": hist_doc["history_d1"]}
                 
         response_data = {"status": "success", "count": len(result), "data": result}
         
