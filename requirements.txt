@@ -7,3 +7,4 @@ pymongo
 requests
 flask
 flask-cors
+Flask-Compress==1.14
