@@ -1,5 +1,4 @@
---extra-index-url https://vnstocks.com/api/packages
-vnstock>=5.0.1
+vnstock
 pandas>=2.0.0
 numpy>=1.24.0
 gunicorn
