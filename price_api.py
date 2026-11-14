@@ -1370,11 +1370,10 @@ NHIỆM VỤ: Diễn giải dữ liệu đã tính sẵn cho mã {symbol}. KHÔN
 
 --- QUY TẮC BẮT BUỘC ---
 1. MỌI nhận định phải có SỐ CỤ THỂ từ dữ kiện.
-2. VỀ VÙNG MUA: PHẢI dùng đúng 2 con số: fair value {fair_high:,.0f}, vùng mua {fair_low:,.0f}.
-3. VỀ KHUYẾN NGHỊ: Hệ thống đã tính → "{final_decision}". BẠN PHẢI trả về recommendation = "{rec_text}" và weight = "{rec_weight}". 
+2. VỀ KHUYẾN NGHỊ: Hệ thống đã tính → "{final_decision}". BẠN PHẢI trả về recommendation = "{rec_text}" và weight = "{rec_weight}". 
 TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ TỪ NÀO KHÁC.
-4. VỀ "ĐỊNH GIÁ & HÀNH ĐỘNG GIÁ" (outlook): Phải làm nổi bật "Biên an toàn" (Margin of Safety). Nếu giá đang trong vùng mua, phải kết luận rõ đây là cơ hội. Nếu giá đắt, phải nói rõ rủi ro.
-5. VỀ "VĨ MÔ & SÓNG NGÀNH" (macro_view): Phân tích dựa trên chu kỳ giá hàng hóa (đối với ngành Vật liệu/Phân bón/Hóa chất/Thép) hoặc chính sách vĩ mô (đối với Ngân hàng/BĐS). KHÔNG nói chung chung về VN-Index.
+3. VỀ "ĐỊNH GIÁ & HÀNH ĐỘNG GIÁ" (outlook): Phải làm nổi bật "Biên an toàn" (Margin of Safety). Nếu giá đang trong vùng mua, phải kết luận rõ đây là cơ hội. Nếu giá đắt, phải nói rõ rủi ro.
+4. VỀ "VĨ MÔ & SÓNG NGÀNH" (macro_view): Phân tích dựa trên chu kỳ giá hàng hóa (đối với ngành Vật liệu/Phân bón/Hóa chất/Thép) hoặc chính sách vĩ mô (đối với Ngân hàng/BĐS). KHÔNG nói chung chung về VN-Index.
 
 --- ĐỊNH DẠNG: JSON THUẦN TÚY (KHÔNG ```json) ---
 {{
@@ -1384,7 +1383,6 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
   "valuation_verdict": "Copy nguyên văn: '{verdict}'",
   "outlook": "4-5 câu. So sánh giá {close_price:,.0f} với vùng mua {fair_low:,.0f}-{fair_high:,.0f}. Giải thích quyết định '{final_decision}'. Nhấn mạnh biên an toàn {discount_pct:.1f}%.",
   "recommendation": "BẮT BUỘC: '{rec_text}' — {rec_weight}",
-  "price_zone": "BẮT BUỘC: 'Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | Giá hiện tại: {close_price:,.0f} | Verdict: {verdict}'",
   "macro_view": "4-5 câu. Phân tích chu kỳ hàng hóa hoặc vĩ mô tác động trực tiếp đến doanh nghiệp."
 }}"""
 
@@ -1407,27 +1405,16 @@ TUYỆT ĐỐI KHÔNG ĐƯỢC TỰ ĐỔI SANG CHỮ "TRÁNH" HAY BẤT KỲ T�
                     
                     parsed = json.loads(content)
                     
-                    raw_pz = parsed.get("price_zone", "")
-                    if isinstance(raw_pz, dict):
-                        parsed["price_zone"] = " | ".join([f"{k}: {v}" for k, v in raw_pz.items()])
-                    elif isinstance(raw_pz, list):
-                        parsed["price_zone"] = " - ".join([str(i) for i in raw_pz])
+                    # === SỬA TẠI ĐÂY: KHÔNG QUAN TÂM AI TRẢ VỀ GÌ, LUÔN GHI ĐÈ ===
+                    if fair_low > 0 and fair_high > 0:
+                        parsed["price_zone"] = (
+                            f"Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | "
+                            f"Giá hiện tại: {close_price:,.0f} | Verdict: {verdict}"
+                        )
                     else:
-                        parsed["price_zone"] = str(raw_pz)
+                        parsed["price_zone"] = "Chưa đủ dữ liệu định giá (Cần cào lại BCTC/Chỉ số)"
 
-                    if fair_low > 0:
-                        pz_text = parsed["price_zone"]
-                        numbers_in_pz = re.findall(r"\d{1,3}(?:[.,]\d{3})+|\d{4,}", pz_text)
-                        allowed = {f"{int(fair_low):,}", f"{int(fair_high):,}", f"{int(close_price):,}"}
-                        for num in numbers_in_pz:
-                            if num not in allowed and num.replace(",", "").replace(".", "") not in [str(int(fair_low)), str(int(fair_high)), str(int(close_price))]:
-                                print(f"  ⚠️ [{symbol}] AI bịa số trong price_zone: {num} → Ghi đè", flush=True)
-                                parsed["price_zone"] = (
-                                    f"Vùng mua: {fair_low:,.0f} — {fair_high:,.0f} | "
-                                    f"Giá hiện tại: {close_price:,.0f} | Verdict: {verdict}"
-                                )
-                                break
-
+                    # Tương tự với khuyến nghị, đảm bảo nó luôn khớp với hệ thống
                     ai_rec = parsed.get("recommendation", "").upper()
                     expected_rec = rec_text.upper()
                     if expected_rec not in ai_rec:
