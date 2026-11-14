@@ -934,7 +934,7 @@ def normalize_stock_data(symbol, data):
     update_fields = {}
 
     # =========================================================
-    # 1. KIỂM TRA VÀ SỬA EPS
+    # 1. KIỂM TRA VÀ SỬA EPS (Lỗi: đồng VNĐ thay vì nghìn VNĐ)
     # =========================================================
     if eps >= 1000:
         eps = eps / 1000.0
@@ -942,25 +942,23 @@ def normalize_stock_data(symbol, data):
     elif close_price > 0 and eps > (close_price * 5): 
         eps = eps / 1000.0
         eps_need_update = True
-        
-    if eps_need_update:
+    if eps_need_update: 
         update_fields["eps"] = round(eps, 2)
 
     # =========================================================
-    # 2. KIỂM TRA VÀ SỬA PS (Doanh thu)
-    # Lỗi thường gặp: PS bị chia 1000 lần do doanh thu tính bằng đồng thay vì nghìn đồng
-    # VD: CTD có giá 76, PS = 0.01 (vô lý). Đúng ra PS phải ~ 10.
+    # 2. KIỂM TRA VÀ SỬA PS (Lỗi: doanh thu bị nhân 1000 lần)
+    # Điều kiện mới: PS < 0.2 (bao phủ cả PS âm và PS quá nhỏ)
     # =========================================================
-    if 0 < ps < 0.1 and close_price > 0:
-        ps = ps * 1000.0  # Nhân lại 1000 lần để bù lỗi
+    if close_price > 0 and (ps <= 0 or ps < 0.2):
+        # Nếu PS âm hoặc quá nhỏ (< 0.2) → Lỗi doanh thu bị nhân 1000
+        ps = ps * 1000.0
         ps_need_update = True
-        
-    if ps_need_update:
+    if ps_need_update: 
         update_fields["ps"] = round(ps, 2)
 
     # Ghi đè tất cả các trường bị lỗi vào DB 1 lần duy nhất
     if update_fields:
-        print(f"    [TỰ ĐỘNG SỬA] {symbol}: Sửa lỗi đơn vị {list(update_fields.keys())} -> {update_fields}", flush=True)
+        print(f"    [CHUẨN HÓA] {symbol}: Sửa lỗi đơn vị {list(update_fields.keys())} -> {update_fields}", flush=True)
         try:
             collection.update_one({"symbol": symbol}, {"$set": update_fields})
         except Exception:
