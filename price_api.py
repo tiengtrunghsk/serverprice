@@ -1865,58 +1865,60 @@ def api_get_data():
     try:
         cursor = collection.find({}, {"_id": 0})
         data = {}
-        
         for doc in cursor:
             sym = doc.get("symbol")
             if sym:
-                # 1. Lấy nến cuối cùng từ bảng lịch sử (history_data)
-                hist_doc = history_col.find_one({"symbol": sym}, {"history_d1": {"$slice": -1}})
-                
-                if hist_doc and hist_doc.get("history_d1"):
-                    last_bar = hist_doc["history_d1"][0]
-                    bar_date_str = last_bar.get("time") # Định dạng YYYY-MM-DD
-                    bar_close = last_bar.get("close")
-                    
-                    # ĐỒNG BỘ: Ép giá trị close của bảng stocks bằng đúng giá đóng cửa của nến cuối cùng
-                    if bar_close and bar_close > 0:
-                        doc["close"] = bar_close
-                    
-                    # ĐỒNG BỘ: Ép ngày cập nhật hiển thị đúng bằng ngày của nến cuối cùng
-                    if bar_date_str:
-                        try:
-                            dt = datetime.strptime(bar_date_str, "%Y-%m-%d")
-                            date_display = dt.strftime("%d/%m/%Y")
-                            # Giữ nguyên giờ cập nhật (hoặc mặc định 15:00 nếu không có)
-                            time_part = doc.get("updated_at", "15:00:00").split(" ")[1] if " " in doc.get("updated_at", "") else "15:00:00"
-                            doc["updated_at"] = f"{date_display} {time_part}"
-                            doc["trading_date"] = bar_date_str
-                        except:
-                            pass
-
-                # 2. Tính toán lại % thay đổi giá dựa trên giá đã đồng bộ
-                close_price = doc.get("close", 0)
-                prev_close = doc.get("prev_close", 0)
-                pct = 0.0
-                avail = False
-                arrow, color = "—", "slate"
-                
-                if close_price > 0 and prev_close > 0:
-                    raw_pct = ((close_price - prev_close) / prev_close) * 100
-                    # Giới hạn biên độ hợp lý (tránh lỗi dữ liệu chia tách, cổ tức)
-                    if -30.0 <= raw_pct <= 30.0:
-                        pct = round(raw_pct, 2)
-                        avail = True
-                        if pct > 0: arrow, color = "▲", "emerald"
-                        elif pct < 0: arrow, color = "▼", "rose"
-                        
-                doc["price_change_percent"] = pct
-                doc["price_change_available"] = avail
-                doc["price_arrow"] = arrow
-                doc["price_color"] = color
-                doc["volume_percent"] = doc.get("volume_percent", 0.0)
-                
                 data[sym] = doc
-                
+
+        # === BỔ SUNG: Lấy nến cuối cùng của TẤT CẢ các mã trong 1 lần query duy nhất ===
+        # Thay vì gọi find_one 100 lần, dùng aggregate để tối ưu tốc độ
+        pipeline = [
+            {"$match": {"history_d1.0": {"$exists": True}}},
+            {"$project": {"symbol": 1, "last_bar": {"$arrayElemAt": ["$history_d1", -1]}}}
+        ]
+        last_bars = {item["symbol"]: item.get("last_bar") for item in history_col.aggregate(pipeline)}
+
+        for sym, doc in data.items():
+            # Nếu tìm thấy nến cuối cùng trong bảng history_data
+            if sym in last_bars and last_bars[sym]:
+                last_bar = last_bars[sym]
+                bar_close = last_bar.get("close")
+                bar_time = last_bar.get("time")
+
+                if bar_close and bar_close > 0:
+                    doc["close"] = bar_close
+
+                if bar_time:
+                    try:
+                        dt = datetime.strptime(bar_time, "%Y-%m-%d")
+                        date_display = dt.strftime("%d/%m/%Y")
+                        time_part = doc.get("updated_at", "15:00:00").split(" ")[1] if " " in doc.get("updated_at", "") else "15:00:00"
+                        doc["updated_at"] = f"{date_display} {time_part}"
+                        doc["trading_date"] = bar_time
+                    except:
+                        pass
+
+            # Tính toán lại % thay đổi giá
+            close_price = doc.get("close", 0)
+            prev_close = doc.get("prev_close", 0)
+            pct = 0.0
+            avail = False
+            arrow, color = "—", "slate"
+            
+            if close_price > 0 and prev_close > 0:
+                raw_pct = ((close_price - prev_close) / prev_close) * 100
+                if -30.0 <= raw_pct <= 30.0:
+                    pct = round(raw_pct, 2)
+                    avail = True
+                    if pct > 0: arrow, color = "▲", "emerald"
+                    elif pct < 0: arrow, color = "▼", "rose"
+                    
+            doc["price_change_percent"] = pct
+            doc["price_change_available"] = avail
+            doc["price_arrow"] = arrow
+            doc["price_color"] = color
+            doc["volume_percent"] = doc.get("volume_percent", 0.0)
+
         return jsonify({"status": "success", "count": len(data), "data": data})
     except Exception as e: 
         log_exception("[API GET DATA]", e)
