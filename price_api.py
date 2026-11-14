@@ -951,19 +951,37 @@ def compute_fair_value_zone(symbol, nd, sector_median, config, group_label):
         if sales_per_share > 0:
             methods["PS_method"] = round(sales_per_share * target_ps, 0)
     
-    if not methods: return {"fair_low": 0, "fair_high": 0, "graham": 0, "methods": {}, "mos_pct": round(mos * 100, 1), "rationale": "Không đủ DL.", "discount_to_fair_pct": 0, "verdict": "KHÔNG ĐỦ DỮ LIỆU"}
+    # IN LOG RA ĐỂ KIỂM TRA (Bạn xem log Render sẽ thấy)
+    print(f"    [DEBUG FAIR VALUE] {symbol}: Giá={close}, EPS={eps}, BVPS={bvps}, Các PP={methods}", flush=True)
+
+    if not methods: 
+        return {"fair_low": 0, "fair_high": 0, "graham": 0, "methods": {}, "mos_pct": round(mos * 100, 1), "rationale": "Không đủ DL.", "discount_to_fair_pct": 0, "verdict": "KHÔNG ĐỦ DỮ LIỆU"}
     
-    weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1, "PS_method": 1}
+    weights = {"PE_method": 2, "PB_method": 1.5, "Graham": 2, "CFO_boost": 1.5, "PS_method": 1}
     weighted = []
     for k, v in methods.items(): weighted.extend([v] * int(weights.get(k, 1) * 2))
     weighted.sort()
     n = len(weighted)
     fair_high = weighted[n // 2] if n % 2 else (weighted[n // 2 - 1] + weighted[n // 2]) / 2
+    
+    # Đảm bảo fair_high và fair_low không bị âm hoặc bằng 0
+    if fair_high <= 0:
+        fair_high = close * 1.2
+
     fair_low = fair_high * (1 - mos)
     discount_to_fair = ((fair_low - close) / close * 100) if close > 0 else 0.0
     verdict = "KHÔNG CÓ GIÁ" if close <= 0 else ("RẺ - TRONG VÙNG MUA" if close <= fair_low else ("HỢP LÝ - CHỜ ĐIỀU CHỈNH" if close <= fair_high else ("HƠI ĐẮT - KHÔNG MUA" if close <= fair_high * 1.2 else "ĐẮT - TRÁNH")))
-    return {"fair_low": round(fair_low, 0), "fair_high": round(fair_high, 0), "graham": round(methods.get("Graham", 0), 0), "methods": {k: round(v, 0) for k, v in methods.items()}, "mos_pct": round(mos * 100, 1), "rationale": f"[{group_label}]", "discount_to_fair_pct": round(discount_to_fair, 1), "verdict": verdict}
-
+    
+    return {
+        "fair_low": round(fair_low, 0), 
+        "fair_high": round(fair_high, 0), 
+        "graham": round(methods.get("Graham", 0), 0), 
+        "methods": {k: round(v, 0) for k, v in methods.items()}, 
+        "mos_pct": round(mos * 100, 1), 
+        "rationale": f"[{group_label}]", 
+        "discount_to_fair_pct": round(discount_to_fair, 1), 
+        "verdict": verdict
+    }
 def compute_final_decision(fund_score, tech_score, val_score, total_score, verdict, cfo, npat, roe, debt_to_equity, discount_to_fair_pct=0.0, close_price=0.0, fair_high=0.0, fair_low=0.0):
     is_bank_or_sec = roe > 0 and debt_to_equity > 3.0
     if fund_score < 20: return ("❌ TRÁNH", "rose", f"PTCB yếu")
