@@ -161,10 +161,12 @@ stop_crawl_requested = False
 is_auto_crawl_paused = False
 
 # === BIẾN CHO HOLIDAY CHECKER (THREAD RIÊNG) ===
+# === BIẾN CHO HOLIDAY CHECKER (THREAD RIÊNG) ===
 holiday_checked_today = None        # Ngày đã check xong (YYYY-MM-DD)
 holiday_status = None               # True = ngày lễ, False = ngày làm việc, None = chưa check
 holiday_detected_date = None        # Ngày phát hiện là lễ (để auto_crawler_worker biết)
 holiday_check_lock = threading.Lock()  # Lock tránh race condition khi đọc/ghi
+is_holiday_paused = False           # True = holiday_checker tự pause (không đụng is_auto_crawl_paused)
 
 def get_current_fhsc_key():
     setting = settings_col.find_one({"_id": "fhsc_key"})
@@ -1527,25 +1529,29 @@ def holiday_checker_worker():
     Thread riêng để check ngày lễ lúc 9h30.
     Độc lập hoàn toàn với auto_crawler_worker → không bị trễ khi crawler bận.
     
+    Sử dụng biến RIÊNG is_holiday_paused — KHÔNG đụng is_auto_crawl_paused của user.
+    
     Logic:
     - Thức dậy mỗi 30s
     - Chỉ check vào ngày làm việc (T2-T6), từ 9h30 trở đi
     - Chỉ check 1 lần/ngày
     - Nếu phát hiện ngày lễ:
         * Set holiday_status = True, holiday_checked_today = today
-        * Set holiday_detected_date = today
+        * Set is_holiday_paused = True (KHÔNG đụng is_auto_crawl_paused)
         * Ngủ tới 8h55 hôm sau
+        * Sáng hôm sau: tự reset is_holiday_paused = False
     - Nếu ngày làm việc:
         * Set holiday_status = False, holiday_checked_today = today
         * Tiếp tục ngủ 60s/lần (không check lại)
     """
-    global holiday_checked_today, holiday_status, holiday_detected_date, is_auto_crawl_paused
+    global holiday_checked_today, holiday_status, holiday_detected_date, is_holiday_paused
     
     print("🗓️ [HOLIDAY] Đã bật thread check ngày lễ (9h30 hàng ngày)!", flush=True)
     
     while True:
         try:
-            # Nếu user pause toàn bộ hệ thống → tạm dừng check
+            # Nếu USER pause toàn bộ hệ thống → tạm dừng check
+            # (KHÔNG check is_holiday_paused ở đây vì thread này tự quản lý biến đó)
             if is_auto_crawl_paused:
                 time.sleep(30)
                 continue
@@ -1593,8 +1599,8 @@ def holiday_checker_worker():
                 print(f"   Chi tiết: {details}", flush=True)
                 print(f"🌙 [HOLIDAY] Tạm dừng crawl tới 8h55 hôm sau...", flush=True)
                 
-                # Set cờ để auto_crawler_worker dừng crawl (nếu đang crawl)
-                is_auto_crawl_paused = True
+                # SỬA: Dùng biến RIÊNG is_holiday_paused (KHÔNG đụng is_auto_crawl_paused của user)
+                is_holiday_paused = True
                 
                 # Ngủ tới 8h55 hôm sau
                 tomorrow = vn_now + timedelta(days=1)
@@ -1604,8 +1610,8 @@ def holiday_checker_worker():
                 sleep_seconds = (wake_up_time - vn_now).total_seconds()
                 time.sleep(min(sleep_seconds, 3600))
                 
-                # Sáng hôm sau: tự mở lại
-                is_auto_crawl_paused = False
+                # Sáng hôm sau: tự mở lại (CHỈ biến is_holiday_paused, giữ nguyên is_auto_crawl_paused)
+                is_holiday_paused = False
                 print(f"☀️ [HOLIDAY] Đã hết thời gian nghỉ, tự mở lại hệ thống.", flush=True)
             else:
                 print(f"✅ [HOLIDAY] KẾT LUẬN: NGÀY LÀM VIỆC (Độ tin cậy {confidence})", flush=True)
@@ -1621,21 +1627,27 @@ def auto_crawler_worker():
     Auto crawler — KHÔNG tự check ngày lễ.
     Đọc kết quả từ holiday_checker_worker qua biến global holiday_status.
     
+    Có timeout fallback: nếu quá 10h mà holiday_checker chưa check xong 
+    (VD: thread bị chết) → tự check lấy để tránh treo.
+    
     Logic:
     - Cuối tuần: ngủ
     - Ngoài 9h-15h05: ngủ
+    - is_auto_crawl_paused (user pause) HOẶC is_holiday_paused (holiday tự pause): ngủ
     - holiday_status == True (ngày lễ): ngủ tới mai
-    - holiday_status == None + đã 9h30: chờ holiday_checker_worker check (ngủ ngắn)
+    - holiday_status == None + đã 9h30: chờ holiday_checker_worker (fallback lúc 10h)
     - holiday_status == False: crawl bình thường
     """
-    global holiday_status, holiday_checked_today, holiday_detected_date
+    global holiday_status, holiday_checked_today, holiday_detected_date, is_holiday_paused
     
     print("⏰ [AUTO] Đã bật chế độ cào Real-time (Đọc kết quả check lễ từ thread riêng)!", flush=True)
     
     while True:
         try:
             global is_auto_crawl_paused
-            if is_auto_crawl_paused:
+            
+            # User pause HOẶC holiday pause → đều tạm dừng
+            if is_auto_crawl_paused or is_holiday_paused:
                 time.sleep(10)
                 continue
 
@@ -1693,15 +1705,44 @@ def auto_crawler_worker():
             
             # Nếu đã qua 9h30 và chưa check xong → chờ holiday_checker_worker
             if is_after_930 and current_holiday_checked_date != today_str:
-                print(f"⏳ [AUTO] Chờ holiday_checker_worker check xong (đã qua 9h30)...", flush=True)
-                time.sleep(15)
-                continue
+                # === TIMEOUT FALLBACK: nếu quá 10h mà vẫn chưa check → tự check ===
+                is_after_10h = (current_hour >= 10)
+                if is_after_10h:
+                    print(f"⚠️ [AUTO] Quá 10h mà chưa có kết quả check lễ → TỰ CHECK (fallback).", flush=True)
+                    try:
+                        is_holiday, confidence, details = _check_holiday_smart_standalone(vn_now)
+                        with holiday_check_lock:
+                            holiday_checked_today = today_str
+                            holiday_status = is_holiday
+                            if is_holiday:
+                                holiday_detected_date = today_str
+                        
+                        if is_holiday:
+                            print(f"🌙 [AUTO] Fallback: NGÀY LỄ (Độ tin cậy {confidence}): {details}", flush=True)
+                            is_holiday_paused = True
+                            # Ngủ tới mai
+                            tomorrow = vn_now + timedelta(days=1)
+                            while tomorrow.weekday() >= 5:
+                                tomorrow += timedelta(days=1)
+                            wake_up = tomorrow.replace(hour=8, minute=55, second=0, microsecond=0)
+                            time.sleep(min((wake_up - vn_now).total_seconds(), 3600))
+                            is_holiday_paused = False
+                            continue
+                        else:
+                            print(f"✅ [AUTO] Fallback: NGÀY LÀM VIỆC (Độ tin cậy {confidence}): {details}", flush=True)
+                    except Exception as fe:
+                        print(f"❌ [AUTO] Fallback check lỗi: {fe}. Mặc định ngày làm việc.", flush=True)
+                        with holiday_check_lock:
+                            holiday_checked_today = today_str
+                            holiday_status = False
+                else:
+                    print(f"⏳ [AUTO] Chờ holiday_checker_worker check xong (đã qua 9h30)...", flush=True)
+                    time.sleep(15)
+                    continue
             
-            # Nếu phát hiện ngày lễ → ngủ (holiday_checker_worker đã set is_auto_crawl_paused = True, 
-            # nhưng vẫn kiểm tra để đảm bảo)
+            # Nếu phát hiện ngày lễ → ngủ (holiday_checker_worker đã set is_holiday_paused = True)
             if current_holiday_checked_date == today_str and current_holiday_status == True:
                 print(f"🌙 [AUTO] Hôm nay là ngày lễ (theo holiday_checker). Tạm nghỉ...", flush=True)
-                # holiday_checker_worker đã set is_auto_crawl_paused = True rồi
                 time.sleep(60)
                 continue
 
@@ -1737,275 +1778,6 @@ def auto_crawler_worker():
             print(f"❌ [AUTO] Lỗi: {e}", flush=True)
             time.sleep(10)
 
-def full_data_crawler_worker():
-    while True:
-        try:
-            vn_now = datetime.utcnow() + timedelta(hours=7)
-            is_bctc_time = (0 <= vn_now.hour < 6 and vn_now.minute == 0 and vn_now.second < 10)
-            if is_bctc_time:
-                target_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
-                thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-                for symbol in target_symbols:
-                    bctc_doc = bctc_col.find_one({"symbol": symbol}, {"updated_at": 1})
-                    need = False
-                    if not bctc_doc or "updated_at" not in bctc_doc: need = True
-                    else:
-                        try:
-                            if datetime.strptime(bctc_doc["updated_at"], "%d/%m/%Y %H:%M:%S") < thirty_days_ago: need = True
-                        except: need = True
-                    if need:
-                        res = _fetch_bctc_ssi(symbol)
-                        if res:
-                            res.update({"symbol": symbol, "updated_at": _now_str()})
-                            bctc_col.update_one({"symbol": symbol}, {"$set": res}, upsert=True)
-                            
-                            extracted = extract_metrics_from_bctc_data(res)
-                            if extracted:
-                                collection.update_one({"symbol": symbol}, {"$set": extracted})
-                                
-                        time.sleep(3.0)
-                time.sleep(3600) 
-            else: time.sleep(30)
-        except Exception: time.sleep(60)
-
-def screener_worker():
-    """
-    Screener worker: chấm điểm sau khi chốt sổ (15h05+).
-    """
-    while True:
-        try:
-            vn_now = datetime.utcnow() + timedelta(hours=7)
-            today_str = vn_now.strftime("%Y-%m-%d")
-            current_hour = vn_now.hour
-            current_minute = vn_now.minute
-            
-            all_symbols_count = collection.count_documents({})
-            crawled_count = collection.count_documents({"chot_so_today": today_str})
-            
-            is_1630 = (current_hour == 16 and vn_now.minute == 30 and vn_now.second < 10)
-            
-            # === SỬA: chỉ chấm điểm sau 15h05 ===
-            is_after_close = (current_hour > 15) or (current_hour == 15 and current_minute >= 5)
-            is_just_closed = (is_after_close and crawled_count >= all_symbols_count and all_symbols_count > 0)
-
-            if is_1630 or is_just_closed:
-                today_screener_check = screener_col.find_one({"date": today_str})
-                if today_screener_check:
-                    time.sleep(60)
-                    continue
-
-                print(f"\n[SCREENER] ⏰ Kích hoạt chấm điểm (Lý do: {'16h30' if is_1630 else 'Vừa chốt sổ sau 15h05'})", flush=True)
-                
-                stock_db = {}
-                print("[SCREENER] 📥 Đang nạp dữ liệu BCTC để tính toán các chỉ số...", flush=True)
-                for doc in collection.find({}):
-                    sym = doc["symbol"]
-                    bctc = bctc_col.find_one({"symbol": sym}, {"_id": 0})
-                    doc["bctc_history"] = bctc.get("income_statement", []) if bctc else []
-                    
-                    if bctc:
-                        extracted = extract_metrics_from_bctc_data(bctc)
-                        if extracted:
-                            doc.update(extracted) 
-                            collection.update_one({"symbol": sym}, {"$set": extracted})
-                    
-                    stock_db[sym] = doc
-                
-                normalized_db = {s: normalize_stock_data(s, r) for s, r in stock_db.items()}
-                sector_medians = compute_sector_medians(normalized_db)
-                results = []
-                
-                for symbol, nd in normalized_db.items():
-                    grp = get_sub_sector(symbol)
-                    cfg = SUB_SECTOR_CONFIG.get(grp) or SUB_SECTOR_CONFIG.get(get_sector(symbol))
-                    med, _ = get_median_for_symbol(symbol, sector_medians)
-                    res = evaluate_stock_from_db(symbol, nd, med, grp, cfg)
-                    if res: 
-                        res["date"] = today_str
-                        results.append(res)
-                
-                if results:
-                    print(f"[SCREENER] 🔄 Đang tính lại final_decision lần 2 để đảm bảo tính nhất quán...", flush=True)
-                    for r in results:
-                        sym = r["symbol"]
-                        nd_final = normalized_db.get(sym, {})
-                        
-                        fd_label, fd_color, fd_reason = compute_final_decision(
-                            fund_score=r.get("fundamental_score", 0),
-                            tech_score=r.get("technical_score", 0),
-                            val_score=r.get("valuation_score", 0),
-                            total_score=r.get("total_score", 0),
-                            verdict=r.get("valuation_verdict", "CHƯA TÍNH"),
-                            cfo=nd_final.get("cfo_latest", 0),
-                            npat=nd_final.get("net_profit_ttm", 0),
-                            roe=nd_final.get("roe", 0),
-                            debt_to_equity=nd_final.get("debt_to_equity", 0),
-                            discount_to_fair_pct=r.get("discount_to_fair_pct", 0),
-                            close_price=r.get("close_price", 0),
-                            fair_high=r.get("fair_value_high", 0),
-                            fair_low=r.get("fair_value_low", 0)
-                        )
-                        r["final_decision"] = fd_label
-                        r["final_decision_color"] = fd_color
-                        r["final_decision_reason"] = fd_reason
-                    print(f"[SCREENER] ✅ Đã tính lại final_decision cho {len(results)} mã.", flush=True)
-
-                if results:
-                    print(f"[SCREENER] 📝 Đang tạo/cập nhật Template cho các mã chưa có AI thật...", flush=True)
-                    template_count = 0
-                    for r in results:
-                        sym = r["symbol"]
-                        existing = collection.find_one({"symbol": sym}, {"ai_bctc": 1, "ai_source": 1})
-                        if existing and existing.get("ai_bctc") and existing.get("ai_source") == "AI":
-                            continue
-                        
-                        nd_for_template = normalized_db.get(sym, {})
-                        template_data = build_fallback_narrative(sym, nd_for_template, r, get_sector(sym))
-                        
-                        if template_data:
-                            collection.update_one({"symbol": sym}, {"$set": {
-                                "ai_bctc": template_data.get("bctc", ""),
-                                "ai_catalyst": template_data.get("catalyst", ""),
-                                "ai_risks": template_data.get("risks", ""),
-                                "ai_outlook": template_data.get("outlook", ""),
-                                "ai_recommendation": template_data.get("recommendation", ""),
-                                "ai_price_zone": template_data.get("price_zone", ""),
-                                "ai_macro_view": template_data.get("macro_view", ""),
-                                "ai_updated_at": _now_str(),
-                                "ai_source": "TEMPLATE"
-                            }})
-                            template_count += 1
-                    print(f"[SCREENER] ✅ Đã tạo/cập nhật Template cho {template_count} mã (chưa có AI thật).", flush=True)
-                        
-                if results:
-                    results = sorted(results, key=lambda x: (x.get("total_score", 0), x.get("fundamental_score", 0)), reverse=True)
-                    screener_col.delete_many({}) 
-                    screener_col.insert_many(results) 
-                    commit_multiple_files_to_github({SCREENER_JSON_FILE: results}, f"Update Screener {_now_str()}")
-                    print(f"[SCREENER] ✅ Đã chấm điểm xong cho {len(results)} mã.", flush=True)
-
-                    try:
-                        up_count = 0; down_count = 0; ref_count = 0
-                        buy_strong = 0; buy_accumulate = 0; avoid = 0
-                        strong_movers = []; value_stocks = []; danger_stocks = []
-                        missing_price_count = 0; missing_pe_count = 0; missing_pb_count = 0; missing_roe_count = 0
-                        missing_pe_symbols = []; missing_pb_symbols = []; missing_roe_symbols = []; missing_price_symbols = []
-
-                        for r in results:
-                            decision = r.get("final_decision", "")
-                            if "MUA MẠNH" in decision: buy_strong += 1
-                            elif "MUA TÍCH SẢN" in decision: buy_accumulate += 1
-                            elif "TRÁNH" in decision: 
-                                avoid += 1
-                                if len(danger_stocks) < 3:
-                                    danger_stocks.append(f"  • {r['symbol']} (Điểm: {r.get('total_score', 0)})")
-
-                            stock_data = stock_db.get(r['symbol'], {})
-                            pct_change = stock_data.get("price_change_percent", 0)
-                            vol_pct = stock_data.get("volume_percent", 0)
-                            close_price = stock_data.get("close", 0)
-
-                            if pct_change > 0.05: up_count += 1
-                            elif pct_change < -0.05: down_count += 1
-                            else: ref_count += 1
-
-                            if abs(pct_change) >= 3.0 and vol_pct >= 120.0:
-                                arrow = "🔴" if pct_change < 0 else "🟢"
-                                strong_movers.append(f"  {arrow} <b>{r['symbol']}</b>: {pct_change:+.2f}% (Vol: {vol_pct:.0f}%)")
-
-                            if "RẺ" in r.get("valuation_verdict", "") and r.get("fundamental_score", 0) >= 30:
-                                if len(value_stocks) < 3:
-                                    value_stocks.append(f"  • <b>{r['symbol']}</b> ({r.get('sector')}): Giá {close_price:,.0f} - Vùng mua ≤ {r.get('fair_value_low',0):,.0f}")
-                            
-                            warnings = r.get("data_warnings", [])
-                            if "Thiếu Giá" in warnings: 
-                                missing_price_count += 1
-                                if len(missing_price_symbols) < 5: missing_price_symbols.append(r['symbol'])
-                            if "Thiếu P/E" in warnings: 
-                                missing_pe_count += 1
-                                if len(missing_pe_symbols) < 5: missing_pe_symbols.append(r['symbol'])
-                            if "Thiếu P/B" in warnings: 
-                                missing_pb_count += 1
-                                if len(missing_pb_symbols) < 5: missing_pb_symbols.append(r['symbol'])
-                            if "Thiếu ROE" in warnings: 
-                                missing_roe_count += 1
-                                if len(missing_roe_symbols) < 5: missing_roe_symbols.append(r['symbol'])
-
-                        data_alert_lines = []
-                        if missing_pe_count > 0:
-                            sample = f" (VD: {', '.join(missing_pe_symbols)}...)" if missing_pe_symbols else ""
-                            data_alert_lines.append(f"  • <b>{missing_pe_count} mã</b> thiếu P/E{sample}")
-                        if missing_pb_count > 0:
-                            sample = f" (VD: {', '.join(missing_pb_symbols)}...)" if missing_pb_symbols else ""
-                            data_alert_lines.append(f"  • <b>{missing_pb_count} mã</b> thiếu P/B{sample}")
-                        if missing_roe_count > 0:
-                            sample = f" (VD: {', '.join(missing_roe_symbols)}...)" if missing_roe_symbols else ""
-                            data_alert_lines.append(f"  • <b>{missing_roe_count} mã</b> thiếu ROE{sample}")
-                        if missing_price_count > 0:
-                            sample = f" (VD: {', '.join(missing_price_symbols)}...)" if missing_price_symbols else ""
-                            data_alert_lines.append(f"  • <b>{missing_price_count} mã</b> bị thiếu Giá (Lỗi cào giá){sample}")
-
-                        total_up_down = up_count + down_count
-                        if total_up_down > 0:
-                            ratio_up = (up_count / total_up_down) * 100
-                        else:
-                            ratio_up = 50
-
-                        if ratio_up >= 65:
-                            market_view = "🟢 <b>TÂM LÝ HƯNG PHẤN:</b> Dòng tiền lan tỏa mạnh, ưu tiên nắm giữ cổ phiếu."
-                        elif ratio_up <= 35:
-                            market_view = "🔴 <b>TÂM LÝ BI QUAN:</b> Áp lực bán chiếm ưu thế, hạn chế mua mới."
-                        else:
-                            market_view = "🟡 <b>THỊ TRƯỜNG PHÂN HÓA:</b> Dòng tiền có sự chọn lọc, chỉ nên mua các mã có nền tảng tốt."
-
-                        msg_lines = []
-                        if data_alert_lines:
-                            msg_lines.append(f"⚠️ <b>CẢNH BÁO LỖI DỮ LIỆU API!</b>")
-                            msg_lines.append(f"Phát hiện các mã bị thiếu thông số để chấm điểm:")
-                            msg_lines.extend(data_alert_lines)
-                            msg_lines.append(f"  👉 <i>Hãy chạy lại API /api/crawl-ratios hoặc /api/force-bctc!</i>")
-                            msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
-
-                        msg_lines.extend([
-                            f"📊 <b>BÁO CÁO THỊ TRƯỜNG TỰ ĐỘNG</b>",
-                            f"⏰ Cập nhật: {_now_str()}",
-                            f"━━━━━━━━━━━━━━━━━━",
-                            f"<b>1️⃣ TỔNG QUAN ĐỘ RỘNG</b>",
-                            f"  🟢 Tăng: <b>{up_count}</b> | 🔴 Giảm: <b>{down_count}</b> | ⚪ Đứng: {ref_count}",
-                            f"  👉 {market_view}",
-                            f"━━━━━━━━━━━━━━━━━━",
-                            f"<b>2️⃣ DÒNG TIỀN ĐỘT BIẾN (Hot Money)</b>"
-                        ])
-                        
-                        if strong_movers:
-                            msg_lines.extend(strong_movers)
-                        else:
-                            msg_lines.append("  💤 Không có mã nào biến động quá 3%.")
-
-                        msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
-                        msg_lines.append(f"<b>3️⃣ CƠ HỘI GIẢI NGÂN (Vùng mua an toàn)</b>")
-                        if value_stocks:
-                            msg_lines.extend(value_stocks)
-                        else:
-                            msg_lines.append("  ⏳ Hiện chưa có mã nào thỏa mãn (Rẻ + Cơ bản tốt).")
-
-                        msg_lines.append(f"━━━━━━━━━━━━━━━━━━")
-                        msg_lines.append(f"<b>4️⃣ CẢNH BÁO RỦI RO</b>")
-                        msg_lines.append(f"  ❌ Có <b>{avoid}</b> mã bị đánh giá TRÁNH (Giá đắt, nền tảng yếu).")
-                        if danger_stocks:
-                             msg_lines.append(f"  ⚠️ <i>Điển hình: {', '.join(danger_stocks).replace('  • ', '')}</i>")
-
-                        send_telegram("\n".join(msg_lines))
-                        print("[SCREENER] 🚀 Đã gửi báo cáo thị trường qua Telegram.", flush=True)
-                    except Exception as te:
-                        print(f"[SCREENER] ❌ Lỗi khi gửi Telegram: {te}", flush=True)
-
-                time.sleep(120)
-            time.sleep(30)
-        except Exception as e: 
-            print(f"❌ [SCREENER] Lỗi: {e}", flush=True)
-            time.sleep(60)
-
 
 threading.Thread(target=auto_crawler_worker, daemon=True).start()
 threading.Thread(target=holiday_checker_worker, daemon=True).start()  # ← MỚI
@@ -2033,7 +1805,7 @@ def pause_crawl():
 
 @app.get("/api/resume-crawl")
 def resume_crawl():
-    global is_auto_crawl_paused, stop_crawl_requested, holiday_status, holiday_checked_today
+    global is_auto_crawl_paused, stop_crawl_requested, holiday_status, holiday_checked_today, is_holiday_paused
     is_auto_crawl_paused = False
     stop_crawl_requested = False
     
@@ -2043,6 +1815,11 @@ def resume_crawl():
             print(f"\n[API] ⚠️ User override: Reset trạng thái ngày lễ. Hệ thống sẽ crawl lại.", flush=True)
             holiday_status = None
             holiday_checked_today = None
+    
+    # Reset cả is_holiday_paused để auto_crawler_worker không bị treo
+    if is_holiday_paused:
+        print(f"\n[API] ⚠️ Reset is_holiday_paused (đang trong chế độ nghỉ lễ tự động).", flush=True)
+        is_holiday_paused = False
     
     print("\n[API] ▶️ Đã TIẾP TỤC tiến trình cào tự động!", flush=True)
     return jsonify({"status": "success", "message": "Đã tiếp tục cào tự động (đã reset trạng thái ngày lễ nếu có)."})
@@ -2056,7 +1833,8 @@ def api_holiday_status():
                 "holiday_checked_today": holiday_checked_today,
                 "holiday_status": holiday_status,  # True = lễ, False = làm việc, None = chưa check
                 "holiday_detected_date": holiday_detected_date,
-                "is_auto_crawl_paused": is_auto_crawl_paused,
+                "is_auto_crawl_paused": is_auto_crawl_paused,  # User pause
+                "is_holiday_paused": is_holiday_paused,        # Holiday checker pause
                 "current_time_vn": (datetime.utcnow() + timedelta(hours=7)).strftime("%d/%m/%Y %H:%M:%S")
             }
         })
