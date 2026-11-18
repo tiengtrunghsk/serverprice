@@ -598,19 +598,68 @@ def _fetch_one(symbol: str) -> Optional[dict]:
                 "source_time": last["time"].strftime("%Y-%m-%d %H:%M:%S"),
                 "source_date": vn_today
             }
-        except Exception as e:
-            log_exception(f"[FETCH ERROR] SSI/Vnstock {symbol}", e)
-            return None
+        except Exception:
+            # Để exception truyền ra ngoài để lớp retry nhận diện HTTP 429/RateLimit.
+            raise
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+    data = None
+    last_error = None
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
         try:
-            data = ex.submit(_do).result(timeout=15)
-        except concurrent.futures.TimeoutError:
-            logger.warning("[FETCH TIMEOUT] Quá 15s không lấy được giá %s", symbol)
-            return None
-        except Exception as e:
-            log_exception(f"[FETCH THREAD ERROR] {symbol}", e)
-            return None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                data = ex.submit(_do).result(timeout=25)
+            last_error = None
+            break
+        except concurrent.futures.TimeoutError as exc:
+            last_error = exc
+            logger.warning("[FETCH TIMEOUT] %s quá 25s (lần %d/%d)", symbol, attempt, max_attempts)
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc)
+            is_rate_limited = (
+                "RateLimitError" in type(exc).__name__
+                or "VNSTOCK_SOURCE_RATE_LIMITED" in error_text
+                or "429" in error_text
+            )
+            if not is_rate_limited or attempt >= max_attempts:
+                log_exception(f"[FETCH ERROR] SSI/Vnstock {symbol}", exc)
+                break
+
+            retry_after = getattr(exc, "retry_after", None)
+            if retry_after is None:
+                match = re.search(r"retry_after[=:\s]+([0-9]+(?:\.[0-9]+)?)", error_text, re.IGNORECASE)
+                retry_after = float(match.group(1)) if match else 1.0
+            try:
+                wait_seconds = max(1.0, min(float(retry_after), 8.0))
+            except (TypeError, ValueError):
+                wait_seconds = 1.0
+            wait_seconds = min(8.0, wait_seconds + (attempt - 1))
+            logger.warning(
+                "[FETCH RETRY] %s SSI rate-limit 429; lần %d/%d, chờ %.1fs rồi thử lại",
+                symbol, attempt, max_attempts, wait_seconds
+            )
+            time.sleep(wait_seconds)
+
+    if last_error is not None and data is None:
+        error_text = str(last_error)
+        error_code = "VNSTOCK_SOURCE_RATE_LIMITED" if (
+            "VNSTOCK_SOURCE_RATE_LIMITED" in error_text or "429" in error_text
+        ) else type(last_error).__name__
+        try:
+            collection.update_one(
+                {"symbol": symbol},
+                {"$set": {
+                    "is_incomplete": True,
+                    "last_error_at": _now_str(),
+                    "last_fetch_error": error_text[:1000],
+                    "last_fetch_error_code": error_code,
+                    "last_fetch_attempts": max_attempts
+                }},
+                upsert=True
+            )
+        except Exception as persist_error:
+            logger.warning("[FETCH ERROR STATE] %s không lưu được trạng thái lỗi: %s", symbol, persist_error)
 
     if not data or data.get("close", 0) <= 0 or data.get("open", 0) <= 0:
         return None
@@ -1154,6 +1203,9 @@ def _execute_crawl(symbols: list, is_retry: bool = False, is_manual: bool = Fals
                         "price_arrow": arrow, "price_color": color,
                         "trading_date": real_today, 
                         "updated_at": _now_str(), "is_locked": is_locked, "is_incomplete": False
+                    }, "$unset": {
+                        "last_fetch_error": "", "last_fetch_error_code": "",
+                        "last_fetch_attempts": "", "last_error_at": ""
                     }}, upsert=True)
                     
                     print(f"  ✅ [OK] {sym}: Giá {data['close']:,} (O:{final_open} H:{final_high} L:{final_low}) | KL: {data['volume']:,} | Vol%: {vol_pct}%", flush=True)
@@ -2304,8 +2356,14 @@ def auto_crawler_worker():
             is_lunch_break = (current_hour == 11 and current_minute >= 30) or (current_hour == 12)
             is_trading_time = (9 <= current_hour < 15) and (not is_lunch_break)
             is_closing_window = (current_hour == 15 and current_minute < 5)
+            # Sau 15:05 tiếp tục rà soát mã chưa có nến D1 hôm nay.
+            # Giới hạn đến 16:30 để tránh gọi SSI ngoài phiên quá lâu.
+            is_post_close_window = (
+                (current_hour == 15 and current_minute >= 5)
+                or (current_hour == 16 and current_minute < 30)
+            )
 
-            if not (is_trading_time or is_closing_window):
+            if not (is_trading_time or is_closing_window or is_post_close_window):
                 if is_lunch_break:
                     wake_up_time = vn_now.replace(hour=13, minute=0, second=0, microsecond=0)
                 else:
@@ -2370,8 +2428,73 @@ def auto_crawler_worker():
                 time.sleep(60)
                 continue
 
-            collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
             all_symbols = [doc["symbol"] for doc in collection.find({}, {"symbol": 1})]
+
+            # Sau giờ đóng cửa: chỉ rà soát D1 khi server thực sự rảnh.
+            # Không chạy song song với realtime, Screener hoặc crawler BCTC/lịch sử.
+            if is_post_close_window:
+                if is_crawling or is_screener_running or is_full_data_running:
+                    time.sleep(30)
+                    continue
+
+                saved_today = {
+                    item.get("symbol")
+                    for item in history_col.find(
+                        {"symbol": {"$in": all_symbols}, "history_d1.time": today_str},
+                        {"_id": 0, "symbol": 1}
+                    )
+                    if item.get("symbol")
+                }
+                stock_states = {
+                    item.get("symbol"): item
+                    for item in collection.find(
+                        {"symbol": {"$in": all_symbols}},
+                        {"_id": 0, "symbol": 1, "last_error_at": 1}
+                    )
+                    if item.get("symbol")
+                }
+                missing_d1 = [
+                    sym for sym in all_symbols
+                    if sym not in saved_today
+                ]
+
+                # Lỗi SSI/429 được giãn tối thiểu 120 giây giữa hai lượt thử
+                # cho cùng mã; mã khác vẫn có thể được rà soát trong lượt này.
+                retry_symbols = []
+                now_vn = _vn_now()
+                for sym in missing_d1:
+                    last_error_at = (stock_states.get(sym) or {}).get("last_error_at")
+                    if last_error_at:
+                        try:
+                            last_error = datetime.strptime(
+                                last_error_at, "%d/%m/%Y %H:%M:%S"
+                            ).replace(tzinfo=timezone.utc)
+                            if (now_vn - last_error).total_seconds() < 120:
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                    retry_symbols.append(sym)
+
+                if not retry_symbols:
+                    if missing_d1:
+                        logger.info(
+                            "[D1 AUDIT] Còn %d mã thiếu nến hôm nay; đang trong thời gian giãn retry.",
+                            len(missing_d1)
+                        )
+                    time.sleep(30 if missing_d1 else 60)
+                    continue
+
+                logger.info(
+                    "[D1 AUDIT] Server rảnh: phát hiện %d/%d mã thiếu nến D1 %s; "
+                    "đang rà soát/lưu bù.",
+                    len(retry_symbols), len(all_symbols), today_str
+                )
+                _execute_crawl(retry_symbols, is_retry=True, is_manual=False)
+                time.sleep(30)
+                continue
+
+            # Trong phiên: giữ nguyên cơ chế cào realtime hiện tại.
+            collection.update_many({"chot_so_today": {"$ne": today_str}}, {"$unset": {"chot_so_today": "", "is_locked": ""}})
             crawled_count = collection.count_documents({"chot_so_today": today_str})
 
             if crawled_count >= len(all_symbols) and len(all_symbols) > 0:
