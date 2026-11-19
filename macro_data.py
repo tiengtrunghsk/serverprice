@@ -235,19 +235,55 @@ def _extract_reference_period(text):
     return None
 
 
-def _discover_nso_publications(query, per_page=4):
-    """Discover current NSO publications from its public WordPress search API."""
-    try:
-        response = _get(NSO_SEARCH_URL, {
+def _discover_nso_publications(query, per_page=4, diagnostics=None):
+    """Discover NSO publications, with a WordPress posts endpoint fallback.
+
+    Diagnostics are returned to the caller as safe, compact messages so an
+    empty search can be distinguished from HTTP, timeout, and JSON failures.
+    """
+    params = {
+        "search": query,
+        "per_page": min(10, max(1, int(per_page))),
+        "_locale": "user",
+    }
+    attempts = (
+        (NSO_SEARCH_URL, params, "wp-search"),
+        (f"{NSO_BASE_URL}/wp-json/wp/v2/posts", {
             "search": query,
-            "per_page": min(10, max(1, int(per_page))),
-            "_locale": "user",
+            "per_page": params["per_page"],
+            "_fields": "id,date,modified,link,title,excerpt",
+            "status": "publish",
+        }, "wp-posts"),
+    )
+    errors = []
+    for url, request_params, endpoint_name in attempts:
+        try:
+            response = _get(url, request_params)
+            payload = response.json()
+            if isinstance(payload, list):
+                if payload:
+                    return payload
+                errors.append(f"{endpoint_name}: kết quả rỗng")
+            else:
+                errors.append(f"{endpoint_name}: JSON không phải danh sách")
+        except requests.Timeout:
+            errors.append(f"{endpoint_name}: timeout")
+        except requests.HTTPError as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            errors.append(f"{endpoint_name}: HTTP {status or 'error'}")
+        except requests.RequestException as exc:
+            errors.append(f"{endpoint_name}: {type(exc).__name__}")
+        except (ValueError, json.JSONDecodeError):
+            errors.append(f"{endpoint_name}: JSON không hợp lệ")
+        except Exception as exc:
+            errors.append(f"{endpoint_name}: {type(exc).__name__}")
+
+    if diagnostics is not None:
+        diagnostics.append({
+            "query": str(query)[:180],
+            "errors": errors,
         })
-        payload = response.json()
-        return payload if isinstance(payload, list) else []
-    except Exception:
-        # Some WordPress installations disable the search endpoint; fail closed.
-        return []
+    return []
 
 
 def _fetch_nso_publication(item, category, query):
@@ -302,11 +338,16 @@ def _fetch_nso_search_pack(searches, category_prefix, per_query=3, limit=24):
     candidates = []
     seen = set()
     warnings = []
+    diagnostics = []
     for category, query in searches:
-        items = _discover_nso_publications(query, per_page=per_query)
+        items = _discover_nso_publications(
+            query, per_page=per_query, diagnostics=diagnostics
+        )
         for item in items:
+            if not isinstance(item, dict):
+                continue
             url = item.get("url") or item.get("link")
-            if not url or url in seen:
+            if not url or not str(url).startswith(("https://", "http://")) or url in seen:
                 continue
             seen.add(url)
             candidates.append((category_prefix + category, query, item))
@@ -314,12 +355,30 @@ def _fetch_nso_search_pack(searches, category_prefix, per_query=3, limit=24):
     # by API date when available and otherwise preserve the source ranking.
     candidates.sort(key=lambda row: str(row[2].get("date") or row[2].get("modified") or ""), reverse=True)
     facts = []
+    article_errors = 0
     for category, query, item in candidates[:limit]:
         fact = _fetch_nso_publication(item, category, query)
-        if fact:
+        if fact and fact.get("excerpt") and not fact.get("error"):
             facts.append(fact)
+        elif fact:
+            article_errors += 1
+
+    if diagnostics:
+        failed = sum(1 for item in diagnostics if item.get("errors"))
+        warnings.append(
+            f"NSO: {failed}/{len(diagnostics)} truy vấn không lấy được kết quả; "
+            + " | ".join(
+                f"{item['errors'][-1]} (truy vấn: {item['query'][:90]})"
+                for item in diagnostics[:4]
+            )
+        )
+    if article_errors:
+        warnings.append(f"NSO: {article_errors} bài tìm thấy nhưng không tải/đọc được nội dung.")
     if not facts:
-        warnings.append("NSO: API tìm kiếm không trả về bài thống kê tải được; không thay thế bằng dữ liệu tự tạo.")
+        warnings.append(
+            "NSO: không có bài thống kê đủ nội dung để tạo dữ kiện; "
+            "không thay thế bằng dữ liệu tự tạo."
+        )
     return facts, warnings
 
 
