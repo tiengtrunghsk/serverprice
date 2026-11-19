@@ -17,6 +17,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -88,6 +89,10 @@ WORLD_BANK_INDICATORS = (
     ("MANUFACTURING_VALUE_ADDED", "NV.IND.MANF.ZS", "Manufacturing, value added (% of GDP)"),
     ("TRADE_OPENNESS", "NE.TRD.GNFS.ZS", "Trade (% of GDP)"),
     ("GROSS_CAPITAL_FORMATION", "NE.GDI.FTOT.ZS", "Gross capital formation (% of GDP)"),
+    ("AGRICULTURE_VALUE_ADDED_GROWTH", "NV.AGR.TOTL.KD.ZG", "Agriculture, forestry and fishing value added growth (annual %)"),
+    ("INDUSTRY_VALUE_ADDED_GROWTH", "NV.IND.TOTL.KD.ZG", "Industry value added growth (annual %)"),
+    ("MANUFACTURING_VALUE_ADDED_GROWTH", "NV.IND.MANF.KD.ZG", "Manufacturing value added growth (annual %)"),
+    ("SERVICES_VALUE_ADDED_GROWTH", "NV.SRV.TETC.KD.ZG", "Services value added growth (annual %)"),
 )
 
 
@@ -202,6 +207,14 @@ def _parse_date(value):
         except Exception:
             continue
     return None
+
+
+def _has_quantitative_evidence(text):
+    """Reject years/dates alone; require a value paired with a measurable unit."""
+    return bool(re.search(
+        r"\d+(?:[.,]\d+)?\s*(?:%|tấn|triệu|tỷ|đồng|USD|ha|nghìn|m3|kwh|lượt|doanh nghiệp|lao động|điểm|lần)",
+        str(text or ""), re.I
+    ))
 
 
 def _article_date(parser, api_item=None):
@@ -321,6 +334,9 @@ def _fetch_nso_publication(item, category, query):
             "source_name": "Cục Thống kê Việt Nam",
             "retrieved_at": _now_iso(),
             "freshness": freshness,
+            "evidence_scope": "INDUSTRY_DIRECT_CANDIDATE" if str(category).startswith("INDUSTRY_") else "NATIONAL_MACRO",
+            "directness": "DIRECT_CANDIDATE" if str(category).startswith("INDUSTRY_") else "NATIONAL_CONTEXT",
+            "quantitative_evidence": _has_quantitative_evidence(body),
         }
     except Exception as exc:
         return {
@@ -522,10 +538,11 @@ def _fetch_nsdp_sdmx_facts():
     return facts[:48], warnings
 
 
-def _fetch_world_bank_facts():
+def _fetch_world_bank_facts(indicators=None):
+    """Fetch annual WDI observations; these are macro context, not direct issuer-sector facts."""
     facts = []
     warnings = []
-    for category, indicator, label in WORLD_BANK_INDICATORS:
+    for category, indicator, label in (indicators or WORLD_BANK_INDICATORS):
         url = f"{WORLD_BANK_API}/country/VNM/indicator/{indicator}"
         try:
             response = _get(url, {"format": "json", "per_page": 8})
@@ -549,6 +566,9 @@ def _fetch_world_bank_facts():
                 "source_name": "World Bank Open Data API",
                 "retrieved_at": _now_iso(),
                 "freshness": "ANNUAL_SERIES",
+                "evidence_scope": "MACRO_CONTEXT",
+                "directness": "CONTEXTUAL",
+                "quantitative_evidence": True,
             })
         except Exception as exc:
             warnings.append(f"World Bank {indicator}: truy xuất thất bại ({type(exc).__name__}).")
@@ -590,6 +610,32 @@ def _industry_queries(industry, sector):
     return deduped[:9]
 
 
+def _normalize_industry_text(value):
+    value = unicodedata.normalize("NFKD", str(value or "").casefold())
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+
+def _industry_context_indicators(industry, sector):
+    """Select broad WDI context by live labels; never represent it as direct sector evidence."""
+    label = _normalize_industry_text(f"{industry or ''} {sector or ''}")
+    selected = []
+    groups = (
+        (("agri", "nong nghiep", "lam nghiep", "thuy san", "chan nuoi", "cay trong"),
+         ("AGRICULTURE_VALUE_ADDED_GROWTH", "NV.AGR.TOTL.KD.ZG", "Agriculture, forestry and fishing value added growth (annual %)")),
+        (("manufactur", "san xuat", "che bien", "thep", "vat lieu", "cong nghiep", "xay dung", "xay lap", "dau khi", "dien", "nuoc", "ha tang", "khai khoang"),
+         ("INDUSTRY_VALUE_ADDED_GROWTH", "NV.IND.TOTL.KD.ZG", "Industry value added growth (annual %)")),
+        (("thep", "det may", "san xuat", "che bien", "cong nghiep"),
+         ("MANUFACTURING_VALUE_ADDED_GROWTH", "NV.IND.MANF.KD.ZG", "Manufacturing value added growth (annual %)")),
+        (("ngan hang", "bao hiem", "chung khoan", "bat dong san", "ban le", "cong nghe", "vien thong", "hang khong", "van tai", "hang hai", "logistics", "dich vu", "du lich", "giao duc", "y te", "tai chinh"),
+         ("SERVICES_VALUE_ADDED_GROWTH", "NV.SRV.TETC.KD.ZG", "Services value added growth (annual %)")),
+    )
+    for aliases, indicator in groups:
+        if any(alias in label for alias in aliases) and indicator[1] not in {item[1] for item in selected}:
+            selected.append(indicator)
+    return selected
+
+
 def _fetch_industry_pack(industry, sector):
     searches = _industry_queries(industry, sector)
     if not searches:
@@ -597,66 +643,87 @@ def _fetch_industry_pack(industry, sector):
     facts, warnings = _fetch_nso_search_pack(
         searches, category_prefix="", per_query=2, limit=MAX_INDUSTRY_FACTS
     )
-    # Keep the raw industry classification on every fact for auditability.
+    context_indicators = _industry_context_indicators(industry, sector)
+    context_facts, context_warnings = _fetch_world_bank_facts(context_indicators) if context_indicators else ([], [])
     for fact in facts:
         fact["industry_classification"] = industry or sector
-    return facts, warnings
+        fact.setdefault("evidence_scope", "INDUSTRY_DIRECT_CANDIDATE")
+        fact.setdefault("directness", "DIRECT_CANDIDATE")
+    for fact in context_facts:
+        fact["industry_classification"] = industry or sector
+        fact["evidence_scope"] = "INDUSTRY_CONTEXT"
+        fact["directness"] = "CONTEXTUAL"
+    return facts + context_facts, warnings + context_warnings
 
 
 def _summarize_industry_coverage(industry, pack):
-    """Create an auditable coverage summary without treating missing dates as fresh."""
+    """Report direct evidence separately from broad contextual indicators."""
     facts = [fact for fact in (pack or {}).get("facts", []) if isinstance(fact, dict)]
     warnings = list((pack or {}).get("warnings") or [])
+    direct_facts = [
+        fact for fact in facts
+        if fact.get("directness") != "CONTEXTUAL"
+        and fact.get("evidence_scope") != "INDUSTRY_CONTEXT"
+    ]
+    contextual_facts = [fact for fact in facts if fact not in direct_facts]
     sources = sorted({
         str(fact.get("source_name") or fact.get("source") or "").strip()
-        for fact in facts
-        if fact.get("source_name") or fact.get("source")
+        for fact in facts if fact.get("source_name") or fact.get("source")
+    })
+    direct_sources = sorted({
+        str(fact.get("source_name") or fact.get("source") or "").strip()
+        for fact in direct_facts if fact.get("source_name") or fact.get("source")
     })
     freshness_counts = {}
     for fact in facts:
         label = str(fact.get("freshness") or "UNKNOWN").upper()
         freshness_counts[label] = freshness_counts.get(label, 0) + 1
-
-    dated_facts = sum(
-        1 for fact in facts
-        if fact.get("published_at") or (
-            fact.get("period_or_date")
-            and str(fact.get("period_or_date")).casefold() not in (
-                "chưa xác định kỳ tham chiếu từ metadata", "không rõ", "unknown"
+    dated_facts = sum(1 for fact in facts if fact.get("published_at") or fact.get("period_or_date"))
+    stale_facts = sum(
+        1 for fact in direct_facts
+        if str(fact.get("freshness") or "").upper() == "STALE_PUBLICATION"
+    )
+    verified_direct = [
+        fact for fact in direct_facts
+        if fact.get("quantitative_evidence") is True
+        and (
+            str(fact.get("freshness") or "").upper() == "OBSERVATION_PERIOD_VERIFIED"
+            or (
+                str(fact.get("freshness") or "").upper() == "RECENT_PUBLICATION"
+                and bool(fact.get("published_at"))
+                and bool(fact.get("period_or_date"))
+                and "chưa xác định" not in str(fact.get("period_or_date")).casefold()
             )
         )
-    )
-    stale_facts = freshness_counts.get("STALE_PUBLICATION", 0)
-    verified_facts = sum(
-        freshness_counts.get(key, 0)
-        for key in ("RECENT_PUBLICATION", "OBSERVATION_PERIOD_VERIFIED", "ANNUAL_SERIES")
-    )
-    if not facts:
+    ]
+    verified_facts = len(verified_direct)
+    if not direct_facts:
         status = "MISSING"
-    elif stale_facts == len(facts):
+    elif stale_facts == len(direct_facts):
         status = "STALE"
-    elif verified_facts:
+    elif verified_facts >= 2 and len(direct_sources) >= 1:
         status = "COVERED"
     else:
         status = "PARTIAL"
-
     periods = sorted({
         str(fact.get("period_or_date")).strip()
-        for fact in facts
-        if fact.get("period_or_date")
-        and str(fact.get("period_or_date")).casefold() not in (
-            "chưa xác định kỳ tham chiếu từ metadata", "không rõ", "unknown"
-        )
+        for fact in facts if fact.get("period_or_date")
+        and "chưa xác định" not in str(fact.get("period_or_date")).casefold()
     })
     published_dates = sorted({
         str(fact.get("published_at")).strip()
         for fact in facts if fact.get("published_at")
     })
+    if contextual_facts and not direct_facts:
+        warnings.insert(0, "Chỉ có dữ liệu bối cảnh ngành từ World Bank; chưa có dữ liệu trực tiếp đủ chuẩn cho ngành.")
     return {
         "industry": str(industry or "Chưa phân loại"),
         "status": status,
         "fact_count": len(facts),
+        "direct_fact_count": len(direct_facts),
+        "contextual_fact_count": len(contextual_facts),
         "source_count": len(sources),
+        "direct_source_count": len(direct_sources),
         "sources": sources,
         "dated_fact_count": dated_facts,
         "stale_fact_count": stale_facts,
@@ -852,7 +919,7 @@ def format_macro_context(bundle):
     for fact in facts:
         if fact.get("excerpt"):
             lines.append(
-                f"- [{fact.get('category')}] {fact.get('title')} | "
+                f"- [{fact.get('category')}] [{fact.get('evidence_scope', 'UNCLASSIFIED')}] {fact.get('title')} | "
                 f"Kỳ tham chiếu: {fact.get('period_or_date', 'chưa xác định')} | "
                 f"Ngày công bố: {fact.get('published_at') or 'chưa xác minh'} | "
                 f"Trạng thái ngày: {fact.get('freshness', 'UNKNOWN')} | "
