@@ -41,17 +41,6 @@ def log_exception(context: str, exc: Exception):
 from vnstock import Market
 
 try:
-    from macro_data import get_macro_context, format_macro_context, refresh_macro_contexts
-except Exception as macro_import_error:
-    logger.warning("Không nạp được macro_data.py: %s", macro_import_error)
-    def get_macro_context(symbol, sector, industry=None, metadata=None, force_refresh=False, cache_store=None):
-        return {"symbol": symbol, "facts": [], "warnings": ["Module macro_data.py chưa khả dụng."]}
-    def format_macro_context(bundle):
-        return "Không có dữ liệu vĩ mô/ngành được truy xuất."
-    def refresh_macro_contexts(industry_labels, cache_store=None, force_refresh=True):
-        return {"global_facts": 0, "industries": {}, "error": "macro_data.py unavailable"}
-
-try:
     from ptkt import ProfessionalTechnicalAnalyzer
 except ImportError:
     logger.warning("Không tìm thấy file ptkt.py. Điểm kỹ thuật sẽ mặc định = 50.")
@@ -124,23 +113,10 @@ if os.path.exists(VN100_INFO_FILE):
             for item in data:
                 sym = str(item.get("symbol", "")).upper().strip()
                 if sym:
-                    # Giữ lại phân loại ngành từ hồ sơ nguồn; không bỏ mất metadata
-                    # khi nạp danh sách mã để engine vĩ mô tự nhận diện ngành.
-                    industry_fields = (
-                        "industry", "industry_name", "industryName", "icb", "icb_name",
-                        "icbName", "sector", "sector_name", "sectorName",
-                        "sub_industry", "subIndustry", "industry_code", "industryCode",
-                        "organType", "organTypeName", "company_type", "companyType",
-                    )
-                    industry_profile = {
-                        key: item.get(key) for key in industry_fields
-                        if item.get(key) not in (None, "", [], {})
-                    }
                     VN100_METADATA[sym] = {
                         "company_name": item.get("company_name", "") or item.get("organName", "") or "",
                         "market_cap": float(item.get("market_cap", 0) or item.get("capitalization", 0) or 0),
-                        "total_shares": int(item.get("total_shares", 0) or item.get("shares", 0) or 0),
-                        **industry_profile,
+                        "total_shares": int(item.get("total_shares", 0) or item.get("shares", 0) or 0)
                     }
         logger.info(f"Đã tải metadata cho {len(VN100_METADATA)} mã từ {VN100_INFO_FILE}")
     except Exception as e:
@@ -163,7 +139,6 @@ try:
     bctc_col = db["bctc_data"]
     screener_col = db["screener_results"]
     settings_col = db["settings"]
-    macro_context_col = db["macro_context"]
     logger.info("MongoDB đã kết nối thành công!")
 
     # Đồng bộ đúng các index đã tạo trên Atlas; dùng cùng tên để create_index
@@ -1435,203 +1410,6 @@ def get_sub_sector(symbol):
         if symbol in symbols: return sub
     return get_sector(symbol)
 
-
-def _macro_auto_refresh_loop():
-    """Refresh shared macro and every active industry pack from live stock metadata."""
-    initial_delay = max(30, int(os.environ.get("MACRO_AUTO_REFRESH_INITIAL_DELAY", "90")))
-    refresh_interval = max(3600, int(os.environ.get("MACRO_AUTO_REFRESH_SECONDS", "21600")))
-    time.sleep(initial_delay)
-    while True:
-        try:
-            industry_labels = set()
-            unclassified_symbols = set()
-            projection = {
-                "symbol": 1, "sector": 1, "sub_sector": 1, "subSector": 1,
-                "industry": 1, "industry_name": 1, "industryName": 1,
-                "icb_name": 1, "icbName": 1,
-                "sector_name": 1, "sectorName": 1,
-            }
-            active_docs = list(collection.find({}, projection))
-            # Screener thường có phân loại ngành chi tiết hơn dữ liệu giá realtime.
-            active_docs.extend(list(screener_col.find({}, projection)))
-            for stock_doc in active_docs:
-                symbol = str(stock_doc.get("symbol", "")).upper().strip()
-                if not symbol:
-                    continue
-                meta = VN100_METADATA.get(symbol, {})
-                # Macro classification must come from issuer/source metadata.
-                # Do not silently substitute ticker-based valuation sector mappings.
-                sector = (
-                    stock_doc.get("sector_name") or stock_doc.get("sectorName")
-                    or meta.get("sector_name") or meta.get("sectorName")
-                    or stock_doc.get("sector") or meta.get("sector")
-                )
-                industry = (
-                    meta.get("industry") or meta.get("industry_name") or meta.get("industryName")
-                    or meta.get("icb_name") or meta.get("icbName")
-                    or stock_doc.get("industry") or stock_doc.get("industry_name")
-                    or stock_doc.get("industryName") or stock_doc.get("icb_name")
-                    or stock_doc.get("icbName") or stock_doc.get("sub_sector")
-                    or stock_doc.get("subSector") or sector
-                )
-                if industry or sector:
-                    industry_labels.add((str(industry or sector), str(sector or "")))
-                else:
-                    unclassified_symbols.add(symbol)
-
-            result = refresh_macro_contexts(
-                sorted(industry_labels),
-                cache_store=macro_context_col,
-                force_refresh=True,
-            )
-            coverage = result.get("coverage", {})
-            logger.info(
-                "[MACRO AUTO] Hoàn tất | nhóm=%s | có dữ liệu=%s | một phần=%s | thiếu=%s | cũ=%s | "
-                "dữ kiện vĩ mô=%s | mã chưa phân loại=%s",
-                len(result.get("industries", {})),
-                coverage.get("covered_industries", 0),
-                coverage.get("partial_industries", 0),
-                coverage.get("missing_industries", 0),
-                coverage.get("stale_industries", 0),
-                result.get("global_facts", 0),
-                len(unclassified_symbols),
-            )
-        except Exception as macro_refresh_error:
-            logger.warning(
-                "[MACRO AUTO] Lỗi cập nhật nền: %s",
-                type(macro_refresh_error).__name__
-            )
-        time.sleep(refresh_interval)
-
-
-# Tự cập nhật dữ liệu nguồn theo chu kỳ; không chờ người dùng bấm phân tích từng mã.
-threading.Thread(
-    target=_macro_auto_refresh_loop,
-    name="macro-auto-refresh",
-    daemon=True
-).start()
-
-# Báo cáo độ phủ nguồn macro có API quản trị riêng; không công khai dữ liệu nội bộ.
-_macro_manual_refresh_lock = threading.RLock()
-_macro_manual_refresh_state = {
-    "status": "idle",
-    "started_at": None,
-    "finished_at": None,
-    "message": "Chưa chạy cập nhật macro thủ công",
-    "result": None,
-    "error": None,
-}
-
-
-@app.get("/api/admin/macro-coverage")
-def admin_macro_coverage():
-    if not _admin_key_valid():
-        return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
-    try:
-        stored = macro_context_col.find_one(
-            {"_id": "MACRO_COVERAGE_REPORT"}, {"_id": 0}
-        ) or {}
-        with _macro_manual_refresh_lock:
-            job = dict(_macro_manual_refresh_state)
-        return jsonify({
-            "status": "success",
-            "report": stored.get("payload"),
-            "report_updated_at": stored.get("updated_at"),
-            "refresh_job": job,
-        })
-    except Exception as exc:
-        log_exception("[MACRO COVERAGE API]", exc)
-        return jsonify({"status": "error", "message": "Không đọc được báo cáo độ phủ macro."}), 500
-
-
-@app.post("/api/admin/macro-refresh")
-def admin_macro_refresh():
-    if not _admin_key_valid():
-        return jsonify({"status": "error", "message": "Sai mật khẩu Admin!"}), 403
-    with _macro_manual_refresh_lock:
-        if _macro_manual_refresh_state.get("status") == "running":
-            return jsonify({"status": "busy", "message": "Tác vụ cập nhật macro đang chạy."}), 409
-        _macro_manual_refresh_state.update({
-            "status": "running",
-            "started_at": _now_str(),
-            "finished_at": None,
-            "message": "Đang thu thập dữ liệu macro và độ phủ từng ngành",
-            "result": None,
-            "error": None,
-        })
-
-    def _run_macro_refresh():
-        try:
-            labels = set()
-            projection = {
-                "symbol": 1, "sector": 1, "sub_sector": 1, "subSector": 1,
-                "industry": 1, "industry_name": 1, "industryName": 1,
-                "icb_name": 1, "icbName": 1,
-                "sector_name": 1, "sectorName": 1,
-            }
-            docs = list(collection.find({}, projection))
-            docs.extend(list(screener_col.find({}, projection)))
-            unclassified = set()
-            for doc in docs:
-                symbol = str(doc.get("symbol", "")).upper().strip()
-                if not symbol:
-                    continue
-                meta = VN100_METADATA.get(symbol, {})
-                sector = (
-                    doc.get("sector_name") or doc.get("sectorName")
-                    or meta.get("sector_name") or meta.get("sectorName")
-                    or doc.get("sector") or meta.get("sector")
-                )
-                industry = (
-                    meta.get("industry") or meta.get("industry_name") or meta.get("industryName")
-                    or meta.get("icb_name") or meta.get("icbName")
-                    or doc.get("industry") or doc.get("industry_name")
-                    or doc.get("industryName") or doc.get("icb_name")
-                    or doc.get("icbName") or doc.get("sub_sector")
-                    or doc.get("subSector") or sector
-                )
-                if industry or sector:
-                    labels.add((str(industry or sector), str(sector or "")))
-                else:
-                    unclassified.add(symbol)
-
-            result = refresh_macro_contexts(
-                sorted(labels), cache_store=macro_context_col, force_refresh=True
-            )
-            result["unclassified_symbol_count"] = len(unclassified)
-            with _macro_manual_refresh_lock:
-                _macro_manual_refresh_state.update({
-                    "status": "success",
-                    "finished_at": _now_str(),
-                    "message": "Đã cập nhật xong dữ liệu macro và báo cáo độ phủ",
-                    "result": result,
-                    "error": None,
-                })
-            logger.info(
-                "[MACRO MANUAL] Hoàn tất | nhóm=%s | facts=%s | mã chưa phân loại=%s",
-                len(result.get("industries", {})),
-                result.get("global_facts", 0),
-                len(unclassified),
-            )
-        except Exception as exc:
-            log_exception("[MACRO MANUAL REFRESH]", exc)
-            with _macro_manual_refresh_lock:
-                _macro_manual_refresh_state.update({
-                    "status": "error",
-                    "finished_at": _now_str(),
-                    "message": "Cập nhật macro thất bại",
-                    "error": type(exc).__name__,
-                })
-
-    threading.Thread(
-        target=_run_macro_refresh, name="macro-manual-refresh", daemon=True
-    ).start()
-    return jsonify({
-        "status": "accepted",
-        "message": "Đã đưa tác vụ cập nhật macro vào nền. Theo dõi tại /api/admin/macro-coverage.",
-    }), 202
-
-
 # FIX BUG #5: normalize_stock_data không ghi DB, trả update_fields cho caller
 def normalize_stock_data(symbol, data):
     """
@@ -2273,46 +2051,6 @@ def _call_ai_for_symbol(symbol, sm, si, sector):
         bctc_doc = bctc_col.find_one({"symbol": symbol}, {"_id": 0, "income_statement": 1, "cash_flow": 1, "balance_sheet": 1})
         verified_facts = build_verified_facts(symbol, sm, si, sector, bctc_doc)
         sector_guidance = get_sector_guidance(sector)
-
-        # Thu thập dữ kiện vĩ mô/ngành có nguồn trước khi gọi AI.
-        # Module tự cache 12 giờ; lỗi nguồn không làm gián đoạn phân tích BCTC.
-        try:
-            company_meta = VN100_METADATA.get(symbol, {})
-            industry_label = (
-                company_meta.get("industry") or company_meta.get("industry_name")
-                or company_meta.get("industryName") or company_meta.get("icb_name")
-                or company_meta.get("icbName") or company_meta.get("sector_name")
-                or company_meta.get("sectorName")
-                or si.get("industry") or si.get("industry_name") or si.get("industryName")
-                or si.get("icb_name") or si.get("icbName") or si.get("sector_name")
-                or si.get("sectorName") or si.get("sub_sector") or si.get("subSector")
-                or sm.get("industry") or sm.get("industry_name")
-                or sm.get("sector_name") or sm.get("sectorName")
-            )
-            macro_sector_label = (
-                company_meta.get("sector_name") or company_meta.get("sectorName")
-                or company_meta.get("sector") or si.get("sector_name")
-                or si.get("sectorName") or si.get("sector")
-                or sm.get("sector_name") or sm.get("sectorName") or sm.get("sector")
-            )
-            macro_bundle = get_macro_context(
-                symbol, macro_sector_label, industry=industry_label, metadata=company_meta,
-                cache_store=macro_context_col
-            )
-            macro_facts = format_macro_context(macro_bundle)
-            macro_count = len(macro_bundle.get("facts", []) or [])
-            coverage = macro_bundle.get("coverage", {}) or {}
-            logger.info(
-                "[MACRO] %s | ngành=%s | tổng=%s | vĩ mô=%s | ngành=%s | cảnh báo=%s",
-                symbol, industry_label, macro_count,
-                coverage.get("global_fact_count", 0),
-                coverage.get("industry_fact_count", 0),
-                len(macro_bundle.get("warnings", []) or [])
-            )
-        except Exception as macro_error:
-            logger.warning("[MACRO] %s: không lấy được dữ liệu (%s)",
-                           symbol, type(macro_error).__name__)
-            macro_facts = "Không truy xuất được dữ liệu vĩ mô/ngành trong lần chạy này; không được tự suy diễn."
         
         final_decision = si.get("final_decision", "CHƯA XÁC ĐỊNH")
         rec_text, rec_weight = DECISION_TO_RECOMMENDATION.get(final_decision, ("NẮM GIỮ / THEO DÕI", "Tỷ trọng 0%"))
@@ -2344,9 +2082,6 @@ NGUYÊN TẮC ƯU TIÊN
 --- DỮ KIỆN ĐÃ KIỂM CHỨNG ---
 {verified_facts}
 
---- DỮ KIỆN VĨ MÔ/NGÀNH ĐƯỢC TRUY XUẤT TỪ NGUỒN ---
-{macro_facts}
-
 --- HƯỚNG DẪN THEO NGÀNH ---
 {sector_guidance}
 
@@ -2365,7 +2100,7 @@ QUY TẮC KHÔNG ĐƯỢC VI PHẠM
 4. Không gọi giá hiện tại là "rẻ" chỉ vì thấp hơn Fair High. Phải đối chiếu đồng thời với Fair Low, Fair High và Verdict.
 5. Chỉ diễn giải Discount/Margin of Safety theo đúng số {discount_pct:.1f}% hệ thống cung cấp; không tự đổi dấu, đổi mẫu số hoặc gọi đó là mức chiết khấu dương nếu không có căn cứ.
 6. Nếu dữ liệu BCTC mới nhất cũ hơn kỳ dự kiến hoặc có cảnh báo trong khối dữ kiện, phải nêu rõ hạn chế này và không mô tả dữ liệu cũ là hiện tại.
-7. Phải sử dụng khối DỮ KIỆN VĨ MÔ/NGÀNH ĐƯỢC TRUY XUẤT nếu có. Ngành doanh nghiệp: "{industry_label}". Tự xác định các biến số quan trọng từ chính dữ liệu nguồn đã truy xuất cho ngành này; không áp một bộ biến số cố định của ngành khác. Mỗi nhận định định lượng phải nêu kỳ tham chiếu, ngày công bố nếu có, chiều biến động, đơn vị và nguồn. Phân biệt dữ liệu Việt Nam với dữ liệu quốc tế, giá benchmark với giá mua/bán thực tế của doanh nghiệp, chỉ số ngành với kết quả riêng của doanh nghiệp. Giải thích kênh tác động có thể đến nhu cầu, sản lượng, giá bán, chi phí đầu vào, biên lợi nhuận, dòng tiền và bảng cân đối tùy theo dữ kiện ngành. Nếu thiếu chỉ tiêu đặc thù của ngành thì ghi rõ chưa có dữ liệu; không thay bằng chỉ tiêu ngành khác, số ước tính hay kiến thức nhớ được. Không suy luận tác động đã xảy ra nếu chưa đối chiếu BCTC. Nếu nguồn không có kỳ tham chiếu hoặc không xác định được nội dung thì đánh dấu chưa xác minh và không dùng làm căn cứ kết luận.
+7. Phần vĩ mô chỉ được nêu yếu tố có căn cứ trong dữ kiện. Nếu không có dữ liệu vĩ mô cập nhật, phải ghi rõ chưa có dữ liệu xác minh; có thể nêu các biến số cần theo dõi dưới dạng rủi ro/giả thuyết, không được khẳng định chúng đang tăng, giảm hay đã xảy ra.
 8. Phân biệt nhận định cấp ngành với lợi thế riêng của doanh nghiệp. Không tự gán thị phần, thương hiệu mạnh, độc quyền, năng lực cạnh tranh hoặc catalyst cụ thể khi chưa có dữ kiện.
 9. Tránh lặp lại cùng một con số và cùng một kết luận ở nhiều mục. Mỗi mục phải có nhiệm vụ riêng.
 10. Trả về JSON hợp lệ, không Markdown, không code fence, không lời dẫn. Giá trị của mọi trường là chuỗi tiếng Việt; escape dấu ngoặc kép nếu cần.
@@ -2378,7 +2113,7 @@ QUY TẮC KHÔNG ĐƯỢC VI PHẠM
   "valuation_verdict": "Sao chép nguyên văn verdict do hệ thống cung cấp: '{verdict}'.",
   "outlook": "4-5 câu. Đối chiếu giá {close_price:,.0f} VNĐ với Fair Low {fair_low:,.0f} VNĐ và Fair High {fair_high:,.0f} VNĐ. Nêu rõ giá đang ở dưới, trong hay trên vùng định giá theo đúng dữ kiện. Diễn giải verdict và quyết định '{final_decision}'. Nhắc Discount/Margin of Safety {discount_pct:.1f}% đúng nguyên trạng, không tự suy diễn công thức. Nêu điều kiện cần có để đánh giá lại, không dự báo giá chắc chắn.",
   "recommendation": "BẮT BUỘC giữ nguyên: '{rec_text} — {rec_weight}'.",
-  "macro_view": "6-9 câu. Phân tích theo đúng ngành {industry_label}, không dùng khuôn mẫu riêng của mã hay ngành khác. Chọn các dữ kiện có liên quan nhất từ nguồn; nêu kỳ tham chiếu, ngày công bố, đơn vị, chiều biến động và nguồn. Với từng yếu tố, giải thích chuỗi tác động có thể từ kinh tế/ngành đến nhu cầu, sản lượng, giá bán, chi phí, biên lợi nhuận hoặc dòng tiền tùy mô hình kinh doanh; phân biệt tác động giả định với kết quả đã thể hiện trong BCTC. Chỉ so sánh YoY/MoM khi dữ liệu cho phép. Đánh giá riêng từng yếu tố là thuận lợi, bất lợi, trung tính hay chưa đủ dữ liệu và nêu độ trễ/hạn chế nguồn. Cuối cùng chỉ ra 1-3 dữ liệu ngành quan trọng còn thiếu để tăng độ tin cậy; không tự tạo số liệu hoặc dự báo."
+  "macro_view": "3-5 câu. Chỉ phân tích yếu tố vĩ mô/ngành có bằng chứng trong dữ kiện. Nếu không có số liệu cập nhật, nói rõ chưa có dữ liệu xác minh; liệt kê ngắn gọn các biến số cần theo dõi và giải thích kênh tác động có thể có, dùng ngôn ngữ điều kiện như 'có thể', 'cần theo dõi'. Không bịa giá hàng hóa, tỷ giá, lãi suất, chính sách hoặc dự báo."
 }}
 
 TỰ KIỂM TRA TRƯỚC KHI TRẢ JSON
