@@ -66,6 +66,25 @@ GENERAL_PUBLICATION_QUERIES = (
 # classification is read from its metadata and is not mapped by ticker here.
 # Generic dimensions applied to every industry label discovered from live company
 # metadata. No ticker allow-list or sector-to-query mapping is maintained.
+# Translate internal classification keys into Vietnamese discovery vocabulary.
+# These are industry taxonomy labels, never ticker-specific assignments.
+INDUSTRY_SEARCH_LABELS = {
+    "AGRI": "nông nghiệp lâm nghiệp thủy sản",
+    "AVIATION": "hàng không vận tải hàng không",
+    "BAT_DONG_SAN": "bất động sản nhà ở khu công nghiệp",
+    "CHUNG_KHOAN": "thị trường chứng khoán công ty chứng khoán môi giới",
+    "CONG_NGHE_BAN_LE": "bán lẻ công nghệ thương mại điện tử",
+    "CONSTRUCTION": "xây dựng xây lắp vật liệu xây dựng",
+    "DIEN_NUOC_HA_TANG": "điện nước hạ tầng tiện ích năng lượng",
+    "INSURANCE": "bảo hiểm phí bảo hiểm bồi thường",
+    "MARITIME": "hàng hải cảng biển vận tải biển logistics",
+    "NGAN_HANG": "ngân hàng tín dụng huy động lãi suất",
+    "NGUYEN_VAT_LIEU_CHU_KY": "nguyên vật liệu thép hóa chất cao su",
+    "PETROLEUM": "dầu khí khai thác lọc hóa dầu xăng dầu",
+    "SAN_XUAT_TIEU_DUNG_PHONG_THU": "sản xuất hàng tiêu dùng thực phẩm đồ uống",
+}
+
+
 INDUSTRY_QUERY_DIMENSIONS = (
     ("INDUSTRY_OUTPUT", "sản lượng sản xuất công suất hoạt động"),
     ("INDUSTRY_PRICING", "giá bán giá nguyên liệu chi phí đầu vào biên lợi nhuận"),
@@ -592,13 +611,17 @@ def _industry_queries(industry, sector):
         return []
 
     primary = labels[0]
-    queries = [("INDUSTRY_OVERVIEW", f'"{primary}" Việt Nam dữ liệu ngành')]
+    # Database classifications may be compact enum keys (e.g. AGRI). Search
+    # with Vietnamese sector vocabulary instead of sending the enum to NSO.
+    search_label = INDUSTRY_SEARCH_LABELS.get(primary.strip().upper(), primary)
+    queries = [("INDUSTRY_OVERVIEW", f'"{search_label}" Việt Nam dữ liệu ngành')]
     queries.extend(
-        (category, f'"{primary}" Việt Nam {dimension}')
+        (category, f'"{search_label}" Việt Nam {dimension}')
         for category, dimension in INDUSTRY_QUERY_DIMENSIONS
     )
     if len(labels) > 1:
-        queries.append(("INDUSTRY_CLASSIFICATION", f'"{labels[1]}" Việt Nam "{primary}" ngành'))
+        secondary = INDUSTRY_SEARCH_LABELS.get(labels[1].strip().upper(), labels[1])
+        queries.append(("INDUSTRY_CLASSIFICATION", f'"{secondary}" Việt Nam "{search_label}" ngành'))
 
     deduped = []
     seen = set()
@@ -618,7 +641,11 @@ def _normalize_industry_text(value):
 
 def _industry_context_indicators(industry, sector):
     """Select broad WDI context by live labels; never represent it as direct sector evidence."""
-    label = _normalize_industry_text(f"{industry or ''} {sector or ''}")
+    industry_label = str(industry or "").strip()
+    sector_label = str(sector or "").strip()
+    industry_label = INDUSTRY_SEARCH_LABELS.get(industry_label.upper(), industry_label)
+    sector_label = INDUSTRY_SEARCH_LABELS.get(sector_label.upper(), sector_label)
+    label = _normalize_industry_text(f"{industry_label} {sector_label}")
     selected = []
     groups = (
         (("agri", "nong nghiep", "lam nghiep", "thuy san", "chan nuoi", "cay trong"),
